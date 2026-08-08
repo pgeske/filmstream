@@ -26,7 +26,7 @@ import (
 	"github.com/pgeske/filmstream/internal/torrentstream"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -44,6 +44,8 @@ func run(args []string) error {
 			return runPlay(args[1:])
 		case "status":
 			return runStatus(args[1:])
+		case "indexer":
+			return runIndexer(args[1:])
 		case "version", "--version", "-version":
 			fmt.Println("filmstream", version)
 			return nil
@@ -92,9 +94,17 @@ func runServer(args []string) error {
 		Languages:    cfg.PreferredLanguages,
 		MaxSizeBytes: cfg.MaxCandidateBytes(),
 	}
+	apiServer := api.New(registry, engine, defaults, logger)
+	apiServer.SetIndexerReloader(func() error {
+		updated, err := config.Load(*configPath)
+		if err != nil {
+			return err
+		}
+		return registry.Replace(updated.Indexers)
+	})
 	server := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           api.New(registry, engine, defaults, logger).Handler(),
+		Handler:           apiServer.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -383,6 +393,8 @@ Usage:
   filmstream play --torrent ./movie.torrent
   filmstream serve
   filmstream status PLAYBACK_ID
+  filmstream indexer add --name NAME URL
+  filmstream indexer list
 
 Examples:
   filmstream --year 2010 Sintel

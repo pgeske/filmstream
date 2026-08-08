@@ -9,7 +9,7 @@ Use it only with media you are authorized to download and share.
 - Local backend bound to `127.0.0.1:8943`
 - One-command CLI that starts the backend when needed and launches MPV
 - A small, trusted open-movie catalog plus an Internet Archive reference indexer
-- External HTTP indexer contract
+- Standard Torznab indexers, including Prowlarr and Jackett endpoints
 - Release ranking by title, year, resolution, language, codec, size, seeders, and leechers
 - Direct magnet and `.torrent` playback
 - HTTP Range streaming with seeking and 32 MiB read-ahead
@@ -104,61 +104,33 @@ Set `FILMSTREAM_CONFIG` to use another path or `FILMSTREAM_SERVER` to use an alr
 
 Downloaded data is stored beneath `<data_dir>/torrents`. The MVP does not delete cached torrents automatically.
 
-## External indexers
+## Torznab indexers
 
-External indexers are small HTTP services. Register one with:
+Every user-registered indexer must expose a standard Torznab endpoint. The endpoint may come directly from an indexer or from software such as Prowlarr or Jackett.
 
-```json
-{
-  "name": "my-authorized-catalog",
-  "type": "http",
-  "endpoint": "http://127.0.0.1:9000/search",
-  "headers": {
-    "Authorization": "Bearer example"
-  }
-}
+Register an endpoint:
+
+```bash
+filmstream indexer add \
+  --name movies \
+  http://prowlarr.example.internal/1/api
 ```
 
-Filmstream sends:
+The CLI prompts for its API key without echoing it or placing it in shell history. For a public endpoint that requires no key, pass `--no-api-key`. For non-interactive setup, provide the key through `FILMSTREAM_INDEXER_API_KEY`.
 
-```json
-{
-  "query": "Sintel",
-  "year": 2010,
-  "preferences": {
-    "resolution": "1080p",
-    "codecs": ["h264", "h265"],
-    "languages": ["en"],
-    "max_size_bytes": 64424509440
-  }
-}
+Manage registrations with:
+
+```bash
+filmstream indexer list
+filmstream indexer test movies
+filmstream indexer remove movies
 ```
 
-The indexer returns normalized candidates:
+Registration calls the Torznab `t=caps` endpoint and refuses endpoints that support neither basic nor movie searches. Each configured endpoint is searched concurrently. Filmstream normalizes standard Torznab fields such as size, seeders, peers, magnet/download URL, language, release group, and upload/download volume factors before ranking candidates.
 
-```json
-{
-  "candidates": [
-    {
-      "id": "release-id",
-      "name": "Sintel.2010.1080p.x265",
-      "year": 2010,
-      "size_bytes": 2147483648,
-      "seeders": 25,
-      "leechers": 4,
-      "resolution": "1080p",
-      "codec": "h265",
-      "languages": ["en"],
-      "release_group": "example",
-      "magnet_uri": "magnet:?xt=urn:btih:..."
-    }
-  ]
-}
-```
+Prowlarr exposes one Torznab URL per configured indexer, conventionally `http://HOST/INDEXER_ID/api`. Register each desired endpoint separately. Filmstream does not use Prowlarr's proprietary aggregate-search API.
 
-A candidate must contain either `magnet_uri` or `torrent_url`. Seeders favor quick startup; active leechers receive a smaller bonus because they may improve upload opportunities. Codec, resolution, and language fields can be omitted when unknown. Filmstream infers common resolution and codec tags from release names.
-
-Many torrent indexers expose Torznab, usually through software such as Prowlarr or Jackett, but tracker-native APIs are not universal. A future Torznab adapter can translate that standard into this contract. Site-specific authentication and tracker rules remain the adapter operator's responsibility.
+The config file is written with mode `0600` because it contains API keys. The CLI reloads a running local backend after an indexer is added or removed.
 
 ## Streaming and ratio behavior
 
@@ -175,6 +147,7 @@ A 1.0 target means one uploaded byte per downloaded byte. It is a target, not a 
 ## API
 
 - `GET /v1/health`
+- `POST /v1/indexers/reload`
 - `POST /v1/playbacks`
 - `GET /v1/playbacks/{id}`
 - `GET|HEAD /v1/playbacks/{id}/stream`
@@ -192,7 +165,6 @@ The end-to-end torrent test builds a local `.torrent`, loads already-authorized 
 
 - Persist and restore torrents for long-lived seeding
 - Cache quota enforcement after ratio targets are met
-- Generic Torznab adapter
 - Optional TMDB title normalization and disambiguation
 - Multiple-file selection in the CLI
 - Docker image and remote authentication

@@ -33,10 +33,11 @@ type CreatePlaybackResponse struct {
 }
 
 type Server struct {
-	indexers *indexer.Registry
-	engine   *torrentstream.Engine
-	defaults catalog.Preferences
-	logger   *slog.Logger
+	indexers       *indexer.Registry
+	engine         *torrentstream.Engine
+	defaults       catalog.Preferences
+	logger         *slog.Logger
+	reloadIndexers func() error
 
 	mu       sync.RWMutex
 	selected map[string]catalog.RankedCandidate
@@ -52,16 +53,33 @@ func New(indexers *indexer.Registry, engine *torrentstream.Engine, defaults cata
 	}
 }
 
+func (s *Server) SetIndexerReloader(reload func() error) {
+	s.reloadIndexers = reload
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	mux.HandleFunc("POST /v1/indexers/reload", s.reloadIndexerConfiguration)
 	mux.HandleFunc("POST /v1/playbacks", s.createPlayback)
 	mux.HandleFunc("GET /v1/playbacks/{id}", s.playbackStatus)
 	mux.HandleFunc("GET /v1/playbacks/{id}/stream", s.streamPlayback)
 	mux.HandleFunc("HEAD /v1/playbacks/{id}/stream", s.streamPlayback)
 	return mux
+}
+
+func (s *Server) reloadIndexerConfiguration(w http.ResponseWriter, _ *http.Request) {
+	if s.reloadIndexers == nil {
+		writeError(w, http.StatusNotImplemented, "indexer reload is not configured")
+		return
+	}
+	if err := s.reloadIndexers(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {

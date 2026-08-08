@@ -25,6 +25,7 @@ type Indexer interface {
 }
 
 type Registry struct {
+	mu       sync.RWMutex
 	indexers map[string]Indexer
 	ordered  []Indexer
 }
@@ -34,13 +35,17 @@ func NewRegistry(configs []config.Indexer) (*Registry, error) {
 	registry := &Registry{indexers: make(map[string]Indexer)}
 	for _, cfg := range configs {
 		var implementation Indexer
+		var err error
 		switch cfg.Type {
 		case "open_media":
 			implementation = NewOpenMedia(cfg.Name, cfg.Endpoint)
 		case "internet_archive":
 			implementation = NewInternetArchive(cfg.Name, cfg.Endpoint, client)
-		case "http":
-			implementation = NewHTTP(cfg.Name, cfg.Endpoint, cfg.Headers, client)
+		case "torznab":
+			implementation, err = NewTorznab(cfg.Name, cfg.Endpoint, cfg.APIKey, client)
+			if err != nil {
+				return nil, fmt.Errorf("configure indexer %q: %w", cfg.Name, err)
+			}
 		default:
 			return nil, fmt.Errorf("indexer %q has unsupported type %q", cfg.Name, cfg.Type)
 		}
@@ -53,8 +58,23 @@ func NewRegistry(configs []config.Indexer) (*Registry, error) {
 	return registry, nil
 }
 
+func (r *Registry) Replace(configs []config.Indexer) error {
+	replacement, err := NewRegistry(configs)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.indexers = replacement.indexers
+	r.ordered = replacement.ordered
+	r.mu.Unlock()
+	return nil
+}
+
 func (r *Registry) Search(ctx context.Context, request catalog.SearchRequest) ([]catalog.Candidate, error) {
-	if len(r.ordered) == 0 {
+	r.mu.RLock()
+	ordered := append([]Indexer(nil), r.ordered...)
+	r.mu.RUnlock()
+	if len(ordered) == 0 {
 		return nil, errors.New("no indexers are configured")
 	}
 
@@ -62,9 +82,9 @@ func (r *Registry) Search(ctx context.Context, request catalog.SearchRequest) ([
 		candidates []catalog.Candidate
 		err        error
 	}
-	results := make(chan result, len(r.ordered))
+	results := make(chan result, len(ordered))
 	var group sync.WaitGroup
-	for _, configured := range r.ordered {
+	for _, configured := range ordered {
 		group.Add(1)
 		go func(indexer Indexer) {
 			defer group.Done()
@@ -93,7 +113,9 @@ func (r *Registry) Search(ctx context.Context, request catalog.SearchRequest) ([
 }
 
 func (r *Registry) Resolve(ctx context.Context, candidate catalog.Candidate) (Source, error) {
+	r.mu.RLock()
 	configured, ok := r.indexers[candidate.Indexer]
+	r.mu.RUnlock()
 	if !ok {
 		return Source{}, fmt.Errorf("indexer %q is not configured", candidate.Indexer)
 	}

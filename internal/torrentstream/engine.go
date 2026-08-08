@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -286,7 +287,12 @@ func (e *Engine) downloadMetainfo(ctx context.Context, torrentURL string) (*meta
 				break
 			}
 		} else {
-			lastErr = err
+			var urlError *url.Error
+			if errors.As(err, &urlError) {
+				lastErr = urlError.Err
+			} else {
+				lastErr = err
+			}
 		}
 		if attempt < 3 {
 			select {

@@ -15,10 +15,10 @@ const (
 )
 
 type Indexer struct {
-	Name     string            `json:"name"`
-	Type     string            `json:"type"`
-	Endpoint string            `json:"endpoint"`
-	Headers  map[string]string `json:"headers,omitempty"`
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	Endpoint string `json:"endpoint"`
+	APIKey   string `json:"api_key,omitempty"`
 }
 
 type Config struct {
@@ -62,11 +62,9 @@ func Defaults() Config {
 
 func Load(path string) (Config, error) {
 	cfg := Defaults()
-	if path == "" {
-		path = defaultConfigPath()
-	}
+	path = Path(path)
 
-	contents, err := os.ReadFile(expandHome(path))
+	contents, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return cfg, nil
 	}
@@ -81,6 +79,49 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func Save(path string, cfg Config) error {
+	path = Path(path)
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	contents, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode config: %w", err)
+	}
+	contents = append(contents, '\n')
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".config-*.json")
+	if err != nil {
+		return fmt.Errorf("create temporary config: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(contents); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("replace config: %w", err)
+	}
+	return nil
+}
+
+func Path(path string) string {
+	if path == "" {
+		path = defaultConfigPath()
+	}
+	return expandHome(path)
 }
 
 func (c Config) Validate() error {

@@ -2,7 +2,10 @@ module github.com/pgeske/filmstream
 
 go 1.24.0
 
-require github.com/anacrolix/torrent v1.61.0
+require (
+	github.com/anacrolix/torrent v1.61.0
+	golang.org/x/term v0.37.0
+)
 
 require (
 	github.com/RoaringBitmap/roaring v1.2.3 // indirect

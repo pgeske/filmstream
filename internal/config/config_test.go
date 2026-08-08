@@ -22,6 +22,31 @@ func TestDefaultsMatchLocalMVP(t *testing.T) {
 	}
 }
 
+func TestSaveUsesPrivatePermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "config.json")
+	cfg := Defaults()
+	cfg.Indexers = append(cfg.Indexers, Indexer{
+		Name: "private", Type: "torznab", Endpoint: "https://example.test/api", APIKey: "secret",
+	})
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("config mode = %o", got)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Indexers[len(loaded.Indexers)-1].APIKey; got != "secret" {
+		t.Fatalf("API key = %q", got)
+	}
+}
+
 func TestLoadOverlaysDefaults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"readahead_mib":64,"indexers":[]}`), 0o644); err != nil {

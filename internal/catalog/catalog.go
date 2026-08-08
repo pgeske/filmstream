@@ -23,21 +23,23 @@ type Preferences struct {
 }
 
 type Candidate struct {
-	ID           string   `json:"id"`
-	Indexer      string   `json:"indexer"`
-	Name         string   `json:"name"`
-	Year         int      `json:"year,omitempty"`
-	SizeBytes    int64    `json:"size_bytes,omitempty"`
-	Seeders      *int     `json:"seeders,omitempty"`
-	Leechers     *int     `json:"leechers,omitempty"`
-	Resolution   string   `json:"resolution,omitempty"`
-	Codec        string   `json:"codec,omitempty"`
-	Languages    []string `json:"languages,omitempty"`
-	ReleaseGroup string   `json:"release_group,omitempty"`
-	Trusted      bool     `json:"trusted,omitempty"`
-	Popularity   int64    `json:"popularity,omitempty"`
-	MagnetURI    string   `json:"magnet_uri,omitempty"`
-	TorrentURL   string   `json:"torrent_url,omitempty"`
+	ID                   string   `json:"id"`
+	Indexer              string   `json:"indexer"`
+	Name                 string   `json:"name"`
+	Year                 int      `json:"year,omitempty"`
+	SizeBytes            int64    `json:"size_bytes,omitempty"`
+	Seeders              *int     `json:"seeders,omitempty"`
+	Leechers             *int     `json:"leechers,omitempty"`
+	Resolution           string   `json:"resolution,omitempty"`
+	Codec                string   `json:"codec,omitempty"`
+	Languages            []string `json:"languages,omitempty"`
+	ReleaseGroup         string   `json:"release_group,omitempty"`
+	DownloadVolumeFactor *float64 `json:"download_volume_factor,omitempty"`
+	UploadVolumeFactor   *float64 `json:"upload_volume_factor,omitempty"`
+	Trusted              bool     `json:"trusted,omitempty"`
+	Popularity           int64    `json:"popularity,omitempty"`
+	MagnetURI            string   `json:"magnet_uri,omitempty"`
+	TorrentURL           string   `json:"torrent_url,omitempty"`
 }
 
 type RankedCandidate struct {
@@ -128,6 +130,14 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 			// Active leechers improve the chance of uploading enough to meet a ratio target.
 			score += math.Log2(float64(*candidate.Leechers)+1) * 5
 			reasons = append(reasons, formatReason("leechers", float64(*candidate.Leechers)))
+		}
+		if candidate.DownloadVolumeFactor != nil && *candidate.DownloadVolumeFactor < 1 {
+			score += (1 - *candidate.DownloadVolumeFactor) * 35
+			reasons = append(reasons, formatReason("download factor", *candidate.DownloadVolumeFactor))
+		}
+		if candidate.UploadVolumeFactor != nil && *candidate.UploadVolumeFactor > 1 {
+			score += math.Log2(*candidate.UploadVolumeFactor) * 10
+			reasons = append(reasons, formatReason("upload factor", *candidate.UploadVolumeFactor))
 		}
 		if candidate.Trusted {
 			score += 75
