@@ -21,6 +21,15 @@ type Indexer struct {
 	APIKey   string `json:"api_key,omitempty"`
 }
 
+type Resolver struct {
+	Provider       string `json:"provider,omitempty"`
+	BaseURL        string `json:"base_url,omitempty"`
+	Model          string `json:"model,omitempty"`
+	APIKeyEnv      string `json:"api_key_env,omitempty"`
+	APIKeyFile     string `json:"api_key_file,omitempty"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+}
+
 type Config struct {
 	Listen              string    `json:"listen"`
 	DataDir             string    `json:"data_dir"`
@@ -31,6 +40,7 @@ type Config struct {
 	PreferredResolution string    `json:"preferred_resolution"`
 	PreferredLanguages  []string  `json:"preferred_languages"`
 	Player              string    `json:"player"`
+	Resolver            Resolver  `json:"resolver,omitempty"`
 	Indexers            []Indexer `json:"indexers"`
 }
 
@@ -75,6 +85,7 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("parse config: %w", err)
 	}
 	cfg.DataDir = expandHome(cfg.DataDir)
+	cfg.Resolver.APIKeyFile = expandHome(cfg.Resolver.APIKeyFile)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -142,6 +153,17 @@ func (c Config) Validate() error {
 	}
 	if c.SeedRatioTarget < 0 {
 		return errors.New("seed_ratio_target cannot be negative")
+	}
+	if c.Resolver.Provider != "" {
+		if c.Resolver.Provider != "openai-compatible" {
+			return fmt.Errorf("unsupported resolver provider %q", c.Resolver.Provider)
+		}
+		if c.Resolver.BaseURL == "" || c.Resolver.Model == "" {
+			return errors.New("resolver base_url and model are required")
+		}
+		if c.Resolver.TimeoutSeconds < 0 {
+			return errors.New("resolver timeout_seconds cannot be negative")
+		}
 	}
 	for i, indexer := range c.Indexers {
 		if indexer.Name == "" || indexer.Type == "" || indexer.Endpoint == "" {

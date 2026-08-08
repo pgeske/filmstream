@@ -12,6 +12,7 @@ import (
 
 	"github.com/pgeske/filmstream/internal/catalog"
 	"github.com/pgeske/filmstream/internal/indexer"
+	"github.com/pgeske/filmstream/internal/resolver"
 	"github.com/pgeske/filmstream/internal/torrentstream"
 )
 
@@ -38,9 +39,12 @@ type Server struct {
 	defaults       catalog.Preferences
 	logger         *slog.Logger
 	reloadIndexers func() error
+	reloadResolver func() error
 
-	mu       sync.RWMutex
-	selected map[string]catalog.RankedCandidate
+	resolverMu    sync.RWMutex
+	movieResolver resolver.Resolver
+	mu            sync.RWMutex
+	selected      map[string]catalog.RankedCandidate
 }
 
 func New(indexers *indexer.Registry, engine *torrentstream.Engine, defaults catalog.Preferences, logger *slog.Logger) *Server {
@@ -57,17 +61,75 @@ func (s *Server) SetIndexerReloader(reload func() error) {
 	s.reloadIndexers = reload
 }
 
+func (s *Server) SetMovieResolver(movieResolver resolver.Resolver) {
+	s.resolverMu.Lock()
+	s.movieResolver = movieResolver
+	s.resolverMu.Unlock()
+}
+
+func (s *Server) SetResolverReloader(reload func() error) {
+	s.reloadResolver = reload
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("POST /v1/indexers/reload", s.reloadIndexerConfiguration)
+	mux.HandleFunc("POST /v1/resolver/reload", s.reloadResolverConfiguration)
+	mux.HandleFunc("POST /v1/resolve", s.resolveMovie)
 	mux.HandleFunc("POST /v1/playbacks", s.createPlayback)
 	mux.HandleFunc("GET /v1/playbacks/{id}", s.playbackStatus)
 	mux.HandleFunc("GET /v1/playbacks/{id}/stream", s.streamPlayback)
 	mux.HandleFunc("HEAD /v1/playbacks/{id}/stream", s.streamPlayback)
 	return mux
+}
+
+func (s *Server) resolveMovie(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	var request struct {
+		Query string `json:"query"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request: "+err.Error())
+		return
+	}
+	request.Query = strings.TrimSpace(request.Query)
+	if request.Query == "" {
+		writeError(w, http.StatusBadRequest, "query cannot be empty")
+		return
+	}
+	s.resolverMu.RLock()
+	movieResolver := s.movieResolver
+	s.resolverMu.RUnlock()
+	if movieResolver == nil {
+		writeJSON(w, http.StatusOK, resolver.Result{
+			Input:      request.Query,
+			Candidates: []resolver.Candidate{{Title: request.Query, Confidence: 1}},
+		})
+		return
+	}
+	result, err := movieResolver.Resolve(r.Context(), request.Query)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) reloadResolverConfiguration(w http.ResponseWriter, _ *http.Request) {
+	if s.reloadResolver == nil {
+		writeError(w, http.StatusNotImplemented, "resolver reload is not configured")
+		return
+	}
+	if err := s.reloadResolver(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (s *Server) reloadIndexerConfiguration(w http.ResponseWriter, _ *http.Request) {

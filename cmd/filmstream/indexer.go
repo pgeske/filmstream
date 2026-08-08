@@ -64,7 +64,7 @@ func runIndexerAdd(args []string) error {
 	if !*noAPIKey {
 		apiKey = os.Getenv("FILMSTREAM_INDEXER_API_KEY")
 		if apiKey == "" {
-			apiKey, err = promptAPIKey()
+			apiKey, err = promptSecret("Torznab API key")
 			if err != nil {
 				return err
 			}
@@ -214,12 +214,12 @@ func reportReload(cfg config.Config) {
 	fmt.Println("Reloaded the running filmstream server.")
 }
 
-func promptAPIKey() (string, error) {
+func promptSecret(label string) (string, error) {
 	fd := int(os.Stdin.Fd())
 	if !term.IsTerminal(fd) {
-		return "", errors.New("stdin is not a terminal; set FILMSTREAM_INDEXER_API_KEY or use --no-api-key")
+		return "", errors.New("stdin is not a terminal; configure a key file or environment variable")
 	}
-	fmt.Fprint(os.Stderr, "Torznab API key: ")
+	fmt.Fprintf(os.Stderr, "%s: ", label)
 	value, err := term.ReadPassword(fd)
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
@@ -227,7 +227,7 @@ func promptAPIKey() (string, error) {
 	}
 	apiKey := strings.TrimSpace(string(value))
 	if apiKey == "" {
-		return "", errors.New("API key cannot be empty; use --no-api-key for a public endpoint")
+		return "", errors.New("secret cannot be empty")
 	}
 	return apiKey, nil
 }

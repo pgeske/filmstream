@@ -23,10 +23,11 @@ import (
 	"github.com/pgeske/filmstream/internal/catalog"
 	"github.com/pgeske/filmstream/internal/config"
 	"github.com/pgeske/filmstream/internal/indexer"
+	"github.com/pgeske/filmstream/internal/resolver"
 	"github.com/pgeske/filmstream/internal/torrentstream"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -46,6 +47,10 @@ func run(args []string) error {
 			return runStatus(args[1:])
 		case "indexer":
 			return runIndexer(args[1:])
+		case "resolver":
+			return runResolver(args[1:])
+		case "resolve":
+			return runResolve(args[1:])
 		case "version", "--version", "-version":
 			fmt.Println("filmstream", version)
 			return nil
@@ -94,7 +99,24 @@ func runServer(args []string) error {
 		Languages:    cfg.PreferredLanguages,
 		MaxSizeBytes: cfg.MaxCandidateBytes(),
 	}
+	movieResolver, err := resolver.FromConfig(cfg.Resolver, cfg.DataDir)
+	if err != nil {
+		return err
+	}
 	apiServer := api.New(registry, engine, defaults, logger)
+	apiServer.SetMovieResolver(movieResolver)
+	apiServer.SetResolverReloader(func() error {
+		updated, err := config.Load(*configPath)
+		if err != nil {
+			return err
+		}
+		updatedResolver, err := resolver.FromConfig(updated.Resolver, updated.DataDir)
+		if err != nil {
+			return err
+		}
+		apiServer.SetMovieResolver(updatedResolver)
+		return nil
+	})
 	apiServer.SetIndexerReloader(func() error {
 		updated, err := config.Load(*configPath)
 		if err != nil {
@@ -138,6 +160,7 @@ func runPlay(args []string) error {
 	maxSize := flags.Int64("max-size-gib", 0, "maximum torrent size in GiB")
 	player := flags.String("player", "", "player executable")
 	printURL := flags.Bool("print-url", false, "print the stream URL without launching a player")
+	noAI := flags.Bool("no-ai", false, "skip natural-language movie resolution")
 	noAutostart := flags.Bool("no-autostart", false, "do not start a missing local server")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -180,6 +203,27 @@ func runPlay(args []string) error {
 
 	if err := ensureServer(*serverURL, *configPath, cfg.DataDir, !*noAutostart); err != nil {
 		return err
+	}
+	if query != "" && !*noAI {
+		var resolution resolver.Result
+		if err := postJSON(*serverURL+"/v1/resolve", map[string]string{"query": query}, &resolution); err != nil {
+			return fmt.Errorf("resolve movie: %w", err)
+		}
+		candidate, err := selectResolvedMovie(resolution)
+		if err != nil {
+			return err
+		}
+		if resolution.Provider != "" {
+			cacheLabel := ""
+			if resolution.Cached {
+				cacheLabel = ", cached"
+			}
+			fmt.Fprintf(os.Stderr, "Resolved: %s%s\n", formatResolvedCandidate(candidate), cacheLabel)
+		}
+		query = candidate.Title
+		if *year == 0 {
+			*year = candidate.Year
+		}
 	}
 	request := api.CreatePlaybackRequest{
 		Query:       query,
@@ -395,6 +439,8 @@ Usage:
   filmstream status PLAYBACK_ID
   filmstream indexer add --name NAME URL
   filmstream indexer list
+  filmstream resolve MOVIE DESCRIPTION
+  filmstream resolver configure [options]
 
 Examples:
   filmstream --year 2010 Sintel
