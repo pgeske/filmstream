@@ -27,7 +27,7 @@ import (
 	"github.com/pgeske/filmstream/internal/torrentstream"
 )
 
-const version = "0.4.0"
+const version = "0.4.1"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -270,7 +270,7 @@ func runPlay(args []string) error {
 	}
 	commandArgs := []string{response.StreamURL}
 	if filepath.Base(path) == "mpv" {
-		commandArgs = []string{"--cache=yes", "--cache-secs=30", response.StreamURL}
+		commandArgs = append(mpvStreamingOptions(), response.StreamURL)
 	} else if filepath.Base(path) == "ffplay" {
 		commandArgs = []string{"-autoexit", response.StreamURL}
 	}

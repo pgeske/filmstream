@@ -190,6 +190,8 @@ The config file is written with mode `0600` because it contains API keys. The CL
 
 Filmstream only requests the pieces needed by MPV's current HTTP Range request, a 32 MiB read-ahead window, and a small tail window used to find container metadata. It does not complete the rest of a movie in the background. Closing MPV closes those readers, so a ten-minute sample remains a partial download.
 
+MPV waits for a two-second initial cache before playback to avoid startup jitter. On WSL with Wayland and NVIDIA's NVDEC library available, Filmstream uses the stable `wlshm` output path with `nvdec-copy`; other environments keep MPV's portable automatic output and software-decoding fallback.
+
 Every verified piece remains available for upload while the session is retained. After playback becomes idle, Filmstream manages the lifecycle automatically:
 
 1. Keep seeding the downloaded pieces toward `seed_ratio_target`.
