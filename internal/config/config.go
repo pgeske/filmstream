@@ -9,9 +9,13 @@ import (
 )
 
 const (
-	defaultListen          = "127.0.0.1:8943"
-	defaultMaxCandidateGiB = 60
-	defaultReadaheadMiB    = 32
+	defaultListen           = "127.0.0.1:8943"
+	defaultMaxCandidateGiB  = 60
+	defaultReadaheadMiB     = 32
+	defaultCacheLimitGiB    = 20
+	defaultMaxSeedSessions  = 20
+	defaultSeedMaxHours     = 24
+	defaultIdleGraceSeconds = 120
 )
 
 type Indexer struct {
@@ -37,6 +41,10 @@ type Config struct {
 	ReadaheadMiB        int64     `json:"readahead_mib"`
 	MetadataTimeoutSecs int       `json:"metadata_timeout_seconds"`
 	SeedRatioTarget     float64   `json:"seed_ratio_target"`
+	CacheLimitGiB       int64     `json:"cache_limit_gib"`
+	MaxSeedSessions     int       `json:"max_seed_sessions"`
+	SeedMaxHours        int       `json:"seed_max_hours"`
+	IdleGraceSeconds    int       `json:"idle_grace_seconds"`
 	PreferredResolution string    `json:"preferred_resolution"`
 	PreferredLanguages  []string  `json:"preferred_languages"`
 	Player              string    `json:"player"`
@@ -52,6 +60,10 @@ func Defaults() Config {
 		ReadaheadMiB:        defaultReadaheadMiB,
 		MetadataTimeoutSecs: 120,
 		SeedRatioTarget:     1,
+		CacheLimitGiB:       defaultCacheLimitGiB,
+		MaxSeedSessions:     defaultMaxSeedSessions,
+		SeedMaxHours:        defaultSeedMaxHours,
+		IdleGraceSeconds:    defaultIdleGraceSeconds,
 		PreferredResolution: "1080p",
 		PreferredLanguages:  []string{"en", "english"},
 		Player:              "mpv",
@@ -154,6 +166,18 @@ func (c Config) Validate() error {
 	if c.SeedRatioTarget < 0 {
 		return errors.New("seed_ratio_target cannot be negative")
 	}
+	if c.CacheLimitGiB <= 0 {
+		return errors.New("cache_limit_gib must be positive")
+	}
+	if c.MaxSeedSessions <= 0 {
+		return errors.New("max_seed_sessions must be positive")
+	}
+	if c.SeedMaxHours <= 0 {
+		return errors.New("seed_max_hours must be positive")
+	}
+	if c.IdleGraceSeconds < 0 {
+		return errors.New("idle_grace_seconds cannot be negative")
+	}
 	if c.Resolver.Provider != "" {
 		if c.Resolver.Provider != "openai-compatible" {
 			return fmt.Errorf("unsupported resolver provider %q", c.Resolver.Provider)
@@ -179,6 +203,10 @@ func (c Config) MaxCandidateBytes() int64 {
 
 func (c Config) ReadaheadBytes() int64 {
 	return c.ReadaheadMiB << 20
+}
+
+func (c Config) CacheLimitBytes() int64 {
+	return c.CacheLimitGiB << 30
 }
 
 func defaultConfigPath() string {

@@ -27,7 +27,7 @@ import (
 	"github.com/pgeske/filmstream/internal/torrentstream"
 )
 
-const version = "0.3.0"
+const version = "0.4.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -87,6 +87,13 @@ func runServer(args []string) error {
 		ReadaheadBytes:  cfg.ReadaheadBytes(),
 		MetadataTimeout: time.Duration(cfg.MetadataTimeoutSecs) * time.Second,
 		SeedRatioTarget: cfg.SeedRatioTarget,
+		CacheLimitBytes: cfg.CacheLimitBytes(),
+		MaxSeedSessions: cfg.MaxSeedSessions,
+		IdleGrace:       time.Duration(cfg.IdleGraceSeconds) * time.Second,
+		SeedMaxAge:      time.Duration(cfg.SeedMaxHours) * time.Hour,
+		CleanOnStart:    true,
+		CleanOnClose:    true,
+		Logger:          logger,
 	})
 	if err != nil {
 		return err
@@ -271,7 +278,11 @@ func runPlay(args []string) error {
 	command.Stdin = os.Stdin
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
-	return command.Run()
+	if err := command.Run(); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr, "Playback ended; Filmstream will seed and retire temporary data automatically.")
+	return nil
 }
 
 func runStatus(args []string) error {
@@ -303,10 +314,12 @@ func runStatus(args []string) error {
 	if err := json.NewDecoder(response.Body).Decode(&status); err != nil {
 		return err
 	}
-	fmt.Printf("%s\nfile: %s\ncomplete: %.1f%%\npeers: %d\nratio: %.3f / %.3f\n",
+	fmt.Printf("%s\nfile: %s\nstate: %s\nstreamed: %.1f%%\nstored: %s\npeers: %d\nratio: %.3f / %.3f\n",
 		status.Name,
 		status.FileName,
+		status.State,
 		percent(status.BytesComplete, status.FileSize),
+		formatBytes(status.TorrentComplete),
 		status.ActivePeers,
 		status.Ratio,
 		status.RatioTarget,

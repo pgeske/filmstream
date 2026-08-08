@@ -14,8 +14,9 @@ Use it only with media you are authorized to download and share.
 - Release ranking by title, year, resolution, language, codec, size, seeders, and leechers
 - Direct magnet and `.torrent` playback
 - HTTP Range streaming with seeking and 32 MiB read-ahead
-- Head-on-demand and background tail prefetch for container metadata
-- Background completion and seeding with a visible 1.0 ratio target
+- Demand-driven smart sampling plus a small tail prefetch for container metadata
+- Automatic best-effort seeding toward a visible 1.0 ratio target
+- Automatic retirement, a 20 GiB cache safety limit, and ephemeral shutdown cleanup
 - Largest-video selection for multi-file torrents
 
 ## Install
@@ -90,6 +91,10 @@ The optional configuration file is `~/.config/filmstream/config.json`:
   "readahead_mib": 32,
   "metadata_timeout_seconds": 120,
   "seed_ratio_target": 1.0,
+  "cache_limit_gib": 20,
+  "max_seed_sessions": 20,
+  "seed_max_hours": 24,
+  "idle_grace_seconds": 120,
   "preferred_resolution": "1080p",
   "preferred_languages": ["en", "english"],
   "player": "mpv",
@@ -117,7 +122,7 @@ The optional configuration file is `~/.config/filmstream/config.json`:
 
 Set `FILMSTREAM_CONFIG` to use another path or `FILMSTREAM_SERVER` to use an already-running backend.
 
-Downloaded data is stored beneath `<data_dir>/torrents`. The MVP does not delete cached torrents automatically.
+Temporary torrent data is stored beneath `<data_dir>/torrents`. Filmstream owns that directory and clears it on clean startup and shutdown; do not place unrelated files there.
 
 ## Natural-language movie resolution
 
@@ -181,17 +186,28 @@ Prowlarr exposes one Torznab URL per configured indexer, conventionally `http://
 
 The config file is written with mode `0600` because it contains API keys. The CLI reloads a running local backend after an indexer is added or removed.
 
-## Streaming and ratio behavior
+## Smart streaming, cleanup, and ratio behavior
 
-The selected video starts a responsive torrent reader. MPV's HTTP Range requests move the read head, and the torrent engine reprioritizes pieces around the new offset. The rest of the selected video downloads in the background.
+Filmstream only requests the pieces needed by MPV's current HTTP Range request, a 32 MiB read-ahead window, and a small tail window used to find container metadata. It does not complete the rest of a movie in the background. Closing MPV closes those readers, so a ten-minute sample remains a partial download.
 
-The torrent client uploads while running and reports:
+Every verified piece remains available for upload while the session is retained. After playback becomes idle, Filmstream manages the lifecycle automatically:
+
+1. Keep seeding the downloaded pieces toward `seed_ratio_target`.
+2. Retire the torrent after the target is met and the two-minute idle grace expires.
+3. Retire it after `seed_max_hours` even when peer demand cannot reach the target.
+4. Keep at most `max_seed_sessions` retained torrents and retire the oldest inactive ones first.
+5. Retire the oldest inactive sessions early if completed pieces exceed `cache_limit_gib`.
+6. Clear managed torrent data on server startup and shutdown, so crashes or restarts do not leave an unmanaged cache indefinitely.
+
+Active playback is never evicted, even if it temporarily exceeds the cache limit. A full watch may naturally download the full selected video, but its data is still retired by the same policy.
+
+Inspect an active session with:
 
 ```bash
 filmstream status PLAYBACK_ID
 ```
 
-A 1.0 target means one uploaded byte per downloaded byte. It is a target, not a guarantee: the swarm must contain peers that need pieces from this client. Filmstream does not bypass private-tracker accounting or requirements. The current process continues seeding after the player exits, but sessions are not yet restored automatically after a backend restart.
+A 1.0 ratio means one uploaded byte per downloaded byte. This is necessarily best effort: Filmstream cannot upload bytes unless another peer requests them, and the hard time/space safety limits take precedence over waiting forever. Filmstream does not bypass or guarantee compliance with tracker-specific minimum-time, completion, or hit-and-run rules.
 
 ## API
 
@@ -214,8 +230,6 @@ The end-to-end torrent test builds a local `.torrent`, loads already-authorized 
 
 ## Next steps
 
-- Persist and restore torrents for long-lived seeding
-- Cache quota enforcement after ratio targets are met
 - TMDB validation and ID-based Torznab searches for resolved movies
 - Multiple-file selection in the CLI
 - Docker image and remote authentication

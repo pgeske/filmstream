@@ -48,13 +48,19 @@ type Server struct {
 }
 
 func New(indexers *indexer.Registry, engine *torrentstream.Engine, defaults catalog.Preferences, logger *slog.Logger) *Server {
-	return &Server{
+	server := &Server{
 		indexers: indexers,
 		engine:   engine,
 		defaults: defaults,
 		logger:   logger,
 		selected: make(map[string]catalog.RankedCandidate),
 	}
+	engine.SetCleanupHandler(func(id, _ string) {
+		server.mu.Lock()
+		delete(server.selected, id)
+		server.mu.Unlock()
+	})
+	return server
 }
 
 func (s *Server) SetIndexerReloader(reload func() error) {

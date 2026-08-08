@@ -3,67 +3,30 @@ package torrentstream
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/bencode"
 	"github.com/anacrolix/torrent/metainfo"
 )
 
-func TestEngineServesRangesFromTorrentStorage(t *testing.T) {
+func TestEngineServesRangesWithoutRequestingTheWholeFile(t *testing.T) {
 	dataDir := t.TempDir()
-	torrentDataDir := filepath.Join(dataDir, "torrents")
-	if err := os.MkdirAll(torrentDataDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	contents := bytes.Repeat([]byte("filmstream-range-test-"), 2048)
-	videoPath := filepath.Join(torrentDataDir, "sample.mp4")
-	if err := os.WriteFile(videoPath, contents, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	meta := metainfo.MetaInfo{}
-	meta.SetDefaults()
-	info := metainfo.Info{PieceLength: 16 << 10}
-	if err := info.BuildFromFilePath(videoPath); err != nil {
-		t.Fatal(err)
-	}
-	var err error
-	meta.InfoBytes, err = bencode.Marshal(info)
-	if err != nil {
-		t.Fatal(err)
-	}
-	torrentPath := filepath.Join(dataDir, "sample.torrent")
-	file, err := os.Create(torrentPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := meta.Write(file); err != nil {
-		file.Close()
-		t.Fatal(err)
-	}
-	if err := file.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	engine, err := New(Config{
-		DataDir:         dataDir,
-		MaxTorrentBytes: 1 << 30,
-		ReadaheadBytes:  1 << 20,
-		MetadataTimeout: 5 * time.Second,
-		SeedRatioTarget: 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	torrentPath, _, contents := createTestTorrent(t, dataDir)
+	engine := newTestEngine(t, dataDir, Config{})
 	defer engine.Close()
 
 	session, err := engine.Create(context.Background(), Source{TorrentPath: torrentPath})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if priority := session.file.Priority(); priority != torrent.PiecePriorityNone {
+		t.Fatalf("file priority = %v, want no background download", priority)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -80,4 +43,170 @@ func TestEngineServesRangesFromTorrentStorage(t *testing.T) {
 	if got, want := response.Body.Bytes(), contents[10:100]; !bytes.Equal(got, want) {
 		t.Fatalf("range body mismatch: got %d bytes, want %d", len(got), len(want))
 	}
+}
+
+func TestCleanupProtectsActiveStreamsThenRemovesIdleCache(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentPath, videoPath, _ := createTestTorrent(t, dataDir)
+	engine := newTestEngine(t, dataDir, Config{
+		CacheLimitBytes: 1,
+		IdleGrace:       time.Millisecond,
+		SeedMaxAge:      time.Hour,
+		CleanupInterval: time.Hour,
+	})
+	defer engine.Close()
+
+	session, err := engine.Create(context.Background(), Source{TorrentPath: torrentPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cleanupID, cleanupReason string
+	engine.SetCleanupHandler(func(id, reason string) {
+		cleanupID, cleanupReason = id, reason
+	})
+	if _, ok := engine.beginStream(session.ID, true); !ok {
+		t.Fatal("could not mark stream active")
+	}
+	engine.cleanup(time.Now().UTC().Add(2 * time.Hour))
+	if _, ok := engine.Get(session.ID); !ok {
+		t.Fatal("active stream was cleaned up")
+	}
+
+	engine.endStream(session.ID)
+	engine.cleanup(time.Now().UTC().Add(time.Second))
+	if _, ok := engine.Get(session.ID); ok {
+		t.Fatal("idle over-quota stream was not cleaned up")
+	}
+	if cleanupID != session.ID || cleanupReason != "cache-limit" {
+		t.Fatalf("cleanup = %q, %q", cleanupID, cleanupReason)
+	}
+	if _, err := os.Stat(videoPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cached video still exists: %v", err)
+	}
+}
+
+func TestCleanOnStartRemovesUnmanagedTorrentData(t *testing.T) {
+	dataDir := t.TempDir()
+	stalePath := filepath.Join(dataDir, "torrents", "old", "movie.mkv.part")
+	if err := os.MkdirAll(filepath.Dir(stalePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stalePath, []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	engine := newTestEngine(t, dataDir, Config{CleanOnStart: true})
+	defer engine.Close()
+	if _, err := os.Stat(stalePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale cache still exists: %v", err)
+	}
+}
+
+func TestCleanOnCloseRemovesManagedTorrentData(t *testing.T) {
+	dataDir := t.TempDir()
+	engine := newTestEngine(t, dataDir, Config{CleanOnClose: true})
+	path := filepath.Join(dataDir, "torrents", "temporary.part")
+	if err := os.WriteFile(path, []byte("temporary"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("managed data still exists after shutdown: %v", err)
+	}
+}
+
+func TestRatioTargetRequiresDownloadedData(t *testing.T) {
+	if ratioTargetMet(0, 0, 1) {
+		t.Fatal("empty transfer should not satisfy a positive ratio target")
+	}
+	if !ratioTargetMet(100, 1, 1) {
+		t.Fatal("1:1 transfer did not satisfy the ratio target")
+	}
+}
+
+func TestEngineLocksItsDataDirectory(t *testing.T) {
+	dataDir := t.TempDir()
+	first := newTestEngine(t, dataDir, Config{})
+	if second, err := New(testConfig(dataDir, Config{})); err == nil {
+		second.Close()
+		t.Fatal("second engine unexpectedly acquired the data directory")
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	third := newTestEngine(t, dataDir, Config{})
+	third.Close()
+}
+
+func createTestTorrent(t *testing.T, dataDir string) (torrentPath, videoPath string, contents []byte) {
+	t.Helper()
+	torrentDataDir := filepath.Join(dataDir, "torrents")
+	if err := os.MkdirAll(torrentDataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	contents = bytes.Repeat([]byte("filmstream-range-test-"), 2048)
+	videoPath = filepath.Join(torrentDataDir, "sample.mp4")
+	if err := os.WriteFile(videoPath, contents, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	meta := metainfo.MetaInfo{}
+	meta.SetDefaults()
+	info := metainfo.Info{PieceLength: 16 << 10}
+	if err := info.BuildFromFilePath(videoPath); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	meta.InfoBytes, err = bencode.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	torrentPath = filepath.Join(dataDir, "sample.torrent")
+	file, err := os.Create(torrentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := meta.Write(file); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return torrentPath, videoPath, contents
+}
+
+func newTestEngine(t *testing.T, dataDir string, overrides Config) *Engine {
+	t.Helper()
+	engine, err := New(testConfig(dataDir, overrides))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return engine
+}
+
+func testConfig(dataDir string, overrides Config) Config {
+	cfg := Config{
+		DataDir:         dataDir,
+		MaxTorrentBytes: 1 << 30,
+		ReadaheadBytes:  1 << 20,
+		MetadataTimeout: 5 * time.Second,
+		SeedRatioTarget: 1,
+	}
+	if overrides.CacheLimitBytes != 0 {
+		cfg.CacheLimitBytes = overrides.CacheLimitBytes
+	}
+	if overrides.IdleGrace != 0 {
+		cfg.IdleGrace = overrides.IdleGrace
+	}
+	if overrides.SeedMaxAge != 0 {
+		cfg.SeedMaxAge = overrides.SeedMaxAge
+	}
+	if overrides.CleanupInterval != 0 {
+		cfg.CleanupInterval = overrides.CleanupInterval
+	}
+	cfg.CleanOnStart = overrides.CleanOnStart
+	cfg.CleanOnClose = overrides.CleanOnClose
+	return cfg
 }
