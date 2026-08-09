@@ -28,7 +28,7 @@ import (
 	"github.com/pgeske/filmstream/internal/torrentstream"
 )
 
-const version = "0.5.2"
+const version = "0.5.3"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
