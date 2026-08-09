@@ -72,7 +72,7 @@ filmstream \
   --resolution 1080p \
   --language en \
   --codecs h264,h265 \
-  --max-size-gib 60 \
+  --max-size-gib 20 \
   "movie title"
 ```
 
@@ -105,7 +105,7 @@ The optional configuration file is `~/.config/filmstream/config.json`:
   "listen": "127.0.0.1:8943",
   "data_dir": "~/.cache/filmstream",
   "state_dir": "~/.local/state/filmstream",
-  "max_candidate_gib": 60,
+  "max_candidate_gib": 20,
   "readahead_mib": 32,
   "metadata_timeout_seconds": 120,
   "seed_ratio_target": 1.0,

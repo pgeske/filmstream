@@ -10,7 +10,7 @@ import (
 
 const (
 	defaultListen           = "127.0.0.1:8943"
-	defaultMaxCandidateGiB  = 60
+	defaultMaxCandidateGiB  = 20
 	defaultReadaheadMiB     = 32
 	defaultCacheLimitGiB    = 20
 	defaultMaxSeedSessions  = 20

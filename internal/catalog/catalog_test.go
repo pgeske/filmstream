@@ -12,7 +12,7 @@ func TestRankPrefersMatchingHealthySwarm(t *testing.T) {
 			Resolution:   "1080p",
 			Codecs:       []string{"h264", "h265"},
 			Languages:    []string{"en"},
-			MaxSizeBytes: 60 << 30,
+			MaxSizeBytes: 20 << 30,
 		},
 	}
 	candidates := []Candidate{
@@ -36,8 +36,8 @@ func TestRankPrefersMatchingHealthySwarm(t *testing.T) {
 func TestRankExcludesOversizedCandidate(t *testing.T) {
 	ranked := Rank(SearchRequest{
 		Query:       "Sintel",
-		Preferences: Preferences{MaxSizeBytes: 60 << 30},
-	}, []Candidate{{Name: "Sintel", SizeBytes: 61 << 30}})
+		Preferences: Preferences{MaxSizeBytes: 20 << 30},
+	}, []Candidate{{Name: "Sintel", SizeBytes: 21 << 30}})
 	if len(ranked) != 0 {
 		t.Fatalf("got %d candidates, want none", len(ranked))
 	}
