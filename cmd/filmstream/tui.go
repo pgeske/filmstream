@@ -229,6 +229,7 @@ func (m tuiModel) View() string {
 		view.WriteString("\n")
 	} else {
 		start, end := m.visibleRange()
+		titleWidths := m.rowTitleWidths(width)
 		lastSection := ""
 		for index := start; index < end; index++ {
 			row := m.rows[index]
@@ -237,7 +238,7 @@ func (m tuiModel) View() string {
 				view.WriteString("\n")
 				lastSection = row.section
 			}
-			line := m.renderRow(row, index == m.cursor, width)
+			line := m.renderRow(row, index == m.cursor, titleWidths[row.section])
 			view.WriteString(line)
 			view.WriteString("\n")
 		}
@@ -257,18 +258,35 @@ func (m tuiModel) View() string {
 	return lipgloss.NewStyle().Padding(1, 2).Render(view.String())
 }
 
-func (m tuiModel) renderRow(row tuiRow, selected bool, width int) string {
-	title := row.entry.Title
-	if row.entry.Year > 0 {
-		title += " (" + strconv.Itoa(row.entry.Year) + ")"
+func (m tuiModel) rowTitleWidths(width int) map[string]int {
+	titleWidths := make(map[string]int)
+	detailWidths := make(map[string]int)
+	for _, row := range m.rows {
+		titleWidths[row.section] = max(titleWidths[row.section], lipgloss.Width(historyTitle(row.entry)))
+		detailWidths[row.section] = max(detailWidths[row.section], lipgloss.Width(historyDetail(row.entry)))
 	}
+	for section, titleWidth := range titleWidths {
+		titleWidths[section] = min(titleWidth, max(18, width-detailWidths[section]-9))
+	}
+	return titleWidths
+}
+
+func (m tuiModel) renderRow(row tuiRow, selected bool, titleWidth int) string {
+	title := ansi.Truncate(historyTitle(row.entry), titleWidth, "…")
+	padding := strings.Repeat(" ", max(0, titleWidth-lipgloss.Width(title)))
 	detail := historyDetail(row.entry)
-	available := max(18, width-lipgloss.Width(detail)-9)
-	title = ansi.Truncate(title, available, "…")
 	if selected {
-		return " " + selectionStyle.Render("›") + " " + selectedTitleStyle.Render(title) + "  " + detail
+		return " " + selectionStyle.Render("›") + " " + selectedTitleStyle.Render(title) + padding + "  " + detail
 	}
-	return "   " + normalStyle.Render(title) + "  " + detail
+	return "   " + normalStyle.Render(title) + padding + "  " + detail
+}
+
+func historyTitle(entry history.Entry) string {
+	title := entry.Title
+	if entry.Year > 0 {
+		title += " (" + strconv.Itoa(entry.Year) + ")"
+	}
+	return title
 }
 
 func historyDetail(entry history.Entry) string {
