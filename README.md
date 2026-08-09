@@ -7,6 +7,7 @@ Use it only with media you are authorized to download and share.
 ## Current MVP
 
 - Local backend bound to `127.0.0.1:8943`
+- Bubble Tea terminal UI with search, continue watching, progress, and history controls
 - One-command CLI that starts the backend when needed and launches MPV
 - A small, trusted open-movie catalog plus an Internet Archive reference indexer
 - Standard Torznab indexers, including Prowlarr and Jackett endpoints
@@ -32,7 +33,23 @@ This installs `filmstream` to `~/.local/bin` by default.
 
 ## Use
 
-The normal command searches configured indexers, selects a release, starts the local server if necessary, and opens MPV:
+Open the terminal UI with no arguments:
+
+```bash
+filmstream
+```
+
+The home screen separates resumable movies from watch history. Use:
+
+- `/` or `s` to search by title, typo, or description
+- `Enter` to play or resume the selected movie
+- `u` to mark the selected movie unwatched
+- `d` to remove it from tracking
+- `q` to quit
+
+Filmstream records MPV position through its local IPC socket. Continue Watching starts after 30 seconds, and a movie is marked watched at 90%. History is stored privately in `~/.local/state/filmstream/history.json`; torrent data remains temporary and is not needed to remember progress. Resuming searches for an appropriate release again, then starts the new stream at the saved timestamp.
+
+The direct CLI searches configured indexers, selects a release, starts the local server if necessary, and opens MPV:
 
 ```bash
 filmstream --year 2010 Sintel
@@ -87,6 +104,7 @@ The optional configuration file is `~/.config/filmstream/config.json`:
 {
   "listen": "127.0.0.1:8943",
   "data_dir": "~/.cache/filmstream",
+  "state_dir": "~/.local/state/filmstream",
   "max_candidate_gib": 60,
   "readahead_mib": 32,
   "metadata_timeout_seconds": 120,
@@ -122,7 +140,7 @@ The optional configuration file is `~/.config/filmstream/config.json`:
 
 Set `FILMSTREAM_CONFIG` to use another path or `FILMSTREAM_SERVER` to use an already-running backend.
 
-Temporary torrent data is stored beneath `<data_dir>/torrents`. Filmstream owns that directory and clears it on clean startup and shutdown; do not place unrelated files there.
+Temporary torrent data is stored beneath `<data_dir>/torrents`. Filmstream owns that directory and clears it on clean startup and shutdown; do not place unrelated files there. Durable watch progress is stored separately beneath `<state_dir>`.
 
 ## Natural-language movie resolution
 
@@ -232,6 +250,7 @@ The end-to-end torrent test builds a local `.torrent`, loads already-authorized 
 
 ## Next steps
 
+- Rich metadata and artwork in the terminal UI
 - TMDB validation and ID-based Torznab searches for resolved movies
 - Multiple-file selection in the CLI
 - Docker image and remote authentication

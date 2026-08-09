@@ -22,12 +22,13 @@ import (
 	"github.com/pgeske/filmstream/internal/api"
 	"github.com/pgeske/filmstream/internal/catalog"
 	"github.com/pgeske/filmstream/internal/config"
+	"github.com/pgeske/filmstream/internal/history"
 	"github.com/pgeske/filmstream/internal/indexer"
 	"github.com/pgeske/filmstream/internal/resolver"
 	"github.com/pgeske/filmstream/internal/torrentstream"
 )
 
-const version = "0.4.1"
+const version = "0.5.0"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -37,6 +38,9 @@ func main() {
 }
 
 func run(args []string) error {
+	if len(args) == 0 {
+		return runTUI(nil)
+	}
 	if len(args) > 0 {
 		switch args[0] {
 		case "serve":
@@ -51,6 +55,8 @@ func run(args []string) error {
 			return runResolver(args[1:])
 		case "resolve":
 			return runResolve(args[1:])
+		case "tui":
+			return runTUI(args[1:])
 		case "version", "--version", "-version":
 			fmt.Println("filmstream", version)
 			return nil
@@ -268,6 +274,23 @@ func runPlay(args []string) error {
 		}
 		return fmt.Errorf("find player %q: %w", *player, err)
 	}
+	if filepath.Base(path) == "mpv" {
+		title := query
+		if title == "" {
+			title = response.Name
+		}
+		store := history.New(cfg.StateDir)
+		entry, err := store.Upsert(title, *year)
+		if err == nil {
+			if err := runTrackedMPV(path, response.StreamURL, entry, store); err != nil {
+				return err
+			}
+			fmt.Fprintln(os.Stderr, "Playback ended; Filmstream saved your progress and will retire temporary data automatically.")
+			return nil
+		}
+		fmt.Fprintln(os.Stderr, "Warning: watch progress will not be saved:", err)
+	}
+
 	commandArgs := []string{response.StreamURL}
 	if filepath.Base(path) == "mpv" {
 		commandArgs = append(mpvStreamingOptions(), response.StreamURL)
@@ -445,6 +468,7 @@ func printUsage() {
 	fmt.Print(`filmstream streams authorized torrent media to a local player.
 
 Usage:
+  filmstream                         # open the TUI
   filmstream [play] [options] MOVIE QUERY
   filmstream play --magnet 'magnet:?...'
   filmstream play --torrent ./movie.torrent
@@ -454,6 +478,7 @@ Usage:
   filmstream indexer list
   filmstream resolve MOVIE DESCRIPTION
   filmstream resolver configure [options]
+  filmstream tui [--config PATH]
 
 Examples:
   filmstream --year 2010 Sintel

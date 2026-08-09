@@ -26,6 +26,16 @@ func TestDefaultsMatchLocalMVP(t *testing.T) {
 	}
 }
 
+func TestMissingConfigExpandsDefaultStateDirectory(t *testing.T) {
+	cfg, err := Load(filepath.Join(t.TempDir(), "missing.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(cfg.StateDir) {
+		t.Fatalf("state directory = %q", cfg.StateDir)
+	}
+}
+
 func TestSaveUsesPrivatePermissions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "config.json")
 	cfg := Defaults()
@@ -60,7 +70,7 @@ func TestLoadOverlaysDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ReadaheadMiB != 64 || cfg.Listen != "127.0.0.1:8943" {
+	if cfg.ReadaheadMiB != 64 || cfg.Listen != "127.0.0.1:8943" || cfg.StateDir == "" {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
 	if len(cfg.Indexers) != 0 {

@@ -37,6 +37,7 @@ type Resolver struct {
 type Config struct {
 	Listen              string    `json:"listen"`
 	DataDir             string    `json:"data_dir"`
+	StateDir            string    `json:"state_dir"`
 	MaxCandidateGiB     int64     `json:"max_candidate_gib"`
 	ReadaheadMiB        int64     `json:"readahead_mib"`
 	MetadataTimeoutSecs int       `json:"metadata_timeout_seconds"`
@@ -56,6 +57,7 @@ func Defaults() Config {
 	return Config{
 		Listen:              defaultListen,
 		DataDir:             defaultDataDir(),
+		StateDir:            defaultStateDir(),
 		MaxCandidateGiB:     defaultMaxCandidateGiB,
 		ReadaheadMiB:        defaultReadaheadMiB,
 		MetadataTimeoutSecs: 120,
@@ -88,7 +90,9 @@ func Load(path string) (Config, error) {
 
 	contents, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return cfg, nil
+		cfg.DataDir = expandHome(cfg.DataDir)
+		cfg.StateDir = expandHome(cfg.StateDir)
+		return cfg, cfg.Validate()
 	}
 	if err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
@@ -97,6 +101,7 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("parse config: %w", err)
 	}
 	cfg.DataDir = expandHome(cfg.DataDir)
+	cfg.StateDir = expandHome(cfg.StateDir)
 	cfg.Resolver.APIKeyFile = expandHome(cfg.Resolver.APIKeyFile)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -153,6 +158,9 @@ func (c Config) Validate() error {
 	}
 	if c.DataDir == "" {
 		return errors.New("data directory cannot be empty")
+	}
+	if c.StateDir == "" {
+		return errors.New("state directory cannot be empty")
 	}
 	if c.MaxCandidateGiB <= 0 {
 		return errors.New("max_candidate_gib must be positive")
@@ -221,6 +229,13 @@ func defaultDataDir() string {
 		return filepath.Join(dir, "filmstream")
 	}
 	return filepath.Join("~", ".cache", "filmstream")
+}
+
+func defaultStateDir() string {
+	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
+		return filepath.Join(dir, "filmstream")
+	}
+	return filepath.Join("~", ".local", "state", "filmstream")
 }
 
 func expandHome(path string) string {
