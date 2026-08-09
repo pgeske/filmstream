@@ -11,7 +11,7 @@ func TestDefaultsMatchLocalMVP(t *testing.T) {
 	if cfg.Listen != "127.0.0.1:8943" {
 		t.Fatalf("listen = %q", cfg.Listen)
 	}
-	if cfg.MaxCandidateGiB != 20 {
+	if cfg.MaxCandidateGiB != 60 {
 		t.Fatalf("max size = %d", cfg.MaxCandidateGiB)
 	}
 	if cfg.SeedRatioTarget != 1 {

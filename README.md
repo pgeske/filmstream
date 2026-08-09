@@ -72,7 +72,7 @@ filmstream \
   --resolution 1080p \
   --language en \
   --codecs h264,h265 \
-  --max-size-gib 20 \
+  --max-size-gib 60 \
   "movie title"
 ```
 
@@ -105,7 +105,7 @@ The optional configuration file is `~/.config/filmstream/config.json`:
   "listen": "127.0.0.1:8943",
   "data_dir": "~/.cache/filmstream",
   "state_dir": "~/.local/state/filmstream",
-  "max_candidate_gib": 20,
+  "max_candidate_gib": 60,
   "readahead_mib": 32,
   "metadata_timeout_seconds": 120,
   "seed_ratio_target": 1.0,
@@ -208,7 +208,7 @@ The config file is written with mode `0600` because it contains API keys. The CL
 
 Filmstream only requests the pieces needed by MPV's current HTTP Range request, a 32 MiB read-ahead window, and a small tail window used to find container metadata. It does not complete the rest of a movie in the background. Closing MPV closes those readers, so a ten-minute sample remains a partial download.
 
-MPV waits for a two-second initial cache before playback to avoid startup jitter. On WSL with Wayland and NVIDIA's NVDEC library available, Filmstream uses the stable `wlshm` output path with `nvdec-copy`; other environments keep MPV's portable automatic output and software-decoding fallback.
+MPV waits for a two-second initial cache before playback to avoid startup jitter. On WSL with Wayland and NVIDIA's NVDEC library available, Filmstream uses `wlshm` output with `nvdec-copy`; other environments keep MPV's portable automatic output and software-decoding fallback.
 
 Every verified piece remains available for upload while the session is retained. After playback becomes idle, Filmstream manages the lifecycle automatically:
 

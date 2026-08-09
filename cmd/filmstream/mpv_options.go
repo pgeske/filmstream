@@ -22,7 +22,7 @@ func mpvStreamingOptionsFor(platform mpvPlatform) []string {
 		"--cache-pause-wait=2",
 	}
 	if platform.UseWSLNVDEC {
-		options = append(options, "--profile=sw-fast", "--vo=wlshm", "--hwdec=nvdec-copy")
+		options = append(options, "--vo=wlshm", "--hwdec=nvdec-copy")
 	}
 	return options
 }

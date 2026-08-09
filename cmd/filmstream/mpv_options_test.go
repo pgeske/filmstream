@@ -25,7 +25,6 @@ func TestMPVStreamingOptionsUseStableWSLNVDECPath(t *testing.T) {
 		"--cache-secs=30",
 		"--cache-pause-initial=yes",
 		"--cache-pause-wait=2",
-		"--profile=sw-fast",
 		"--vo=wlshm",
 		"--hwdec=nvdec-copy",
 	}
