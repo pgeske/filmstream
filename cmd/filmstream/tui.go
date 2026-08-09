@@ -19,10 +19,8 @@ import (
 )
 
 const (
-	colorBase     = "#303446"
 	colorText     = "#c6d0f5"
 	colorSubtext  = "#a5adce"
-	colorSurface  = "#414559"
 	colorOverlay  = "#737994"
 	colorBlue     = "#8caaee"
 	colorLavender = "#babbf1"
@@ -61,14 +59,15 @@ type tuiModel struct {
 }
 
 var (
-	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorLavender))
-	sectionStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorBlue)).MarginTop(1)
-	selectedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorText)).Background(lipgloss.Color(colorSurface))
-	normalStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
-	detailStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtext))
-	helpStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOverlay))
-	statusStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen))
-	errorStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorRed))
+	titleStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorLavender))
+	sectionStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorBlue)).MarginTop(1)
+	selectedTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorLavender))
+	selectionStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorBlue))
+	normalStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
+	detailStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(colorSubtext))
+	helpStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color(colorOverlay))
+	statusStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen))
+	errorStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color(colorRed))
 )
 
 func runTUI(args []string) error {
@@ -255,14 +254,10 @@ func (m tuiModel) View() string {
 	}
 	view.WriteString("\n")
 	view.WriteString(helpStyle.Render("↑/↓ navigate  •  enter watch  •  / search  •  u unwatched  •  d remove  •  q quit"))
-	return lipgloss.NewStyle().Background(lipgloss.Color(colorBase)).Padding(1, 2).Width(max(20, width-4)).Render(view.String())
+	return lipgloss.NewStyle().Padding(1, 2).Render(view.String())
 }
 
 func (m tuiModel) renderRow(row tuiRow, selected bool, width int) string {
-	marker := "  "
-	if selected {
-		marker = "› "
-	}
 	title := row.entry.Title
 	if row.entry.Year > 0 {
 		title += " (" + strconv.Itoa(row.entry.Year) + ")"
@@ -270,11 +265,10 @@ func (m tuiModel) renderRow(row tuiRow, selected bool, width int) string {
 	detail := historyDetail(row.entry)
 	available := max(18, width-lipgloss.Width(detail)-9)
 	title = ansi.Truncate(title, available, "…")
-	line := marker + title + "  " + detail
 	if selected {
-		return selectedStyle.Padding(0, 1).Width(max(20, width-6)).Render(line)
+		return " " + selectionStyle.Render("›") + " " + selectedTitleStyle.Render(title) + "  " + detail
 	}
-	return normalStyle.Padding(0, 1).Render(line)
+	return "   " + normalStyle.Render(title) + "  " + detail
 }
 
 func historyDetail(entry history.Entry) string {

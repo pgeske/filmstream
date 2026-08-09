@@ -31,6 +31,12 @@ func TestTUIBuildsContinueAndHistorySections(t *testing.T) {
 		t.Fatalf("rows = %+v", model.rows)
 	}
 	view := model.View()
+	if strings.Contains(view, "\x1b[48;") {
+		t.Fatal("view contains a background color that can bleed into adjacent lines")
+	}
+	if line := model.renderRow(model.rows[0], true, 100); strings.Contains(line, "\n") {
+		t.Fatalf("selected row wrapped unexpectedly: %q", line)
+	}
 	for _, expected := range []string{"FILMSTREAM", "Continue Watching", "Sintel", "Watch History", "Cosmos Laundromat"} {
 		if !strings.Contains(view, expected) {
 			t.Fatalf("view does not contain %q", expected)
