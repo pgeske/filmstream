@@ -18,7 +18,7 @@ func TestMPVStreamingOptionsPrimeCacheBeforePlayback(t *testing.T) {
 	}
 }
 
-func TestMPVStreamingOptionsUseStableWSLNVDECPath(t *testing.T) {
+func TestMPVStreamingOptionsUseLegacyWSLNVDECPath(t *testing.T) {
 	got := mpvStreamingOptionsFor(mpvPlatform{UseWSLNVDEC: true})
 	want := []string{
 		"--cache=yes",
@@ -26,6 +26,22 @@ func TestMPVStreamingOptionsUseStableWSLNVDECPath(t *testing.T) {
 		"--cache-pause-initial=yes",
 		"--cache-pause-wait=2",
 		"--vo=wlshm",
+		"--hwdec=nvdec-copy",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("options = %q, want %q", got, want)
+	}
+}
+
+func TestMPVStreamingOptionsUseModernWSLGPUPath(t *testing.T) {
+	got := mpvStreamingOptionsFor(mpvPlatform{UseWSLNVDEC: true, UseGPUNext: true})
+	want := []string{
+		"--cache=yes",
+		"--cache-secs=30",
+		"--cache-pause-initial=yes",
+		"--cache-pause-wait=2",
+		"--vo=gpu-next",
+		"--gpu-context=x11egl",
 		"--hwdec=nvdec-copy",
 	}
 	if !reflect.DeepEqual(got, want) {

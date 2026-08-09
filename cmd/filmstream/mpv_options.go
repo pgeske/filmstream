@@ -2,16 +2,18 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
 
-func mpvStreamingOptions() []string {
-	return mpvStreamingOptionsFor(detectMPVPlatform())
+func mpvStreamingOptions(path string) []string {
+	return mpvStreamingOptionsFor(detectMPVPlatform(path))
 }
 
 type mpvPlatform struct {
 	UseWSLNVDEC bool
+	UseGPUNext  bool
 }
 
 func mpvStreamingOptionsFor(platform mpvPlatform) []string {
@@ -22,19 +24,27 @@ func mpvStreamingOptionsFor(platform mpvPlatform) []string {
 		"--cache-pause-wait=2",
 	}
 	if platform.UseWSLNVDEC {
-		options = append(options, "--vo=wlshm", "--hwdec=nvdec-copy")
+		if platform.UseGPUNext {
+			options = append(options, "--vo=gpu-next", "--gpu-context=x11egl", "--hwdec=nvdec-copy")
+		} else {
+			options = append(options, "--vo=wlshm", "--hwdec=nvdec-copy")
+		}
 	}
 	return options
 }
 
-func detectMPVPlatform() mpvPlatform {
+func detectMPVPlatform(path string) mpvPlatform {
 	contents, err := os.ReadFile("/proc/sys/kernel/osrelease")
 	if err != nil || !strings.Contains(strings.ToLower(string(contents)), "microsoft") {
 		return mpvPlatform{}
 	}
-	if os.Getenv("WAYLAND_DISPLAY") == "" {
+	matches, _ := filepath.Glob("/usr/lib/wsl/lib/libnvcuvid.so*")
+	useNVDEC := len(matches) > 0 && (os.Getenv("WAYLAND_DISPLAY") != "" || os.Getenv("DISPLAY") != "")
+	if !useNVDEC {
 		return mpvPlatform{}
 	}
-	matches, _ := filepath.Glob("/usr/lib/wsl/lib/libnvcuvid.so*")
-	return mpvPlatform{UseWSLNVDEC: len(matches) > 0}
+
+	output, err := exec.Command(path, "--vo=help").CombinedOutput()
+	useGPUNext := err == nil && os.Getenv("DISPLAY") != "" && strings.Contains(string(output), "gpu-next")
+	return mpvPlatform{UseWSLNVDEC: true, UseGPUNext: useGPUNext}
 }

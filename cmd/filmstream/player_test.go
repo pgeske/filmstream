@@ -10,8 +10,8 @@ import (
 )
 
 func TestTrackedMPVOptionsPreserveStreamingStartupOptions(t *testing.T) {
-	streaming := mpvStreamingOptions()
-	options := trackedMPVOptions("/tmp/mpv.sock", "Sintel (2010)", 65.5)
+	streaming := mpvStreamingOptions("mpv")
+	options := trackedMPVOptions("mpv", "/tmp/mpv.sock", "Sintel (2010)", 65.5)
 	if !slices.Equal(options[:len(streaming)], streaming) {
 		t.Fatalf("streaming prefix = %q, want %q", options[:len(streaming)], streaming)
 	}

@@ -31,7 +31,7 @@ func runTrackedMPV(path, streamURL string, entry history.Entry, store *history.S
 		title += fmt.Sprintf(" (%d)", entry.Year)
 	}
 	position := entry.ResumePosition()
-	args := trackedMPVOptions(socketPath, title, position)
+	args := trackedMPVOptions(path, socketPath, title, position)
 	if position > 0 {
 		fmt.Fprintf(os.Stderr, "Resuming at %s.\n", formatDuration(position))
 	}
@@ -75,8 +75,8 @@ func runTrackedMPV(path, streamURL string, entry history.Entry, store *history.S
 	}
 }
 
-func trackedMPVOptions(socketPath, title string, position float64) []string {
-	options := append([]string(nil), mpvStreamingOptions()...)
+func trackedMPVOptions(path, socketPath, title string, position float64) []string {
+	options := append([]string(nil), mpvStreamingOptions(path)...)
 	options = append(options,
 		"--resume-playback=no",
 		"--force-media-title="+title,
