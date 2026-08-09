@@ -12,8 +12,9 @@ func mpvStreamingOptions(path string) []string {
 }
 
 type mpvPlatform struct {
-	UseWSLNVDEC bool
-	UseGPUNext  bool
+	UseWindowsD3D11 bool
+	UseWSLNVDEC     bool
+	UseGPUNext      bool
 }
 
 func mpvStreamingOptionsFor(platform mpvPlatform) []string {
@@ -23,7 +24,9 @@ func mpvStreamingOptionsFor(platform mpvPlatform) []string {
 		"--cache-pause-initial=yes",
 		"--cache-pause-wait=2",
 	}
-	if platform.UseWSLNVDEC {
+	if platform.UseWindowsD3D11 {
+		options = append(options, "--hwdec=auto-safe")
+	} else if platform.UseWSLNVDEC {
 		if platform.UseGPUNext {
 			options = append(options, "--vo=gpu-next", "--gpu-context=x11egl", "--hwdec=nvdec-copy")
 		} else {
@@ -34,6 +37,10 @@ func mpvStreamingOptionsFor(platform mpvPlatform) []string {
 }
 
 func detectMPVPlatform(path string) mpvPlatform {
+	if isWindowsMPV(path) {
+		return mpvPlatform{UseWindowsD3D11: true}
+	}
+
 	contents, err := os.ReadFile("/proc/sys/kernel/osrelease")
 	if err != nil || !strings.Contains(strings.ToLower(string(contents)), "microsoft") {
 		return mpvPlatform{}

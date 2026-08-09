@@ -18,6 +18,20 @@ func TestMPVStreamingOptionsPrimeCacheBeforePlayback(t *testing.T) {
 	}
 }
 
+func TestMPVStreamingOptionsUseWindowsHardwareDecoding(t *testing.T) {
+	got := mpvStreamingOptionsFor(mpvPlatform{UseWindowsD3D11: true})
+	want := []string{
+		"--cache=yes",
+		"--cache-secs=30",
+		"--cache-pause-initial=yes",
+		"--cache-pause-wait=2",
+		"--hwdec=auto-safe",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("options = %q, want %q", got, want)
+	}
+}
+
 func TestMPVStreamingOptionsUseLegacyWSLNVDECPath(t *testing.T) {
 	got := mpvStreamingOptionsFor(mpvPlatform{UseWSLNVDEC: true})
 	want := []string{

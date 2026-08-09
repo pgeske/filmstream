@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"net"
+	"os"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -11,12 +12,37 @@ import (
 
 func TestTrackedMPVOptionsPreserveStreamingStartupOptions(t *testing.T) {
 	streaming := mpvStreamingOptions("mpv")
-	options := trackedMPVOptions("mpv", "/tmp/mpv.sock", "Sintel (2010)", 65.5)
+	options := trackedMPVOptions("mpv", []string{"--input-ipc-server=/tmp/mpv.sock"}, "Sintel (2010)", 65.5)
 	if !slices.Equal(options[:len(streaming)], streaming) {
 		t.Fatalf("streaming prefix = %q, want %q", options[:len(streaming)], streaming)
 	}
 	if options[len(options)-1] != "--start=65.5" {
 		t.Fatalf("resume option = %q", options[len(options)-1])
+	}
+}
+
+func TestRecognizesMPVExecutables(t *testing.T) {
+	for _, path := range []string{"mpv", "/usr/bin/mpv", "/mnt/c/mpv/mpv.exe", "/mnt/c/mpv/MPV.COM"} {
+		if !isMPV(path) {
+			t.Errorf("isMPV(%q) = false", path)
+		}
+	}
+	if isMPV("ffplay.exe") {
+		t.Error("isMPV recognized ffplay")
+	}
+}
+
+func TestReadWindowsMPVProgress(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "progress.json")
+	if err := os.WriteFile(path, []byte(`{"position":321.5,"duration":7200}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	position, duration, err := readWindowsMPVProgress(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if position != 321.5 || duration != 7200 {
+		t.Fatalf("progress = %f / %f", position, duration)
 	}
 }
 
