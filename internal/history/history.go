@@ -18,8 +18,12 @@ const resumeThresholdSeconds = 30
 
 type Entry struct {
 	ID              string    `json:"id"`
+	MediaID         string    `json:"media_id,omitempty"`
 	Title           string    `json:"title"`
 	Year            int       `json:"year,omitempty"`
+	Overview        string    `json:"overview,omitempty"`
+	PosterURL       string    `json:"poster_url,omitempty"`
+	BackdropURL     string    `json:"backdrop_url,omitempty"`
 	PositionSeconds float64   `json:"position_seconds"`
 	DurationSeconds float64   `json:"duration_seconds,omitempty"`
 	Completed       bool      `json:"completed"`
@@ -96,6 +100,95 @@ func (s *Store) Upsert(title string, year int) (Entry, error) {
 		return Entry{}, err
 	}
 	return entry, nil
+}
+
+func (s *Store) RecordProgress(update Entry) (Entry, error) {
+	update.Title = strings.TrimSpace(update.Title)
+	if update.Title == "" {
+		return Entry{}, errors.New("history title cannot be empty")
+	}
+	update.MediaID = strings.TrimSpace(update.MediaID)
+	update.Overview = strings.TrimSpace(update.Overview)
+	update.PosterURL = strings.TrimSpace(update.PosterURL)
+	update.BackdropURL = strings.TrimSpace(update.BackdropURL)
+	update.PositionSeconds = max(0, update.PositionSeconds)
+	update.DurationSeconds = max(0, update.DurationSeconds)
+	if update.DurationSeconds > 0 {
+		update.PositionSeconds = min(update.PositionSeconds, update.DurationSeconds)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := s.read()
+	if err != nil {
+		return Entry{}, err
+	}
+	update.ID = entryID(update.Title, update.Year)
+	update.UpdatedAt = time.Now().UTC()
+	for i := range entries {
+		if entries[i].ID != update.ID && (update.MediaID == "" || entries[i].MediaID != update.MediaID) {
+			continue
+		}
+		update.ID = entries[i].ID
+		if update.MediaID == "" {
+			update.MediaID = entries[i].MediaID
+		}
+		if update.Overview == "" {
+			update.Overview = entries[i].Overview
+		}
+		if update.PosterURL == "" {
+			update.PosterURL = entries[i].PosterURL
+		}
+		if update.BackdropURL == "" {
+			update.BackdropURL = entries[i].BackdropURL
+		}
+		if update.DurationSeconds == 0 {
+			update.DurationSeconds = entries[i].DurationSeconds
+		}
+		update.Completed = update.DurationSeconds > 0 && update.Progress() >= 0.9
+		entries[i] = update
+		if err := s.write(entries); err != nil {
+			return Entry{}, err
+		}
+		return update, nil
+	}
+	update.Completed = update.DurationSeconds > 0 && update.Progress() >= 0.9
+	entries = append(entries, update)
+	if err := s.write(entries); err != nil {
+		return Entry{}, err
+	}
+	return update, nil
+}
+
+func (s *Store) UpdateMetadata(id string, metadata Entry) (Entry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := s.read()
+	if err != nil {
+		return Entry{}, err
+	}
+	for i := range entries {
+		if entries[i].ID != id {
+			continue
+		}
+		if value := strings.TrimSpace(metadata.MediaID); value != "" {
+			entries[i].MediaID = value
+		}
+		if value := strings.TrimSpace(metadata.Overview); value != "" {
+			entries[i].Overview = value
+		}
+		if value := strings.TrimSpace(metadata.PosterURL); value != "" {
+			entries[i].PosterURL = value
+		}
+		if value := strings.TrimSpace(metadata.BackdropURL); value != "" {
+			entries[i].BackdropURL = value
+		}
+		if err := s.write(entries); err != nil {
+			return Entry{}, err
+		}
+		return entries[i], nil
+	}
+	return Entry{}, fmt.Errorf("history entry %q not found", id)
 }
 
 func (s *Store) UpdateProgress(id string, position, duration float64) error {

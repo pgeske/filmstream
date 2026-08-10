@@ -49,6 +49,45 @@ func TestStoreTracksResumeCompletionAndRemoval(t *testing.T) {
 	}
 }
 
+func TestStoreRecordsSharedProgressMetadata(t *testing.T) {
+	store := New(t.TempDir())
+	entry, err := store.RecordProgress(Entry{
+		MediaID:         "tmdb:335984",
+		Title:           "Blade Runner 2049",
+		Year:            2017,
+		Overview:        "A young blade runner uncovers a secret.",
+		PosterURL:       "https://image.example/poster.jpg",
+		BackdropURL:     "https://image.example/backdrop.jpg",
+		PositionSeconds: 600,
+		DurationSeconds: 1800,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !entry.CanContinue() || entry.MediaID != "tmdb:335984" {
+		t.Fatalf("entry = %+v", entry)
+	}
+	enriched, err := store.UpdateMetadata(entry.ID, Entry{BackdropURL: "https://image.example/new-backdrop.jpg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enriched.UpdatedAt != entry.UpdatedAt || enriched.BackdropURL != "https://image.example/new-backdrop.jpg" {
+		t.Fatalf("enriched entry = %+v", enriched)
+	}
+	updated, err := store.RecordProgress(Entry{
+		MediaID:         entry.MediaID,
+		Title:           entry.Title,
+		Year:            entry.Year,
+		PositionSeconds: 700,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.ID != entry.ID || updated.DurationSeconds != 1800 {
+		t.Fatalf("updated entry = %+v", updated)
+	}
+}
+
 func TestStoreUsesPrivatePermissions(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), "state")
 	store := New(stateDir)

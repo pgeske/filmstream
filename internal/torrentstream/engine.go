@@ -114,8 +114,11 @@ type Status struct {
 	Ratio            float64    `json:"ratio"`
 	RatioTarget      float64    `json:"ratio_target"`
 	RatioTargetMet   bool       `json:"ratio_target_met"`
+	TotalPeers       int        `json:"total_peers"`
+	PendingPeers     int        `json:"pending_peers"`
 	ActivePeers      int        `json:"active_peers"`
 	ConnectedSeeders int        `json:"connected_seeders"`
+	HalfOpenPeers    int        `json:"half_open_peers"`
 }
 
 func New(cfg Config) (*Engine, error) {
@@ -360,8 +363,11 @@ func (e *Engine) Status(id string) (Status, bool) {
 	status.Ratio = ratio
 	status.RatioTarget = e.seedRatioTarget
 	status.RatioTargetMet = ratioTargetMet(downloaded, ratio, e.seedRatioTarget)
+	status.TotalPeers = stats.TotalPeers
+	status.PendingPeers = stats.PendingPeers
 	status.ActivePeers = stats.ActivePeers
 	status.ConnectedSeeders = stats.ConnectedSeeders
+	status.HalfOpenPeers = stats.HalfOpenPeers
 	return status, true
 }
 

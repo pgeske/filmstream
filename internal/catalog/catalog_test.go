@@ -33,6 +33,44 @@ func TestRankPrefersMatchingHealthySwarm(t *testing.T) {
 	}
 }
 
+func TestRankStreamingOptimizedPrefersNativeFriendlyEncode(t *testing.T) {
+	manySeeders, enoughSeeders := 300, 20
+	ranked := Rank(SearchRequest{
+		Query: "The Matrix",
+		Year:  1999,
+		Preferences: Preferences{
+			Resolution:         "1080p",
+			Codecs:             []string{"h264", "h265"},
+			MaxSizeBytes:       50 << 30,
+			StreamingOptimized: true,
+		},
+	}, []Candidate{
+		{Name: "The.Matrix.1999.1080p.BluRay.AVC.TrueHD.REMUX", SizeBytes: 32 << 30, Seeders: &manySeeders},
+		{Name: "The.Matrix.1999.2160p.DV.HEVC.REMUX", SizeBytes: 40 << 30, Seeders: &manySeeders},
+		{Name: "The.Matrix.1999.1080p.WEB-DL.x264.AAC", SizeBytes: 8 << 30, Seeders: &enoughSeeders},
+		{Name: "The.Matrix.1999.1080p.Xvid", SizeBytes: 2 << 30, Seeders: &manySeeders},
+	})
+	if len(ranked) != 2 {
+		t.Fatalf("got %d candidates, want compatible WEB and remux candidates", len(ranked))
+	}
+	if got := ranked[0].Candidate.Name; got != "The.Matrix.1999.1080p.WEB-DL.x264.AAC" {
+		t.Fatalf("top candidate = %q", got)
+	}
+}
+
+func TestRankStreamingOptimizedAllowsTrustedUnknownCodec(t *testing.T) {
+	ranked := Rank(SearchRequest{
+		Query: "Sintel",
+		Preferences: Preferences{
+			Codecs:             []string{"h264", "h265"},
+			StreamingOptimized: true,
+		},
+	}, []Candidate{{Name: "Sintel", Trusted: true}})
+	if len(ranked) != 1 {
+		t.Fatalf("trusted catalog candidate was rejected: %+v", ranked)
+	}
+}
+
 func TestRankExcludesOversizedCandidate(t *testing.T) {
 	ranked := Rank(SearchRequest{
 		Query:       "Sintel",

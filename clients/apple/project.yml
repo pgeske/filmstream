@@ -1,0 +1,44 @@
+name: FilmstreamApple
+options:
+  minimumXcodeGenVersion: 2.46.0
+  deploymentTarget:
+    tvOS: "18.0"
+  createIntermediateGroups: true
+packages:
+  FilmstreamCore:
+    path: Packages/FilmstreamCore
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: minimal
+    CLANG_ENABLE_MODULES: YES
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 0.1.0
+targets:
+  FilmstreamTV:
+    type: application
+    platform: tvOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: FilmstreamTV
+        excludes:
+          - Info.plist
+    dependencies:
+      - package: FilmstreamCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.alyoshukai.filmstream.tv
+        PRODUCT_NAME: Filmstream
+        INFOPLIST_FILE: FilmstreamTV/Info.plist
+        TARGETED_DEVICE_FAMILY: 3
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_USER_SCRIPT_SANDBOXING: YES
+schemes:
+  FilmstreamTV:
+    build:
+      targets:
+        FilmstreamTV: all
+    run:
+      config: Debug
+    archive:
+      config: Release

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -23,7 +24,9 @@ import (
 	"github.com/pgeske/filmstream/internal/catalog"
 	"github.com/pgeske/filmstream/internal/config"
 	"github.com/pgeske/filmstream/internal/history"
+	"github.com/pgeske/filmstream/internal/hls"
 	"github.com/pgeske/filmstream/internal/indexer"
+	"github.com/pgeske/filmstream/internal/metadata"
 	"github.com/pgeske/filmstream/internal/resolver"
 	"github.com/pgeske/filmstream/internal/torrentstream"
 )
@@ -82,6 +85,9 @@ func runServer(args []string) error {
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return err
 	}
+	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
+		return err
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	registry, err := indexer.NewRegistry(cfg.Indexers)
@@ -108,6 +114,25 @@ func runServer(args []string) error {
 	}
 	defer engine.Close()
 
+	sourceBaseURL, err := loopbackBaseURL(cfg.Listen)
+	if err != nil {
+		return err
+	}
+	hlsManager, hlsErr := hls.New(hls.Config{
+		DataDir:        cfg.HLSDir,
+		FFmpegPath:     cfg.FFmpegPath,
+		FFprobePath:    cfg.FFprobePath,
+		SourceBaseURL:  sourceBaseURL,
+		StartupTimeout: time.Duration(cfg.HLSStartupSeconds) * time.Second,
+		SegmentSeconds: cfg.HLSSegmentSeconds,
+		Logger:         logger,
+	})
+	if hlsErr != nil {
+		logger.Warn("native HLS playback disabled", "error", hlsErr)
+	} else {
+		defer hlsManager.Close()
+	}
+
 	defaults := catalog.Preferences{
 		Resolution:   cfg.PreferredResolution,
 		Codecs:       []string{"h264", "h265"},
@@ -118,8 +143,17 @@ func runServer(args []string) error {
 	if err != nil {
 		return err
 	}
+	metadataProvider, err := metadata.FromConfig(cfg.Metadata)
+	if err != nil {
+		return err
+	}
 	apiServer := api.New(registry, engine, defaults, logger)
 	apiServer.SetMovieResolver(movieResolver)
+	apiServer.SetMetadataProvider(metadataProvider)
+	apiServer.SetHistoryStore(history.New(cfg.StateDir))
+	if hlsManager != nil {
+		apiServer.SetHLSManager(hlsManager)
+	}
 	apiServer.SetResolverReloader(func() error {
 		updated, err := config.Load(*configPath)
 		if err != nil {
@@ -160,6 +194,14 @@ func runServer(args []string) error {
 		return nil
 	}
 	return err
+}
+
+func loopbackBaseURL(listen string) (string, error) {
+	_, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return "", fmt.Errorf("parse listen address for HLS: %w", err)
+	}
+	return "http://" + net.JoinHostPort("127.0.0.1", port), nil
 }
 
 func runPlay(args []string) error {

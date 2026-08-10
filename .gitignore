@@ -1,3 +1,9 @@
 /bin/
 *.log
 .env
+.DS_Store
+clients/apple/Packages/*/.build/
+clients/apple/Packages/*/.swiftpm/
+clients/apple/*.xcodeproj/
+clients/apple/.derivedData/
+**/xcuserdata/

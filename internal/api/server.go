@@ -5,13 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 
 	"github.com/pgeske/filmstream/internal/catalog"
+	"github.com/pgeske/filmstream/internal/history"
+	"github.com/pgeske/filmstream/internal/hls"
 	"github.com/pgeske/filmstream/internal/indexer"
+	"github.com/pgeske/filmstream/internal/metadata"
 	"github.com/pgeske/filmstream/internal/resolver"
 	"github.com/pgeske/filmstream/internal/torrentstream"
 )
@@ -33,6 +38,12 @@ type CreatePlaybackResponse struct {
 	Selected  *catalog.RankedCandidate `json:"selected,omitempty"`
 }
 
+type HLSStreamManager interface {
+	Start(context.Context, string, float64) (hls.Stream, error)
+	AssetPath(string, string) (string, error)
+	Stop(string)
+}
+
 type Server struct {
 	indexers       *indexer.Registry
 	engine         *torrentstream.Engine
@@ -41,10 +52,15 @@ type Server struct {
 	reloadIndexers func() error
 	reloadResolver func() error
 
-	resolverMu    sync.RWMutex
-	movieResolver resolver.Resolver
-	mu            sync.RWMutex
-	selected      map[string]catalog.RankedCandidate
+	resolverMu       sync.RWMutex
+	movieResolver    resolver.Resolver
+	metadataMu       sync.RWMutex
+	metadataProvider metadata.Provider
+	historyStore     *history.Store
+	hlsMu            sync.RWMutex
+	hlsManager       HLSStreamManager
+	mu               sync.RWMutex
+	selected         map[string]catalog.RankedCandidate
 }
 
 func New(indexers *indexer.Registry, engine *torrentstream.Engine, defaults catalog.Preferences, logger *slog.Logger) *Server {
@@ -59,6 +75,12 @@ func New(indexers *indexer.Registry, engine *torrentstream.Engine, defaults cata
 		server.mu.Lock()
 		delete(server.selected, id)
 		server.mu.Unlock()
+		server.hlsMu.RLock()
+		manager := server.hlsManager
+		server.hlsMu.RUnlock()
+		if manager != nil {
+			manager.Stop(id)
+		}
 	})
 	return server
 }
@@ -77,6 +99,22 @@ func (s *Server) SetResolverReloader(reload func() error) {
 	s.reloadResolver = reload
 }
 
+func (s *Server) SetMetadataProvider(provider metadata.Provider) {
+	s.metadataMu.Lock()
+	s.metadataProvider = provider
+	s.metadataMu.Unlock()
+}
+
+func (s *Server) SetHistoryStore(store *history.Store) {
+	s.historyStore = store
+}
+
+func (s *Server) SetHLSManager(manager HLSStreamManager) {
+	s.hlsMu.Lock()
+	s.hlsManager = manager
+	s.hlsMu.Unlock()
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, _ *http.Request) {
@@ -85,10 +123,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/indexers/reload", s.reloadIndexerConfiguration)
 	mux.HandleFunc("POST /v1/resolver/reload", s.reloadResolverConfiguration)
 	mux.HandleFunc("POST /v1/resolve", s.resolveMovie)
+	mux.HandleFunc("GET /v1/catalog/search", s.searchCatalog)
+	mux.HandleFunc("GET /v1/watch-history", s.listWatchHistory)
+	mux.HandleFunc("PUT /v1/watch-history", s.updateWatchProgress)
 	mux.HandleFunc("POST /v1/playbacks", s.createPlayback)
 	mux.HandleFunc("GET /v1/playbacks/{id}", s.playbackStatus)
 	mux.HandleFunc("GET /v1/playbacks/{id}/stream", s.streamPlayback)
 	mux.HandleFunc("HEAD /v1/playbacks/{id}/stream", s.streamPlayback)
+	mux.HandleFunc("POST /v1/playbacks/{id}/hls", s.startHLSPlayback)
+	mux.HandleFunc("DELETE /v1/playbacks/{id}/hls", s.stopHLSPlayback)
+	mux.HandleFunc("GET /v1/playbacks/{id}/hls/{asset}", s.serveHLSAsset)
 	return mux
 }
 
@@ -124,6 +168,196 @@ func (s *Server) resolveMovie(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) searchCatalog(w http.ResponseWriter, r *http.Request) {
+	query := strings.TrimSpace(r.URL.Query().Get("query"))
+	if query == "" {
+		query = strings.TrimSpace(r.URL.Query().Get("q"))
+	}
+	if query == "" {
+		writeError(w, http.StatusBadRequest, "query cannot be empty")
+		return
+	}
+	movies, err := s.searchMovies(r.Context(), query)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if movies == nil {
+		movies = []metadata.Movie{}
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Items []metadata.Movie `json:"items"`
+	}{Items: movies})
+}
+
+func (s *Server) searchMovies(ctx context.Context, query string) ([]metadata.Movie, error) {
+	s.metadataMu.RLock()
+	provider := s.metadataProvider
+	s.metadataMu.RUnlock()
+	if provider != nil {
+		movies, err := provider.Search(ctx, query)
+		if err != nil {
+			return nil, err
+		}
+		if len(movies) > 0 {
+			return movies, nil
+		}
+	}
+
+	s.resolverMu.RLock()
+	movieResolver := s.movieResolver
+	s.resolverMu.RUnlock()
+	if movieResolver == nil {
+		return []metadata.Movie{fallbackMovie(query, 0)}, nil
+	}
+	result, err := movieResolver.Resolve(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	if provider == nil {
+		movies := make([]metadata.Movie, 0, len(result.Candidates))
+		for _, candidate := range result.Candidates {
+			movies = append(movies, fallbackMovie(candidate.Title, candidate.Year))
+		}
+		return movies, nil
+	}
+
+	movies := make([]metadata.Movie, 0, len(result.Candidates))
+	seen := make(map[string]bool)
+	for _, candidate := range result.Candidates {
+		results, err := provider.Search(ctx, candidate.Title)
+		if err != nil {
+			return nil, err
+		}
+		for _, movie := range results {
+			if candidate.Year > 0 && movie.Year > 0 && candidate.Year != movie.Year {
+				continue
+			}
+			if !seen[movie.ID] {
+				movies = append(movies, movie)
+				seen[movie.ID] = true
+			}
+			break
+		}
+	}
+	return movies, nil
+}
+
+func fallbackMovie(title string, year int) metadata.Movie {
+	normalized := strings.ToLower(strings.Join(strings.Fields(title), "-"))
+	return metadata.Movie{
+		ID:    fmt.Sprintf("filmstream:%s:%d", normalized, year),
+		Title: strings.TrimSpace(title),
+		Year:  year,
+	}
+}
+
+func (s *Server) listWatchHistory(w http.ResponseWriter, r *http.Request) {
+	if s.historyStore == nil {
+		writeError(w, http.StatusServiceUnavailable, "watch history is not configured")
+		return
+	}
+	entries, err := s.historyStore.List()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if entries == nil {
+		entries = []history.Entry{}
+	}
+	entries = s.enrichWatchHistory(r.Context(), entries)
+	if r.URL.Query().Get("continue") == "true" {
+		filtered := entries[:0]
+		for _, entry := range entries {
+			if entry.CanContinue() {
+				filtered = append(filtered, entry)
+			}
+		}
+		entries = filtered
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Entries []history.Entry `json:"entries"`
+	}{Entries: entries})
+}
+
+func (s *Server) enrichWatchHistory(ctx context.Context, entries []history.Entry) []history.Entry {
+	s.metadataMu.RLock()
+	provider := s.metadataProvider
+	s.metadataMu.RUnlock()
+	if provider == nil {
+		return entries
+	}
+	for i, entry := range entries {
+		if strings.HasPrefix(entry.MediaID, "tmdb:") {
+			continue
+		}
+		movies, err := provider.Search(ctx, entry.Title)
+		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("enrich watch history", "title", entry.Title, "error", err)
+			}
+			continue
+		}
+		for _, movie := range movies {
+			if entry.Year > 0 && movie.Year > 0 && entry.Year != movie.Year {
+				continue
+			}
+			enriched, err := s.historyStore.UpdateMetadata(entry.ID, history.Entry{
+				MediaID:     movie.ID,
+				Overview:    movie.Overview,
+				PosterURL:   movie.PosterURL,
+				BackdropURL: movie.BackdropURL,
+			})
+			if err == nil {
+				entries[i] = enriched
+			} else if s.logger != nil {
+				s.logger.Warn("save watch history metadata", "title", entry.Title, "error", err)
+			}
+			break
+		}
+	}
+	return entries
+}
+
+func (s *Server) updateWatchProgress(w http.ResponseWriter, r *http.Request) {
+	if s.historyStore == nil {
+		writeError(w, http.StatusServiceUnavailable, "watch history is not configured")
+		return
+	}
+	defer r.Body.Close()
+	var request struct {
+		MediaID         string  `json:"media_id,omitempty"`
+		Title           string  `json:"title"`
+		Year            int     `json:"year,omitempty"`
+		Overview        string  `json:"overview,omitempty"`
+		PosterURL       string  `json:"poster_url,omitempty"`
+		BackdropURL     string  `json:"backdrop_url,omitempty"`
+		PositionSeconds float64 `json:"position_seconds"`
+		DurationSeconds float64 `json:"duration_seconds,omitempty"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request: "+err.Error())
+		return
+	}
+	entry, err := s.historyStore.RecordProgress(history.Entry{
+		MediaID:         request.MediaID,
+		Title:           request.Title,
+		Year:            request.Year,
+		Overview:        request.Overview,
+		PosterURL:       request.PosterURL,
+		BackdropURL:     request.BackdropURL,
+		PositionSeconds: request.PositionSeconds,
+		DurationSeconds: request.DurationSeconds,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, entry)
 }
 
 func (s *Server) reloadResolverConfiguration(w http.ResponseWriter, _ *http.Request) {
@@ -218,7 +452,7 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 		Name:      session.Name,
 		FileName:  session.FileName,
 		FileSize:  session.FileSize,
-		StreamURL: fmt.Sprintf("http://%s/v1/playbacks/%s/stream", r.Host, session.ID),
+		StreamURL: fmt.Sprintf("%s://%s/v1/playbacks/%s/stream", requestScheme(r), r.Host, session.ID),
 		Selected:  selected,
 	})
 }
@@ -252,6 +486,83 @@ func (s *Server) streamPlayback(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) startHLSPlayback(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if _, ok := s.engine.Get(id); !ok {
+		writeError(w, http.StatusNotFound, "playback not found")
+		return
+	}
+	s.hlsMu.RLock()
+	manager := s.hlsManager
+	s.hlsMu.RUnlock()
+	if manager == nil {
+		writeError(w, http.StatusNotImplemented, "HLS playback is not configured")
+		return
+	}
+	defer r.Body.Close()
+	var request struct {
+		StartSeconds float64 `json:"start_seconds,omitempty"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid request: "+err.Error())
+		return
+	}
+	stream, err := manager.Start(r.Context(), id, request.StartSeconds)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, struct {
+		hls.Stream
+		PlaylistURL string `json:"playlist_url"`
+	}{
+		Stream:      stream,
+		PlaylistURL: fmt.Sprintf("%s://%s/v1/playbacks/%s/hls/index.m3u8", requestScheme(r), r.Host, id),
+	})
+}
+
+func (s *Server) stopHLSPlayback(w http.ResponseWriter, r *http.Request) {
+	s.hlsMu.RLock()
+	manager := s.hlsManager
+	s.hlsMu.RUnlock()
+	if manager != nil {
+		manager.Stop(r.PathValue("id"))
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) serveHLSAsset(w http.ResponseWriter, r *http.Request) {
+	s.hlsMu.RLock()
+	manager := s.hlsManager
+	s.hlsMu.RUnlock()
+	if manager == nil {
+		http.NotFound(w, r)
+		return
+	}
+	name := r.PathValue("asset")
+	path, err := manager.AssetPath(r.PathValue("id"), name)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			http.NotFound(w, r)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	switch {
+	case strings.HasSuffix(name, ".m3u8"):
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Header().Set("Cache-Control", "no-store")
+	case strings.HasSuffix(name, ".m4s"):
+		w.Header().Set("Content-Type", "video/iso.segment")
+	case strings.HasSuffix(name, ".mp4"):
+		w.Header().Set("Content-Type", "video/mp4")
+	}
+	http.ServeFile(w, r, path)
+}
+
 func mergePreferences(defaults, requested catalog.Preferences) catalog.Preferences {
 	result := requested
 	if result.Resolution == "" {
@@ -267,6 +578,16 @@ func mergePreferences(defaults, requested catalog.Preferences) catalog.Preferenc
 		result.MaxSizeBytes = defaults.MaxSizeBytes
 	}
 	return result
+}
+
+func requestScheme(r *http.Request) string {
+	if forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]); forwarded == "http" || forwarded == "https" {
+		return forwarded
+	}
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {

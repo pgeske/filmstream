@@ -9,13 +9,15 @@ import (
 )
 
 const (
-	defaultListen           = "127.0.0.1:8943"
-	defaultMaxCandidateGiB  = 60
-	defaultReadaheadMiB     = 32
-	defaultCacheLimitGiB    = 20
-	defaultMaxSeedSessions  = 20
-	defaultSeedMaxHours     = 24
-	defaultIdleGraceSeconds = 120
+	defaultListen            = "127.0.0.1:8943"
+	defaultMaxCandidateGiB   = 60
+	defaultReadaheadMiB      = 32
+	defaultCacheLimitGiB     = 20
+	defaultMaxSeedSessions   = 20
+	defaultSeedMaxHours      = 24
+	defaultIdleGraceSeconds  = 120
+	defaultHLSStartupSeconds = 90
+	defaultHLSSegmentSeconds = 4
 )
 
 type Indexer struct {
@@ -34,10 +36,24 @@ type Resolver struct {
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 }
 
+type Metadata struct {
+	Provider       string `json:"provider,omitempty"`
+	BaseURL        string `json:"base_url,omitempty"`
+	Language       string `json:"language,omitempty"`
+	APIKeyEnv      string `json:"api_key_env,omitempty"`
+	APIKeyFile     string `json:"api_key_file,omitempty"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+}
+
 type Config struct {
 	Listen              string    `json:"listen"`
 	DataDir             string    `json:"data_dir"`
 	StateDir            string    `json:"state_dir"`
+	HLSDir              string    `json:"hls_dir"`
+	FFmpegPath          string    `json:"ffmpeg_path"`
+	FFprobePath         string    `json:"ffprobe_path"`
+	HLSStartupSeconds   int       `json:"hls_startup_seconds"`
+	HLSSegmentSeconds   int       `json:"hls_segment_seconds"`
 	MaxCandidateGiB     int64     `json:"max_candidate_gib"`
 	ReadaheadMiB        int64     `json:"readahead_mib"`
 	MetadataTimeoutSecs int       `json:"metadata_timeout_seconds"`
@@ -50,6 +66,7 @@ type Config struct {
 	PreferredLanguages  []string  `json:"preferred_languages"`
 	Player              string    `json:"player"`
 	Resolver            Resolver  `json:"resolver,omitempty"`
+	Metadata            Metadata  `json:"metadata,omitempty"`
 	Indexers            []Indexer `json:"indexers"`
 }
 
@@ -58,6 +75,11 @@ func Defaults() Config {
 		Listen:              defaultListen,
 		DataDir:             defaultDataDir(),
 		StateDir:            defaultStateDir(),
+		HLSDir:              filepath.Join(defaultDataDir(), "hls"),
+		FFmpegPath:          "ffmpeg",
+		FFprobePath:         "ffprobe",
+		HLSStartupSeconds:   defaultHLSStartupSeconds,
+		HLSSegmentSeconds:   defaultHLSSegmentSeconds,
 		MaxCandidateGiB:     defaultMaxCandidateGiB,
 		ReadaheadMiB:        defaultReadaheadMiB,
 		MetadataTimeoutSecs: 120,
@@ -102,7 +124,11 @@ func Load(path string) (Config, error) {
 	}
 	cfg.DataDir = expandHome(cfg.DataDir)
 	cfg.StateDir = expandHome(cfg.StateDir)
+	cfg.HLSDir = expandHome(cfg.HLSDir)
+	cfg.FFmpegPath = expandHome(cfg.FFmpegPath)
+	cfg.FFprobePath = expandHome(cfg.FFprobePath)
 	cfg.Resolver.APIKeyFile = expandHome(cfg.Resolver.APIKeyFile)
+	cfg.Metadata.APIKeyFile = expandHome(cfg.Metadata.APIKeyFile)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -162,6 +188,12 @@ func (c Config) Validate() error {
 	if c.StateDir == "" {
 		return errors.New("state directory cannot be empty")
 	}
+	if c.HLSDir == "" || c.FFmpegPath == "" || c.FFprobePath == "" {
+		return errors.New("hls_dir, ffmpeg_path, and ffprobe_path cannot be empty")
+	}
+	if c.HLSStartupSeconds <= 0 || c.HLSSegmentSeconds <= 0 {
+		return errors.New("HLS timeout and segment duration must be positive")
+	}
 	if c.MaxCandidateGiB <= 0 {
 		return errors.New("max_candidate_gib must be positive")
 	}
@@ -195,6 +227,14 @@ func (c Config) Validate() error {
 		}
 		if c.Resolver.TimeoutSeconds < 0 {
 			return errors.New("resolver timeout_seconds cannot be negative")
+		}
+	}
+	if c.Metadata.Provider != "" {
+		if c.Metadata.Provider != "tmdb" {
+			return fmt.Errorf("unsupported metadata provider %q", c.Metadata.Provider)
+		}
+		if c.Metadata.TimeoutSeconds < 0 {
+			return errors.New("metadata timeout_seconds cannot be negative")
 		}
 	}
 	for i, indexer := range c.Indexers {

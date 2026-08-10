@@ -8,6 +8,7 @@ Use it only with media you are authorized to download and share.
 
 - Local backend bound to `127.0.0.1:8943`
 - Bubble Tea terminal UI with search, continue watching, progress, and history controls
+- Native tvOS client with poster search, movie details, AVPlayer HLS playback, and shared progress
 - One-command CLI that starts the backend when needed and launches MPV
 - A small, trusted open-movie catalog plus an Internet Archive reference indexer
 - Standard Torznab indexers, including Prowlarr and Jackett endpoints
@@ -97,6 +98,17 @@ filmstream status PLAYBACK_ID
 
 An automatically started server logs to `~/.cache/filmstream/server.log`.
 
+## Apple TV client
+
+The SwiftUI client lives in `clients/apple`. Its shared `FilmstreamCore` package supports future iOS and macOS targets, while `FilmstreamTV` uses AVPlayer for native Apple TV playback and remote controls. The backend copies compatible H.264/H.265 video into fragmented HLS and converts the selected audio track to AAC; the raw HTTP stream remains available to MPV.
+
+```bash
+make apple-test
+make tvos-build
+```
+
+The app uses the server for catalog search, torrent preparation, and durable watch progress. See [`clients/apple/README.md`](clients/apple/README.md) for project generation, simulator, TMDB, and networking details.
+
 ## Configuration
 
 The optional configuration file is `~/.config/filmstream/config.json`:
@@ -106,6 +118,11 @@ The optional configuration file is `~/.config/filmstream/config.json`:
   "listen": "127.0.0.1:8943",
   "data_dir": "~/.cache/filmstream",
   "state_dir": "~/.local/state/filmstream",
+  "hls_dir": "~/.cache/filmstream/hls",
+  "ffmpeg_path": "ffmpeg",
+  "ffprobe_path": "ffprobe",
+  "hls_startup_seconds": 90,
+  "hls_segment_seconds": 4,
   "max_candidate_gib": 60,
   "readahead_mib": 32,
   "metadata_timeout_seconds": 120,
@@ -124,6 +141,13 @@ The optional configuration file is `~/.config/filmstream/config.json`:
     "api_key_file": "~/.config/filmstream/openai-api-key",
     "timeout_seconds": 60
   },
+  "metadata": {
+    "provider": "tmdb",
+    "base_url": "https://api.themoviedb.org/3",
+    "language": "en-US",
+    "api_key_file": "~/.config/filmstream/tmdb-api-key",
+    "timeout_seconds": 30
+  },
   "indexers": [
     {
       "name": "open-media",
@@ -141,7 +165,7 @@ The optional configuration file is `~/.config/filmstream/config.json`:
 
 Set `FILMSTREAM_CONFIG` to use another path or `FILMSTREAM_SERVER` to use an already-running backend.
 
-Temporary torrent data is stored beneath `<data_dir>/torrents`. Filmstream owns that directory and clears it on clean startup and shutdown; do not place unrelated files there. Durable watch progress is stored separately beneath `<state_dir>`.
+Temporary torrent data is stored beneath `<data_dir>/torrents`, and temporary native-player segments are stored beneath `<hls_dir>`. Filmstream owns and clears both locations on clean startup and shutdown; do not place unrelated files there. Durable watch progress is stored separately beneath `<state_dir>`.
 
 ## Natural-language movie resolution
 
@@ -207,9 +231,9 @@ The config file is written with mode `0600` because it contains API keys. The CL
 
 ## Smart streaming, cleanup, and ratio behavior
 
-Filmstream only requests the pieces needed by MPV's current HTTP Range request, a 32 MiB read-ahead window, and a small tail window used to find container metadata. It does not complete the rest of a movie in the background. Closing MPV closes those readers, so a ten-minute sample remains a partial download.
+Filmstream only requests the pieces needed by MPV's current HTTP Range request, a 32 MiB read-ahead window, and a small tail window used to find container metadata. Native HLS packaging reads at approximately playback speed with a small initial segment burst, so it also avoids racing through an entire movie in the background. Closing either player closes its readers and removes temporary HLS segments.
 
-MPV waits for a two-second initial cache before playback to avoid startup jitter. Native Windows MPV uses its D3D11 hardware-decoding and GPU-rendering path. Linux MPV on WSL uses `gpu-next` with `nvdec-copy` when supported and retains `wlshm` as a compatibility fallback; other environments keep MPV's portable automatic output and software-decoding fallback.
+MPV waits for a two-second initial cache before playback to avoid startup jitter. Native Windows MPV uses its D3D11 hardware-decoding and GPU-rendering path. Linux MPV on WSL uses `gpu-next` with `nvdec-copy` when supported and retains `wlshm` as a compatibility fallback; other environments keep MPV's portable automatic output and software-decoding fallback. Apple clients request streaming-optimized H.264/H.265 releases, avoid known-incompatible Dolby Vision releases, copy video without quality loss, and transcode only audio for AVPlayer compatibility.
 
 Every verified piece remains available for upload while the session is retained. After playback becomes idle, Filmstream manages the lifecycle automatically:
 
@@ -236,22 +260,31 @@ A 1.0 ratio means one uploaded byte per downloaded byte. This is necessarily bes
 - `POST /v1/indexers/reload`
 - `POST /v1/resolver/reload`
 - `POST /v1/resolve`
+- `GET /v1/catalog/search?query=...`
+- `GET /v1/watch-history?continue=true`
+- `PUT /v1/watch-history`
 - `POST /v1/playbacks`
 - `GET /v1/playbacks/{id}`
 - `GET|HEAD /v1/playbacks/{id}/stream`
+- `POST|DELETE /v1/playbacks/{id}/hls`
+- `GET /v1/playbacks/{id}/hls/{asset}`
 
 ## Development
 
 ```bash
 make test
 make build
+make apple-test
+make tvos-build
 ```
 
 The end-to-end torrent test builds a local `.torrent`, loads already-authorized test bytes through the torrent engine, and verifies HTTP byte-range seeking without contacting a public swarm.
 
 ## Next steps
 
+- Discovery rows for popular, classic, and genre-based movies
 - Rich metadata and artwork in the terminal UI
 - TMDB validation and ID-based Torznab searches for resolved movies
+- iOS and macOS app targets sharing `FilmstreamCore`
 - Multiple-file selection in the CLI
 - Docker image and remote authentication

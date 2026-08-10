@@ -16,10 +16,11 @@ type SearchRequest struct {
 }
 
 type Preferences struct {
-	Resolution   string   `json:"resolution,omitempty"`
-	Codecs       []string `json:"codecs,omitempty"`
-	Languages    []string `json:"languages,omitempty"`
-	MaxSizeBytes int64    `json:"max_size_bytes,omitempty"`
+	Resolution         string   `json:"resolution,omitempty"`
+	Codecs             []string `json:"codecs,omitempty"`
+	Languages          []string `json:"languages,omitempty"`
+	MaxSizeBytes       int64    `json:"max_size_bytes,omitempty"`
+	StreamingOptimized bool     `json:"streaming_optimized,omitempty"`
 }
 
 type Candidate struct {
@@ -88,6 +89,20 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 		if request.Preferences.MaxSizeBytes > 0 && candidate.SizeBytes > request.Preferences.MaxSizeBytes {
 			continue
 		}
+		if request.Preferences.StreamingOptimized {
+			name := normalize(candidate.Name)
+			words := wordSet(name)
+			if hasWord(words, "dv") || hasWord(words, "dovi") || strings.Contains(name, "dolby vision") {
+				continue
+			}
+			if len(request.Preferences.Codecs) > 0 {
+				unknownUntrustedCodec := candidate.Codec == "" && !candidate.Trusted
+				knownUnsupportedCodec := candidate.Codec != "" && !containsFold(request.Preferences.Codecs, candidate.Codec)
+				if unknownUntrustedCodec || knownUnsupportedCodec {
+					continue
+				}
+			}
+		}
 		if request.Year > 0 && candidate.Year > 0 && request.Year != candidate.Year {
 			continue
 		}
@@ -123,6 +138,28 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 		if languageOverlap(request.Preferences.Languages, candidate.Languages) {
 			score += 20
 			reasons = append(reasons, "preferred language")
+		}
+		if request.Preferences.StreamingOptimized {
+			name := normalize(candidate.Name)
+			words := wordSet(name)
+			if candidate.SizeBytes > 0 {
+				sizeGiB := float64(candidate.SizeBytes) / float64(int64(1)<<30)
+				penalty := math.Min(sizeGiB*2, 100)
+				score -= penalty
+				reasons = append(reasons, formatReason("streaming size penalty", penalty))
+			}
+			if hasWord(words, "remux") {
+				score -= 100
+				reasons = append(reasons, "remux penalty")
+			}
+			if strings.Contains(name, "web dl") || hasWord(words, "webrip") {
+				score += 30
+				reasons = append(reasons, "streaming-friendly source")
+			}
+			if hasWord(words, "x264") || hasWord(words, "x265") {
+				score += 20
+				reasons = append(reasons, "streaming-friendly encode")
+			}
 		}
 
 		if candidate.Seeders != nil {
@@ -262,6 +299,11 @@ func containsFold(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func hasWord(words map[string]struct{}, word string) bool {
+	_, ok := words[word]
+	return ok
 }
 
 func languageOverlap(preferred, actual []string) bool {
