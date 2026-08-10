@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -82,6 +83,32 @@ func TestCleanupProtectsActiveStreamsThenRemovesIdleCache(t *testing.T) {
 	}
 	if _, err := os.Stat(videoPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("cached video still exists: %v", err)
+	}
+}
+
+func TestEngineUsesConfiguredListenPort(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := newTestEngine(t, t.TempDir(), Config{ListenPort: port})
+	defer engine.Close()
+	if got := engine.ListenPort(); got != port {
+		t.Fatalf("listen port = %d, want %d", got, port)
+	}
+}
+
+func TestEngineRejectsInvalidListenPort(t *testing.T) {
+	for _, port := range []int{-1, 65536} {
+		if engine, err := New(Config{DataDir: t.TempDir(), ListenPort: port}); err == nil {
+			engine.Close()
+			t.Fatalf("listen port %d was accepted", port)
+		}
 	}
 }
 
@@ -193,6 +220,9 @@ func testConfig(dataDir string, overrides Config) Config {
 		ReadaheadBytes:  1 << 20,
 		MetadataTimeout: 5 * time.Second,
 		SeedRatioTarget: 1,
+	}
+	if overrides.ListenPort != 0 {
+		cfg.ListenPort = overrides.ListenPort
 	}
 	if overrides.CacheLimitBytes != 0 {
 		cfg.CacheLimitBytes = overrides.CacheLimitBytes

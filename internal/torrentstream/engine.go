@@ -34,6 +34,7 @@ const (
 
 type Config struct {
 	DataDir         string
+	ListenPort      int
 	MaxTorrentBytes int64
 	ReadaheadBytes  int64
 	MetadataTimeout time.Duration
@@ -118,6 +119,9 @@ type Status struct {
 }
 
 func New(cfg Config) (*Engine, error) {
+	if cfg.ListenPort < 0 || cfg.ListenPort > 65535 {
+		return nil, fmt.Errorf("listen port must be between 0 and 65535: %d", cfg.ListenPort)
+	}
 	if cfg.CacheLimitBytes <= 0 {
 		cfg.CacheLimitBytes = defaultCacheLimit
 	}
@@ -161,7 +165,7 @@ func New(cfg Config) (*Engine, error) {
 	}
 	clientConfig := torrent.NewDefaultClientConfig()
 	clientConfig.DataDir = torrentDataDir
-	clientConfig.ListenPort = 0
+	clientConfig.ListenPort = cfg.ListenPort
 	clientConfig.Seed = true
 	clientConfig.NoUpload = false
 	clientConfig.Slogger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -231,6 +235,11 @@ func (e *Engine) Close() error {
 		_ = e.lockFile.Close()
 	})
 	return nil
+}
+
+// ListenPort returns the TCP and UDP port used for incoming peers.
+func (e *Engine) ListenPort() int {
+	return e.client.LocalPort()
 }
 
 func (e *Engine) SetCleanupHandler(handler func(string, string)) {

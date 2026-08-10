@@ -89,6 +89,7 @@ Useful development commands:
 
 ```bash
 filmstream serve                   # run the backend in the foreground
+filmstream serve --torrent-listen-port 51413  # use a VPN-forwarded peer port
 filmstream --print-url Sintel      # prepare a stream without opening a player
 filmstream --player ffplay Sintel  # temporary fallback if MPV is unavailable
 filmstream status PLAYBACK_ID

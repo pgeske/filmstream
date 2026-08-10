@@ -71,6 +71,7 @@ func run(args []string) error {
 func runServer(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	configPath := flags.String("config", os.Getenv("FILMSTREAM_CONFIG"), "path to config file")
+	torrentListenPort := flags.Int("torrent-listen-port", 0, "BitTorrent peer listen port (0 chooses an available port)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -89,6 +90,7 @@ func runServer(args []string) error {
 	}
 	engine, err := torrentstream.New(torrentstream.Config{
 		DataDir:         cfg.DataDir,
+		ListenPort:      *torrentListenPort,
 		MaxTorrentBytes: cfg.MaxCandidateBytes(),
 		ReadaheadBytes:  cfg.ReadaheadBytes(),
 		MetadataTimeout: time.Duration(cfg.MetadataTimeoutSecs) * time.Second,
@@ -152,7 +154,7 @@ func runServer(args []string) error {
 		_ = server.Shutdown(shutdownContext)
 	}()
 
-	logger.Info("filmstream server listening", "address", cfg.Listen, "data", cfg.DataDir)
+	logger.Info("filmstream server listening", "address", cfg.Listen, "data", cfg.DataDir, "torrent_listen_port", engine.ListenPort())
 	err = server.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
