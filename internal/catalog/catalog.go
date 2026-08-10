@@ -52,6 +52,13 @@ var (
 	resolutionPattern = regexp.MustCompile(`(?i)(?:^|[^0-9])(2160p|1080p|720p|480p)(?:[^0-9]|$)`)
 	x265Pattern       = regexp.MustCompile(`(?i)(?:x265|h[ ._-]?265|hevc)`)
 	x264Pattern       = regexp.MustCompile(`(?i)(?:x264|h[ ._-]?264|avc)`)
+	releaseMarkers    = map[string]bool{
+		"2160p": true, "1080p": true, "720p": true, "480p": true,
+		"bluray": true, "brrip": true, "dvd": true, "dvdrip": true,
+		"hdtv": true, "remux": true, "uhd": true, "web": true,
+		"webdl": true, "webrip": true, "x264": true, "x265": true,
+		"h264": true, "h265": true, "avc": true, "hevc": true,
+	}
 )
 
 func Enrich(candidate Candidate) Candidate {
@@ -75,7 +82,13 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 	ranked := make([]RankedCandidate, 0, len(candidates))
 	for _, raw := range candidates {
 		candidate := Enrich(raw)
+		if candidate.Year == 0 {
+			candidate.Year = inferReleaseYear(request.Query, candidate.Name)
+		}
 		if request.Preferences.MaxSizeBytes > 0 && candidate.SizeBytes > request.Preferences.MaxSizeBytes {
+			continue
+		}
+		if request.Year > 0 && candidate.Year > 0 && request.Year != candidate.Year {
 			continue
 		}
 
@@ -86,14 +99,9 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 		score := match * 500
 		reasons := []string{formatReason("title match", match*100)}
 
-		if request.Year > 0 && candidate.Year > 0 {
-			if request.Year == candidate.Year {
-				score += 80
-				reasons = append(reasons, "exact year")
-			} else {
-				score -= math.Min(160, float64(abs(request.Year-candidate.Year))*40)
-				reasons = append(reasons, "year mismatch")
-			}
+		if request.Year > 0 && candidate.Year == request.Year {
+			score += 80
+			reasons = append(reasons, "exact year")
 		}
 
 		if preferred := strings.ToLower(request.Preferences.Resolution); preferred != "" {
@@ -158,16 +166,16 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 
 func titleSimilarity(query, candidate string) float64 {
 	queryNormalized := normalize(query)
-	candidateNormalized := normalize(candidate)
-	if queryNormalized == "" || candidateNormalized == "" {
+	candidateTitle := releaseTitle(queryNormalized, normalize(candidate))
+	if queryNormalized == "" || candidateTitle == "" {
 		return 0
 	}
-	if strings.Contains(candidateNormalized, queryNormalized) {
+	if candidateTitle == queryNormalized {
 		return 1
 	}
 
 	queryWords := wordSet(queryNormalized)
-	candidateWords := wordSet(candidateNormalized)
+	candidateWords := wordSet(candidateTitle)
 	intersection := 0
 	for word := range queryWords {
 		if _, ok := candidateWords[word]; ok {
@@ -204,6 +212,49 @@ func wordSet(value string) map[string]struct{} {
 	return result
 }
 
+func inferReleaseYear(query, candidate string) int {
+	queryWords := wordSet(normalize(query))
+	year := 0
+	for _, word := range strings.Fields(normalize(candidate)) {
+		if _, partOfTitle := queryWords[word]; partOfTitle {
+			continue
+		}
+		if releaseMarkers[word] {
+			break
+		}
+		if parsed, ok := parseReleaseYear(word); ok {
+			year = parsed
+		}
+	}
+	return year
+}
+
+func releaseTitle(normalizedQuery, normalizedCandidate string) string {
+	queryWords := wordSet(normalizedQuery)
+	words := strings.Fields(normalizedCandidate)
+	for index, word := range words {
+		if _, partOfTitle := queryWords[word]; partOfTitle {
+			continue
+		}
+		if _, ok := parseReleaseYear(word); ok || releaseMarkers[word] {
+			words = words[:index]
+			break
+		}
+	}
+	return strings.Join(words, " ")
+}
+
+func parseReleaseYear(value string) (int, bool) {
+	if len(value) != 4 || value[0] != '1' && value[0] != '2' {
+		return 0, false
+	}
+	year, err := strconv.Atoi(value)
+	if err != nil || year < 1900 || year > 2099 {
+		return 0, false
+	}
+	return year, true
+}
+
 func containsFold(values []string, target string) bool {
 	for _, value := range values {
 		if strings.EqualFold(value, target) {
@@ -233,11 +284,4 @@ func formatReason(label string, value float64) string {
 		precision = 0
 	}
 	return label + ": " + strconv.FormatFloat(value, 'f', precision, 64)
-}
-
-func abs(value int) int {
-	if value < 0 {
-		return -value
-	}
-	return value
 }

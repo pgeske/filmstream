@@ -42,3 +42,64 @@ func TestRankExcludesOversizedCandidate(t *testing.T) {
 		t.Fatalf("got %d candidates, want none", len(ranked))
 	}
 }
+
+func TestRankRejectsNewerSequelForOriginalMovie(t *testing.T) {
+	manySeeders, fewSeeders := 297, 3
+	ranked := Rank(SearchRequest{Query: "Kung Fu Panda", Year: 2008}, []Candidate{
+		{Name: "Kung Fu Panda 4 2024 1080p WEB h264-ETHEL", Seeders: &manySeeders},
+		{Name: "Kung Fu Panda 2008 1080p BluRay x264", Seeders: &fewSeeders},
+	})
+	if len(ranked) != 1 {
+		t.Fatalf("got %d candidates, want only the matching year", len(ranked))
+	}
+	if got := ranked[0].Candidate.Name; got != "Kung Fu Panda 2008 1080p BluRay x264" {
+		t.Fatalf("top candidate = %q", got)
+	}
+	if got := ranked[0].Candidate.Year; got != 2008 {
+		t.Fatalf("inferred year = %d, want 2008", got)
+	}
+}
+
+func TestRankRejectsOriginalMovieForRequestedSequel(t *testing.T) {
+	manySeeders, fewSeeders := 200, 2
+	ranked := Rank(SearchRequest{Query: "Paddington 2", Year: 2017}, []Candidate{
+		{Name: "Paddington 2014 1080p BluRay x264", Seeders: &manySeeders},
+		{Name: "Paddington 2 2017 1080p BluRay x264", Seeders: &fewSeeders},
+	})
+	if len(ranked) != 1 {
+		t.Fatalf("got %d candidates, want only the matching year", len(ranked))
+	}
+	if got := ranked[0].Candidate.Name; got != "Paddington 2 2017 1080p BluRay x264" {
+		t.Fatalf("top candidate = %q", got)
+	}
+}
+
+func TestTitleSimilarityDistinguishesSequels(t *testing.T) {
+	exact := titleSimilarity("Kung Fu Panda", "Kung Fu Panda 2008 1080p BluRay x264")
+	sequel := titleSimilarity("Kung Fu Panda", "Kung Fu Panda 4 2024 1080p WEB h264-ETHEL")
+	if exact != 1 {
+		t.Fatalf("exact title similarity = %v, want 1", exact)
+	}
+	if sequel >= exact {
+		t.Fatalf("sequel similarity = %v, want less than exact match %v", sequel, exact)
+	}
+}
+
+func TestInferReleaseYearIgnoresNumbersInMovieTitle(t *testing.T) {
+	tests := []struct {
+		query    string
+		release  string
+		wantYear int
+	}{
+		{"2001: A Space Odyssey", "2001 A Space Odyssey 1968 1080p BluRay", 1968},
+		{"Blade Runner 2049", "Blade Runner 2049 2017 2160p UHD BluRay", 2017},
+		{"1917", "1917 2019 1080p BluRay", 2019},
+	}
+	for _, test := range tests {
+		t.Run(test.query, func(t *testing.T) {
+			if got := inferReleaseYear(test.query, test.release); got != test.wantYear {
+				t.Fatalf("inferred year = %d, want %d", got, test.wantYear)
+			}
+		})
+	}
+}
