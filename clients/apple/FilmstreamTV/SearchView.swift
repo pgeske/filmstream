@@ -6,6 +6,7 @@ struct SearchView: View {
     @State private var query = ""
     @State private var results: [Movie] = []
     @State private var isSearching = false
+    @State private var selectedMovie: Movie?
     @State private var errorMessage: String?
 
     private let columns = [GridItem(.adaptive(minimum: 250, maximum: 250), spacing: 48)]
@@ -38,6 +39,9 @@ struct SearchView: View {
         }
         .navigationTitle("Search")
         .searchable(text: $query, prompt: "Movie title")
+        .navigationDestination(item: $selectedMovie) { movie in
+            MovieDetailView(movie: movie)
+        }
         .task(id: query) {
             await searchAfterTypingPause()
         }
@@ -48,7 +52,9 @@ struct SearchView: View {
         if !results.isEmpty {
             LazyVGrid(columns: columns, alignment: .leading, spacing: 44) {
                 ForEach(results) { movie in
-                    MovieNavigationCard(movie: movie)
+                    SearchResultCard(movie: movie) {
+                        selectedMovie = movie
+                    }
                 }
             }
             .padding(.vertical, 20)
@@ -112,6 +118,30 @@ struct SearchView: View {
             results = []
             isSearching = false
             errorMessage = error.localizedDescription
+        }
+    }
+}
+
+private struct SearchResultCard: View {
+    @Environment(\.dismissSearch) private var dismissSearch
+    @Environment(\.isSearching) private var isSearching
+
+    let movie: Movie
+    let onSelect: () -> Void
+
+    var body: some View {
+        MovieNavigationCard(movie: movie) {
+            guard isSearching else {
+                onSelect()
+                return
+            }
+            dismissSearch()
+            Task { @MainActor in
+                // Let tvOS remove its search presentation before pushing the detail view.
+                try? await Task.sleep(for: .milliseconds(150))
+                guard !Task.isCancelled else { return }
+                onSelect()
+            }
         }
     }
 }

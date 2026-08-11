@@ -37,52 +37,22 @@ struct MovieNavigationCard: View {
     let movie: Movie
     var progress: Double? = nil
     var requestsInitialFocus = false
+    var action: (() -> Void)? = nil
     @FocusState private var isFocused: Bool
 
     private let cardWidth: CGFloat = 250
 
     var body: some View {
-        NavigationLink(value: movie) {
-            VStack(alignment: .leading, spacing: 13) {
-                PosterImage(movie: movie)
-                    .frame(width: cardWidth, height: 375)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 20, style: .continuous)
-                            .stroke(
-                                isFocused ? Color.filmstreamAccent : .white.opacity(0.09),
-                                lineWidth: isFocused ? 3 : 1
-                            )
-                    }
-                    .overlay(alignment: .bottom) {
-                        if let progress, progress > 0 {
-                            ProgressView(value: progress)
-                                .tint(Color.filmstreamAccent)
-                                .padding(.horizontal, 12)
-                                .padding(.bottom, 11)
-                        }
-                    }
-                    .shadow(
-                        color: isFocused ? Color.filmstreamAccent.opacity(0.2) : .black.opacity(0.35),
-                        radius: isFocused ? 28 : 12,
-                        y: isFocused ? 14 : 8
-                    )
-
-                Text(movie.title)
-                    .font(.headline.weight(.semibold))
-                    .foregroundStyle(.white)
-                    .lineLimit(2)
-                    .frame(width: cardWidth, height: 58, alignment: .topLeading)
-                if let year = movie.year {
-                    Text(String(year))
-                        .font(.subheadline)
-                        .foregroundStyle(.white.opacity(0.58))
+        Group {
+            if let action {
+                Button(action: action) {
+                    cardContent
+                }
+            } else {
+                NavigationLink(value: movie) {
+                    cardContent
                 }
             }
-            .frame(width: cardWidth, alignment: .leading)
-            .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-            .scaleEffect(isFocused ? 1.035 : 1)
-            .offset(y: isFocused ? -6 : 0)
-            .animation(.snappy(duration: 0.22), value: isFocused)
         }
         .buttonStyle(MovieCardButtonStyle())
         .focusEffectDisabled()
@@ -93,6 +63,49 @@ struct MovieNavigationCard: View {
                 isFocused = true
             }
         }
+    }
+
+    private var cardContent: some View {
+        VStack(alignment: .leading, spacing: 13) {
+            PosterImage(movie: movie)
+                .frame(width: cardWidth, height: 375)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .stroke(
+                            isFocused ? Color.filmstreamAccent : .white.opacity(0.09),
+                            lineWidth: isFocused ? 3 : 1
+                        )
+                }
+                .overlay(alignment: .bottom) {
+                    if let progress, progress > 0 {
+                        ProgressView(value: progress)
+                            .tint(Color.filmstreamAccent)
+                            .padding(.horizontal, 12)
+                            .padding(.bottom, 11)
+                    }
+                }
+                .shadow(
+                    color: isFocused ? Color.filmstreamAccent.opacity(0.2) : .black.opacity(0.35),
+                    radius: isFocused ? 28 : 12,
+                    y: isFocused ? 14 : 8
+                )
+
+            Text(movie.title)
+                .font(.headline.weight(.semibold))
+                .foregroundStyle(.white)
+                .lineLimit(2)
+                .frame(width: cardWidth, height: 58, alignment: .topLeading)
+            if let year = movie.year {
+                Text(String(year))
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.58))
+            }
+        }
+        .frame(width: cardWidth, alignment: .leading)
+        .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .scaleEffect(isFocused ? 1.035 : 1)
+        .offset(y: isFocused ? -6 : 0)
+        .animation(.snappy(duration: 0.22), value: isFocused)
     }
 }
 
