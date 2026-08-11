@@ -24,37 +24,50 @@ struct BrandHeader: View {
 struct MovieNavigationCard: View {
     let movie: Movie
     var progress: Double? = nil
+    var action: (() -> Void)? = nil
     @FocusState private var isFocused: Bool
 
     var body: some View {
-        NavigationLink(value: movie) {
-            VStack(alignment: .leading, spacing: 12) {
-                PosterImage(movie: movie)
-                    .frame(width: 230, height: 345)
-                    .overlay(alignment: .bottom) {
-                        if let progress, progress > 0 {
-                            ProgressView(value: progress)
-                                .tint(Color.filmstreamAccent)
-                                .padding(.horizontal, 10)
-                                .padding(.bottom, 9)
-                        }
-                    }
-                Text(movie.title)
-                    .font(.headline)
-                    .lineLimit(1)
-                if let year = movie.year {
-                    Text(String(year))
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+        Group {
+            if let action {
+                Button(action: action) {
+                    cardContent
+                }
+            } else {
+                NavigationLink(value: movie) {
+                    cardContent
                 }
             }
-            .frame(width: 230, alignment: .leading)
-            .scaleEffect(isFocused ? 1.06 : 1)
-            .shadow(color: .black.opacity(isFocused ? 0.55 : 0.2), radius: isFocused ? 24 : 8, y: 10)
-            .animation(.easeOut(duration: 0.16), value: isFocused)
         }
         .buttonStyle(.plain)
         .focused($isFocused)
+    }
+
+    private var cardContent: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            PosterImage(movie: movie)
+                .frame(width: 230, height: 345)
+                .overlay(alignment: .bottom) {
+                    if let progress, progress > 0 {
+                        ProgressView(value: progress)
+                            .tint(Color.filmstreamAccent)
+                            .padding(.horizontal, 10)
+                            .padding(.bottom, 9)
+                    }
+                }
+            Text(movie.title)
+                .font(.headline)
+                .lineLimit(1)
+            if let year = movie.year {
+                Text(String(year))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(width: 230, alignment: .leading)
+        .scaleEffect(isFocused ? 1.06 : 1)
+        .shadow(color: .black.opacity(isFocused ? 0.55 : 0.2), radius: isFocused ? 24 : 8, y: 10)
+        .animation(.easeOut(duration: 0.16), value: isFocused)
     }
 }
 
