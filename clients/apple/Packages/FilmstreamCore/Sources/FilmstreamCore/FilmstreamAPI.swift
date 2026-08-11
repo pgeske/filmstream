@@ -74,6 +74,36 @@ public struct FilmstreamAPI: Sendable {
         let _: HealthResponse = try await send(request)
     }
 
+    public func subtitleCues(
+        playbackID: String,
+        track: HLSSubtitleTrack,
+        offsetSeconds: Double
+    ) async throws -> [SubtitleCue]? {
+        let url = baseURL.appendingPathComponent(
+            "v1/playbacks/\(playbackID)/hls/subtitle-\(track.index).vtt"
+        )
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
+        request.timeoutInterval = 15
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw FilmstreamError.network(error.localizedDescription)
+        }
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw FilmstreamError.invalidResponse
+        }
+        if httpResponse.statusCode == 404 {
+            return nil
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            let payload = try? decoder.decode(ErrorResponse.self, from: data)
+            throw FilmstreamError.server(status: httpResponse.statusCode, message: payload?.error)
+        }
+        return WebVTTParser.parse(data, offsetSeconds: offsetSeconds)
+    }
+
     @discardableResult
     public func updateProgress(
         for movie: Movie,

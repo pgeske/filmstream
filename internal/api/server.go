@@ -559,6 +559,8 @@ func (s *Server) serveHLSAsset(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "video/iso.segment")
 	case strings.HasSuffix(name, ".mp4"):
 		w.Header().Set("Content-Type", "video/mp4")
+	case strings.HasSuffix(name, ".vtt"):
+		w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	}
 	http.ServeFile(w, r, path)
 }

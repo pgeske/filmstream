@@ -11,12 +11,31 @@ import Testing
 }
 
 @Test func decodesNativeHLSPlayback() throws {
-    let data = Data(#"{"playback_id":"abc123","playlist_url":"https://filmstream.example/v1/playbacks/abc123/hls/index.m3u8","start_seconds":120,"duration_seconds":7200,"video_codec":"h264"}"#.utf8)
+    let data = Data(#"{"playback_id":"abc123","playlist_url":"https://filmstream.example/v1/playbacks/abc123/hls/index.m3u8","start_seconds":120,"duration_seconds":7200,"video_codec":"h264","subtitles":[{"index":6,"language":"en","title":"SDH"}]}"#.utf8)
     let playback = try JSONDecoder().decode(HLSPlayback.self, from: data)
     #expect(playback.id == "abc123")
     #expect(playback.startSeconds == 120)
     #expect(playback.durationSeconds == 7200)
     #expect(playback.playlistURL.pathExtension == "m3u8")
+    #expect(playback.subtitles?.first?.language == "en")
+}
+
+@Test func parsesGrowingWebVTTWithPlaybackOffset() {
+    let data = Data("""
+    WEBVTT
+
+    00:01.250 --> 00:03.500
+    <i>Wake up, Neo.</i>
+
+    00:04.000 --> 00:06.000 align:middle
+    The Matrix has you.
+
+    """.utf8)
+    let cues = WebVTTParser.parse(data, offsetSeconds: 120)
+    #expect(cues == [
+        SubtitleCue(startSeconds: 121.25, endSeconds: 123.5, text: "Wake up, Neo."),
+        SubtitleCue(startSeconds: 124, endSeconds: 126, text: "The Matrix has you.")
+    ])
 }
 
 @Test func computesContinueWatchingProgress() throws {

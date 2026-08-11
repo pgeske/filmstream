@@ -33,10 +33,19 @@ type Config struct {
 }
 
 type Stream struct {
-	PlaybackID      string  `json:"playback_id"`
-	StartSeconds    float64 `json:"start_seconds"`
-	DurationSeconds float64 `json:"duration_seconds,omitempty"`
-	VideoCodec      string  `json:"video_codec"`
+	PlaybackID      string          `json:"playback_id"`
+	StartSeconds    float64         `json:"start_seconds"`
+	DurationSeconds float64         `json:"duration_seconds,omitempty"`
+	VideoCodec      string          `json:"video_codec"`
+	Subtitles       []SubtitleTrack `json:"subtitles"`
+}
+
+type SubtitleTrack struct {
+	Index    int    `json:"index"`
+	Language string `json:"language,omitempty"`
+	Title    string `json:"title,omitempty"`
+	Default  bool   `json:"default,omitempty"`
+	Forced   bool   `json:"forced,omitempty"`
 }
 
 type Manager struct {
@@ -66,15 +75,27 @@ type runningStream struct {
 }
 
 type mediaProbe struct {
-	Streams []struct {
-		CodecName    string `json:"codec_name"`
-		SideDataList []struct {
-			SideDataType string `json:"side_data_type"`
-		} `json:"side_data_list"`
-	} `json:"streams"`
-	Format struct {
+	Streams []mediaStream `json:"streams"`
+	Format  struct {
 		Duration string `json:"duration"`
 	} `json:"format"`
+}
+
+type mediaStream struct {
+	Index        int    `json:"index"`
+	CodecName    string `json:"codec_name"`
+	CodecType    string `json:"codec_type"`
+	SideDataList []struct {
+		SideDataType string `json:"side_data_type"`
+	} `json:"side_data_list"`
+	Tags struct {
+		Language string `json:"language"`
+		Title    string `json:"title"`
+	} `json:"tags"`
+	Disposition struct {
+		Default int `json:"default"`
+		Forced  int `json:"forced"`
+	} `json:"disposition"`
 }
 
 func New(cfg Config) (*Manager, error) {
@@ -144,6 +165,7 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 	if err != nil {
 		return Stream{}, err
 	}
+	subtitles := supportedSubtitles(probe)
 
 	dir := filepath.Join(m.dataDir, playbackID)
 	if err := os.RemoveAll(dir); err != nil {
@@ -158,7 +180,7 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 	}
 
 	streamContext, cancel := context.WithCancel(m.ctx)
-	args := m.ffmpegArgs(sourceURL, dir, codec, startSeconds)
+	args := m.ffmpegArgs(sourceURL, dir, codec, startSeconds, subtitles)
 	command := exec.CommandContext(streamContext, m.ffmpegPath, args...)
 	command.Stdout = logFile
 	command.Stderr = logFile
@@ -168,7 +190,10 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 		return Stream{}, fmt.Errorf("start FFmpeg: %w", err)
 	}
 	stream := &runningStream{
-		info:   Stream{PlaybackID: playbackID, StartSeconds: startSeconds, DurationSeconds: duration, VideoCodec: codec},
+		info: Stream{
+			PlaybackID: playbackID, StartSeconds: startSeconds, DurationSeconds: duration,
+			VideoCodec: codec, Subtitles: subtitles,
+		},
 		dir:    dir,
 		cancel: cancel,
 		done:   make(chan struct{}),
@@ -258,8 +283,7 @@ func (m *Manager) probe(parent context.Context, sourceURL string) (mediaProbe, e
 	defer cancel()
 	command := exec.CommandContext(ctx, m.ffprobePath,
 		"-v", "error",
-		"-select_streams", "v:0",
-		"-show_entries", "stream=codec_name:stream_side_data=side_data_type:format=duration",
+		"-show_entries", "stream=index,codec_name,codec_type:stream_tags=language,title:stream_disposition=default,forced:stream_side_data=side_data_type:format=duration",
 		"-of", "json",
 		sourceURL,
 	)
@@ -275,24 +299,73 @@ func (m *Manager) probe(parent context.Context, sourceURL string) (mediaProbe, e
 }
 
 func compatibleVideo(probe mediaProbe) (string, float64, error) {
-	if len(probe.Streams) == 0 {
-		return "", 0, errors.New("playback has no video stream")
-	}
-	codec := strings.ToLower(probe.Streams[0].CodecName)
-	if codec != "h264" && codec != "hevc" {
-		return "", 0, fmt.Errorf("video codec %q is not supported by native Apple playback", codec)
-	}
-	for _, sideData := range probe.Streams[0].SideDataList {
-		name := strings.ToLower(sideData.SideDataType)
-		if strings.Contains(name, "dovi") || strings.Contains(name, "dolby vision") {
-			return "", 0, errors.New("this Dolby Vision profile is not supported by native Apple playback")
+	for _, stream := range probe.Streams {
+		if stream.CodecType != "video" {
+			continue
 		}
+		codec := strings.ToLower(stream.CodecName)
+		if codec != "h264" && codec != "hevc" {
+			return "", 0, fmt.Errorf("video codec %q is not supported by native Apple playback", codec)
+		}
+		for _, sideData := range stream.SideDataList {
+			name := strings.ToLower(sideData.SideDataType)
+			if strings.Contains(name, "dovi") || strings.Contains(name, "dolby vision") {
+				return "", 0, errors.New("this Dolby Vision profile is not supported by native Apple playback")
+			}
+		}
+		duration, _ := strconv.ParseFloat(probe.Format.Duration, 64)
+		return codec, duration, nil
 	}
-	duration, _ := strconv.ParseFloat(probe.Format.Duration, 64)
-	return codec, duration, nil
+	return "", 0, errors.New("playback has no video stream")
 }
 
-func (m *Manager) ffmpegArgs(sourceURL, dir, codec string, startSeconds float64) []string {
+func supportedSubtitles(probe mediaProbe) []SubtitleTrack {
+	var tracks []SubtitleTrack
+	for _, stream := range probe.Streams {
+		if stream.CodecType != "subtitle" || !isTextSubtitleCodec(stream.CodecName) {
+			continue
+		}
+		tracks = append(tracks, SubtitleTrack{
+			Index:    stream.Index,
+			Language: canonicalLanguage(stream.Tags.Language),
+			Title:    strings.TrimSpace(stream.Tags.Title),
+			Default:  stream.Disposition.Default != 0,
+			Forced:   stream.Disposition.Forced != 0,
+		})
+	}
+	return tracks
+}
+
+func isTextSubtitleCodec(codec string) bool {
+	switch strings.ToLower(codec) {
+	case "ass", "mov_text", "ssa", "subrip", "text", "webvtt":
+		return true
+	default:
+		return false
+	}
+}
+
+func canonicalLanguage(language string) string {
+	language = strings.ToLower(strings.TrimSpace(language))
+	aliases := map[string]string{
+		"ara": "ar", "bul": "bg", "cat": "ca", "chi": "zh", "zho": "zh",
+		"hrv": "hr", "cze": "cs", "ces": "cs", "dan": "da", "dut": "nl", "nld": "nl",
+		"eng": "en", "est": "et", "fin": "fi", "fre": "fr", "fra": "fr",
+		"ger": "de", "deu": "de", "gre": "el", "ell": "el", "heb": "he",
+		"hun": "hu", "ice": "is", "isl": "is", "ind": "id", "ita": "it",
+		"jpn": "ja", "kor": "ko", "lav": "lv", "lit": "lt", "mac": "mk", "mkd": "mk",
+		"may": "ms", "msa": "ms", "nob": "no", "per": "fa", "fas": "fa",
+		"pol": "pl", "por": "pt", "rum": "ro", "ron": "ro", "rus": "ru",
+		"srp": "sr", "slo": "sk", "slk": "sk", "slv": "sl", "spa": "es",
+		"swe": "sv", "tha": "th", "tur": "tr", "ukr": "uk",
+	}
+	if canonical := aliases[language]; canonical != "" {
+		return canonical
+	}
+	return language
+}
+
+func (m *Manager) ffmpegArgs(sourceURL, dir, codec string, startSeconds float64, subtitles []SubtitleTrack) []string {
 	// Allow one segment beyond the target buffer to be packaged without rate limiting.
 	// Stream-copied video can only cut on keyframes, so segment lengths may exceed the target.
 	initialBurstSeconds := m.bufferSeconds + m.segmentSeconds
@@ -326,6 +399,13 @@ func (m *Manager) ffmpegArgs(sourceURL, dir, codec string, startSeconds float64)
 		"-hls_segment_filename", filepath.Join(dir, "segment-%06d.m4s"),
 		filepath.Join(dir, "index.m3u8"),
 	)
+	for _, subtitle := range subtitles {
+		args = append(args,
+			"-map", fmt.Sprintf("0:%d", subtitle.Index),
+			"-c:s", "webvtt", "-flush_packets", "1", "-f", "webvtt",
+			filepath.Join(dir, fmt.Sprintf("subtitle-%d.vtt", subtitle.Index)),
+		)
+	}
 	return args
 }
 
@@ -400,7 +480,15 @@ func validAssetName(name string) bool {
 	if name == "index.m3u8" || name == "init.mp4" {
 		return true
 	}
-	return strings.HasPrefix(name, "segment-") && strings.HasSuffix(name, ".m4s") && filepath.Base(name) == name
+	if strings.HasPrefix(name, "segment-") && strings.HasSuffix(name, ".m4s") {
+		return filepath.Base(name) == name
+	}
+	if !strings.HasPrefix(name, "subtitle-") || !strings.HasSuffix(name, ".vtt") || filepath.Base(name) != name {
+		return false
+	}
+	index := strings.TrimSuffix(strings.TrimPrefix(name, "subtitle-"), ".vtt")
+	value, err := strconv.Atoi(index)
+	return err == nil && value >= 0
 }
 
 func tailFile(path string, limit int64) string {

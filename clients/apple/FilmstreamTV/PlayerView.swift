@@ -1,6 +1,7 @@
 import AVFoundation
 import Combine
 import FilmstreamCore
+import Foundation
 import SwiftUI
 import UIKit
 
@@ -13,6 +14,7 @@ struct PlayerView: View {
 
     @StateObject private var controller: NativePlaybackController
     @State private var didClose = false
+    @State private var isSubtitlePickerPresented = false
     @FocusState private var receivesRemoteCommands: Bool
 
     init(movie: Movie, prepared: PreparedPlayback, api: FilmstreamAPI) {
@@ -38,6 +40,21 @@ struct PlayerView: View {
             .frame(height: 270)
             .allowsHitTesting(false)
 
+            if let subtitle = controller.activeSubtitleText {
+                Text(subtitle)
+                    .font(.system(size: 44, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(5)
+                    .frame(maxWidth: 1_500)
+                    .padding(.horizontal, 80)
+                    .padding(.bottom, 245)
+                    .shadow(color: .black, radius: 3, x: 2, y: 2)
+                    .shadow(color: .black.opacity(0.9), radius: 7)
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+            }
+
             controls
                 .padding(.horizontal, 68)
                 .padding(.bottom, 42)
@@ -61,8 +78,24 @@ struct PlayerView: View {
                 PlaybackLoadingIndicator()
                     .allowsHitTesting(false)
             }
+
+            if isSubtitlePickerPresented {
+                SubtitlePicker(
+                    tracks: controller.subtitleOptions,
+                    selected: controller.selectedSubtitle,
+                    onSelect: { track in
+                        controller.selectSubtitle(track)
+                        Task { @MainActor in
+                            try? await Task.sleep(for: .milliseconds(100))
+                            closeSubtitlePicker()
+                        }
+                    },
+                    onDismiss: closeSubtitlePicker
+                )
+                .transition(.opacity.combined(with: .move(edge: .trailing)))
+            }
         }
-        .focusable()
+        .focusable(!isSubtitlePickerPresented)
         .focused($receivesRemoteCommands)
         .onAppear {
             receivesRemoteCommands = true
@@ -72,24 +105,37 @@ struct PlayerView: View {
             closePlayback()
         }
         .onTapGesture {
+            guard !isSubtitlePickerPresented else { return }
             controller.togglePlayback()
         }
         .onPlayPauseCommand {
+            guard !isSubtitlePickerPresented else { return }
             controller.togglePlayback()
         }
         .onMoveCommand { direction in
+            guard !isSubtitlePickerPresented else { return }
             switch direction {
             case .left:
                 controller.jump(by: -30)
             case .right:
                 controller.jump(by: 30)
+            case .up, .down:
+                guard !controller.subtitleOptions.isEmpty else { return }
+                receivesRemoteCommands = false
+                withAnimation(.easeOut(duration: 0.2)) {
+                    isSubtitlePickerPresented = true
+                }
             default:
                 break
             }
         }
         .onExitCommand {
-            closePlayback()
-            dismiss()
+            if isSubtitlePickerPresented {
+                closeSubtitlePicker()
+            } else {
+                closePlayback()
+                dismiss()
+            }
         }
         .task {
             while !Task.isCancelled {
@@ -109,10 +155,19 @@ struct PlayerView: View {
                 Text(movie.title)
                     .font(.title2.weight(.bold))
                 Spacer()
-                Label(
-                    controller.stateLabel,
-                    systemImage: controller.isPlaying ? "pause.fill" : "play.fill"
-                )
+                VStack(alignment: .trailing, spacing: 7) {
+                    Label(
+                        controller.stateLabel,
+                        systemImage: controller.isPlaying ? "pause.fill" : "play.fill"
+                    )
+                    if !controller.subtitleOptions.isEmpty {
+                        Label(
+                            controller.selectedSubtitle?.displayName ?? "Subtitles Off",
+                            systemImage: "captions.bubble"
+                        )
+                        .font(.footnote)
+                    }
+                }
                 .foregroundStyle(.secondary)
             }
 
@@ -128,6 +183,15 @@ struct PlayerView: View {
                 Text(formatTime(controller.durationSeconds))
             }
             .font(.footnote.monospacedDigit())
+        }
+    }
+
+    private func closeSubtitlePicker() {
+        withAnimation(.easeOut(duration: 0.18)) {
+            isSubtitlePickerPresented = false
+        }
+        Task { @MainActor in
+            receivesRemoteCommands = true
         }
     }
 
@@ -172,6 +236,132 @@ struct PlayerView: View {
             return String(format: "%d:%02d:%02d", hours, minutes, remainingSeconds)
         }
         return String(format: "%d:%02d", minutes, remainingSeconds)
+    }
+}
+
+private extension HLSSubtitleTrack {
+    var displayName: String {
+        let languageName: String
+        if let language, !language.isEmpty {
+            languageName = Locale.current.localizedString(forLanguageCode: language)?.capitalized
+                ?? language.uppercased()
+        } else {
+            languageName = "Unknown Language"
+        }
+        if let title, !title.isEmpty {
+            return "\(languageName) (\(title))"
+        }
+        if isForced == true {
+            return "\(languageName) (Forced)"
+        }
+        return languageName
+    }
+}
+
+private struct SubtitlePicker: View {
+    let tracks: [HLSSubtitleTrack]
+    let selected: HLSSubtitleTrack?
+    let onSelect: (HLSSubtitleTrack?) -> Void
+    let onDismiss: () -> Void
+
+    @FocusState private var focusedOption: Int?
+
+    var body: some View {
+        ZStack(alignment: .trailing) {
+            Color.black.opacity(0.42)
+                .ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: 28) {
+                HStack(spacing: 14) {
+                    Image(systemName: "captions.bubble.fill")
+                        .foregroundStyle(Color.filmstreamAccent)
+                    Text("Subtitles")
+                        .font(.system(size: 38, weight: .bold, design: .rounded))
+                }
+
+                Text("Choose a language")
+                    .font(.title3)
+                    .foregroundStyle(.secondary)
+
+                ScrollView {
+                    LazyVStack(spacing: 10) {
+                        optionRow(id: -1, title: "Off", isSelected: selected == nil) {
+                            onSelect(nil)
+                        }
+                        ForEach(tracks) { track in
+                            optionRow(
+                                id: track.index,
+                                title: displayName(for: track),
+                                isSelected: selected?.index == track.index
+                            ) {
+                                onSelect(track)
+                            }
+                        }
+                    }
+                }
+                .scrollIndicators(.hidden)
+            }
+            .padding(42)
+            .frame(width: 660)
+            .frame(maxHeight: 830, alignment: .topLeading)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 28, style: .continuous)
+                    .stroke(.white.opacity(0.12), lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.55), radius: 38, x: -12)
+            .padding(.trailing, 58)
+        }
+        .onExitCommand(perform: onDismiss)
+        .task {
+            focusedOption = selected?.index ?? -1
+        }
+    }
+
+    private func displayName(for track: HLSSubtitleTrack) -> String {
+        let matching = tracks.filter { $0.displayName == track.displayName }
+        guard matching.count > 1,
+              let position = matching.firstIndex(where: { $0.index == track.index }),
+              position > 0 else {
+            return track.displayName
+        }
+        return "\(track.displayName) \(position + 1)"
+    }
+
+    private func optionRow(
+        id: Int,
+        title: String,
+        isSelected: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 18) {
+                Text(title)
+                    .font(.title3.weight(.semibold))
+                    .lineLimit(1)
+                Spacer()
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.headline.weight(.bold))
+                        .foregroundStyle(Color.filmstreamAccent)
+                }
+            }
+            .padding(.horizontal, 22)
+            .frame(height: 66)
+            .background(
+                focusedOption == id ? Color.white.opacity(0.16) : Color.clear,
+                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+            )
+            .overlay {
+                if focusedOption == id {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(Color.filmstreamAccent.opacity(0.9), lineWidth: 2)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .focusEffectDisabled()
+        .focused($focusedOption, equals: id)
     }
 }
 
@@ -247,6 +437,9 @@ private final class NativePlaybackController: ObservableObject {
     @Published private(set) var isWaiting = true
     @Published private(set) var stateLabel = "Preparing Stream…"
     @Published private(set) var errorMessage: String?
+    @Published private(set) var subtitleOptions: [HLSSubtitleTrack]
+    @Published private(set) var selectedSubtitle: HLSSubtitleTrack?
+    @Published private(set) var activeSubtitleText: String?
 
     private let api: FilmstreamAPI
     private let playback: Playback
@@ -255,6 +448,8 @@ private final class NativePlaybackController: ObservableObject {
     private var statusObservation: NSKeyValueObservation?
     private var playbackObservation: NSKeyValueObservation?
     private var seekTask: Task<Void, Never>?
+    private var subtitleTask: Task<Void, Never>?
+    private var subtitleCues: [SubtitleCue] = []
     private var seekGeneration = 0
     private var seekOriginSeconds: Double
     private var pendingSeekSeconds: Double?
@@ -269,13 +464,15 @@ private final class NativePlaybackController: ObservableObject {
         positionSeconds = max(0, prepared.hls.startSeconds)
         durationSeconds = max(0, prepared.hls.durationSeconds ?? 0)
         seekOriginSeconds = max(0, prepared.hls.startSeconds)
+        subtitleOptions = prepared.hls.subtitles ?? []
+        selectedSubtitle = Self.preferredSubtitle(in: subtitleOptions)
 
         player.automaticallyWaitsToMinimizeStalling = true
         player.actionAtItemEnd = .pause
         installItem(url: prepared.hls.playlistURL)
 
         timeObserver = player.addPeriodicTimeObserver(
-            forInterval: CMTime(seconds: 1, preferredTimescale: 600),
+            forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
             queue: .main
         ) { [weak self] time in
             Task { @MainActor in
@@ -286,9 +483,12 @@ private final class NativePlaybackController: ObservableObject {
                         max(0, self.streamStartSeconds + current),
                         self.durationSeconds > 0 ? self.durationSeconds : .greatestFiniteMagnitude
                     )
+                    self.updateActiveSubtitle()
                 }
             }
         }
+
+        restartSubtitleUpdates()
 
         playbackObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] player, _ in
             Task { @MainActor in
@@ -343,12 +543,23 @@ private final class NativePlaybackController: ObservableObject {
         seek(to: origin + seconds)
     }
 
+    func selectSubtitle(_ track: HLSSubtitleTrack?) {
+        selectedSubtitle = track
+        let defaults = UserDefaults.standard
+        defaults.set(track != nil, forKey: "filmstream.subtitles.enabled")
+        defaults.set(track?.language, forKey: "filmstream.subtitles.language")
+        defaults.set(track?.title, forKey: "filmstream.subtitles.title")
+        restartSubtitleUpdates()
+    }
+
     func stop() {
         guard !stopped else { return }
         stopped = true
         seekGeneration += 1
         seekTask?.cancel()
         seekTask = nil
+        subtitleTask?.cancel()
+        subtitleTask = nil
         player.pause()
         player.isMuted = true
         player.replaceCurrentItem(with: nil)
@@ -408,6 +619,7 @@ private final class NativePlaybackController: ObservableObject {
             let prepared = try await api.prepareNativePlayback(playback, startSeconds: target)
             guard !Task.isCancelled, generation == seekGeneration, !stopped else { return }
             streamStartSeconds = max(0, prepared.hls.startSeconds)
+            updateSubtitleOptions(prepared.hls.subtitles ?? [])
             if let duration = prepared.hls.durationSeconds, duration > 0 {
                 durationSeconds = duration
             }
@@ -449,6 +661,78 @@ private final class NativePlaybackController: ObservableObject {
         return item.seekableTimeRanges.contains { value in
             CMTimeRangeContainsTime(value.timeRangeValue, time: target)
         }
+    }
+
+    private func updateSubtitleOptions(_ tracks: [HLSSubtitleTrack]) {
+        let previous = selectedSubtitle
+        subtitleOptions = tracks
+        if let previous {
+            selectedSubtitle = tracks.first(where: { $0.index == previous.index })
+                ?? tracks.first(where: {
+                    $0.language == previous.language && $0.title == previous.title
+                })
+        }
+        restartSubtitleUpdates()
+    }
+
+    private func restartSubtitleUpdates() {
+        subtitleTask?.cancel()
+        subtitleTask = nil
+        subtitleCues = []
+        activeSubtitleText = nil
+        guard let track = selectedSubtitle, !stopped else { return }
+
+        let offset = streamStartSeconds
+        subtitleTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self, !self.stopped,
+                      self.selectedSubtitle?.index == track.index,
+                      self.streamStartSeconds == offset else {
+                    return
+                }
+                do {
+                    if let cues = try await self.api.subtitleCues(
+                        playbackID: self.playback.id,
+                        track: track,
+                        offsetSeconds: offset
+                    ) {
+                        guard !Task.isCancelled,
+                              self.selectedSubtitle?.index == track.index,
+                              self.streamStartSeconds == offset else {
+                            return
+                        }
+                        self.subtitleCues = cues
+                        self.updateActiveSubtitle()
+                    }
+                } catch {
+                    // Subtitle polling is best-effort while the growing WebVTT file is written.
+                }
+                do {
+                    try await Task.sleep(for: .seconds(2))
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    private func updateActiveSubtitle() {
+        let active = subtitleCues.filter {
+            positionSeconds >= $0.startSeconds && positionSeconds <= $0.endSeconds
+        }
+        activeSubtitleText = active.isEmpty ? nil : active.map(\.text).joined(separator: "\n")
+    }
+
+    private static func preferredSubtitle(in tracks: [HLSSubtitleTrack]) -> HLSSubtitleTrack? {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: "filmstream.subtitles.enabled") == nil {
+            return tracks.first(where: { $0.isForced == true })
+        }
+        guard defaults.bool(forKey: "filmstream.subtitles.enabled") else { return nil }
+        let language = defaults.string(forKey: "filmstream.subtitles.language")
+        let title = defaults.string(forKey: "filmstream.subtitles.title")
+        return tracks.first(where: { $0.language == language && $0.title == title })
+            ?? tracks.first(where: { $0.language == language })
     }
 
     private func installItem(url: URL) {

@@ -8,7 +8,7 @@ Use it only with media you are authorized to download and share.
 
 - Local backend bound to `127.0.0.1:8943`
 - Bubble Tea terminal UI with search, continue watching, progress, and history controls
-- Native tvOS client with poster search, movie details, AVPlayer HLS playback, and shared progress
+- Native tvOS client with poster search, movie details, selectable subtitles, AVPlayer HLS playback, and shared progress
 - One-command CLI that starts the backend when needed and launches MPV
 - A small, trusted open-movie catalog plus an Internet Archive reference indexer
 - Standard Torznab indexers, including Prowlarr and Jackett endpoints

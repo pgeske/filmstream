@@ -124,6 +124,9 @@ func TestHLSAssetsAndCleanup(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "segment-000000.m4s"), []byte("segment"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "subtitle-6.vtt"), []byte("WEBVTT\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	manager := &fakeHLSManager{dir: dir}
 	server := &Server{hlsManager: manager}
 
@@ -142,6 +145,13 @@ func TestHLSAssetsAndCleanup(t *testing.T) {
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("segment status = %d, cache control = %q", response.Code, response.Header().Get("Cache-Control"))
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/v1/playbacks/abc/hls/subtitle-6.vtt", nil)
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "text/vtt; charset=utf-8" {
+		t.Fatalf("subtitle status = %d, content type = %q", response.Code, response.Header().Get("Content-Type"))
 	}
 
 	request = httptest.NewRequest(http.MethodDelete, "/v1/playbacks/abc/hls", nil)
