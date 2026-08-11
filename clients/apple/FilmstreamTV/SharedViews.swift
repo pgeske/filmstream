@@ -1,8 +1,11 @@
 import FilmstreamCore
+import Foundation
 import SwiftUI
+import UIKit
 
 extension Color {
     static let filmstreamBackground = Color(red: 0.035, green: 0.045, blue: 0.07)
+    static let filmstreamBackgroundTop = Color(red: 0.055, green: 0.07, blue: 0.11)
     static let filmstreamPanel = Color(red: 0.075, green: 0.09, blue: 0.13)
     static let filmstreamAccent = Color(red: 0.95, green: 0.23, blue: 0.28)
 }
@@ -21,74 +24,102 @@ struct BrandHeader: View {
     }
 }
 
+private struct MovieCardButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.82 : 1)
+            .scaleEffect(configuration.isPressed ? 0.985 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
 struct MovieNavigationCard: View {
     let movie: Movie
     var progress: Double? = nil
+    var requestsInitialFocus = false
     @FocusState private var isFocused: Bool
+
+    private let cardWidth: CGFloat = 250
 
     var body: some View {
         NavigationLink(value: movie) {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 13) {
                 PosterImage(movie: movie)
-                    .frame(width: 230, height: 345)
+                    .frame(width: cardWidth, height: 375)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .stroke(
+                                isFocused ? Color.filmstreamAccent : .white.opacity(0.09),
+                                lineWidth: isFocused ? 3 : 1
+                            )
+                    }
                     .overlay(alignment: .bottom) {
                         if let progress, progress > 0 {
                             ProgressView(value: progress)
                                 .tint(Color.filmstreamAccent)
-                                .padding(.horizontal, 10)
-                                .padding(.bottom, 9)
+                                .padding(.horizontal, 12)
+                                .padding(.bottom, 11)
                         }
                     }
+                    .shadow(
+                        color: isFocused ? Color.filmstreamAccent.opacity(0.2) : .black.opacity(0.35),
+                        radius: isFocused ? 28 : 12,
+                        y: isFocused ? 14 : 8
+                    )
+
                 Text(movie.title)
-                    .font(.headline)
-                    .lineLimit(1)
+                    .font(.headline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .frame(width: cardWidth, height: 58, alignment: .topLeading)
                 if let year = movie.year {
                     Text(String(year))
                         .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.white.opacity(0.58))
                 }
             }
-            .frame(width: 230, alignment: .leading)
-            .scaleEffect(isFocused ? 1.06 : 1)
-            .shadow(color: .black.opacity(isFocused ? 0.55 : 0.2), radius: isFocused ? 24 : 8, y: 10)
-            .animation(.easeOut(duration: 0.16), value: isFocused)
+            .frame(width: cardWidth, alignment: .leading)
+            .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .scaleEffect(isFocused ? 1.035 : 1)
+            .offset(y: isFocused ? -6 : 0)
+            .animation(.snappy(duration: 0.22), value: isFocused)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(MovieCardButtonStyle())
+        .focusEffectDisabled()
         .focused($isFocused)
+        .zIndex(isFocused ? 1 : 0)
+        .task {
+            if requestsInitialFocus {
+                isFocused = true
+            }
+        }
     }
 }
 
 struct PosterImage: View {
     let movie: Movie
 
+    @State private var imageData: Data?
+    @State private var isLoading = false
+
     var body: some View {
         Group {
-            if let posterURL = movie.posterURL {
-                AsyncImage(url: posterURL) { phase in
-                    switch phase {
-                    case let .success(image):
-                        image
-                            .resizable()
-                            .scaledToFill()
-                    case .empty:
-                        ZStack {
-                            Color.filmstreamPanel
-                            ProgressView()
-                        }
-                    case .failure:
-                        placeholder
-                    @unknown default:
-                        placeholder
-                    }
+            if let imageData, let image = UIImage(data: imageData) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else if isLoading {
+                ZStack {
+                    Color.filmstreamPanel
+                    ProgressView()
                 }
             } else {
                 placeholder
             }
         }
-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(.white.opacity(0.08), lineWidth: 1)
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .task(id: movie) {
+            await loadArtwork()
         }
     }
 
@@ -101,7 +132,42 @@ struct PosterImage: View {
             )
             Image(systemName: "film.stack")
                 .font(.system(size: 54))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.white.opacity(0.32))
+        }
+    }
+
+    private func loadArtwork() async {
+        imageData = nil
+        let urls = [movie.posterURL, movie.backdropURL].compactMap { $0 }
+        guard !urls.isEmpty else { return }
+
+        isLoading = true
+        defer { isLoading = false }
+        for url in urls {
+            for attempt in 0..<2 {
+                do {
+                    var request = URLRequest(
+                        url: url,
+                        cachePolicy: attempt == 0 ? .returnCacheDataElseLoad : .reloadIgnoringLocalCacheData,
+                        timeoutInterval: 20
+                    )
+                    request.setValue("image/avif,image/webp,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+                    let (data, response) = try await URLSession.shared.data(for: request)
+                    guard let response = response as? HTTPURLResponse,
+                          (200..<300).contains(response.statusCode),
+                          UIImage(data: data) != nil else {
+                        continue
+                    }
+                    imageData = data
+                    return
+                } catch is CancellationError {
+                    return
+                } catch {
+                    if attempt == 0 {
+                        try? await Task.sleep(for: .milliseconds(350))
+                    }
+                }
+            }
         }
     }
 }
