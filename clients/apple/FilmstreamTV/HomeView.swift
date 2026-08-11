@@ -7,21 +7,26 @@ struct HomeView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                Color.filmstreamBackground.ignoresSafeArea()
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 52) {
-                        header
-                        continueWatchingSection
-                        if let errorMessage = model.errorMessage {
-                            Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
-                                .foregroundStyle(.orange)
-                                .font(.headline)
-                        }
-                        Spacer(minLength: 60)
+                LinearGradient(
+                    colors: [Color.filmstreamBackgroundTop, Color.filmstreamBackground],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .ignoresSafeArea()
+
+                VStack(alignment: .leading, spacing: 68) {
+                    header
+                    continueWatchingSection
+                    if let errorMessage = model.errorMessage {
+                        Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .font(.headline)
                     }
-                    .padding(.horizontal, 76)
-                    .padding(.vertical, 44)
+                    Spacer(minLength: 60)
                 }
+                .padding(.horizontal, 88)
+                .padding(.top, 64)
+                .padding(.bottom, 80)
             }
             .navigationDestination(for: Movie.self) { movie in
                 MovieDetailView(movie: movie)
@@ -49,9 +54,14 @@ struct HomeView: View {
 
     @ViewBuilder
     private var continueWatchingSection: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            Text("Continue Watching")
-                .font(.system(size: 40, weight: .bold, design: .rounded))
+        VStack(alignment: .leading, spacing: 30) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Continue Watching")
+                    .font(.system(size: 42, weight: .bold, design: .rounded))
+                Text("Pick up where you left off")
+                    .font(.title3)
+                    .foregroundStyle(.white.opacity(0.58))
+            }
 
             if model.isLoading && model.continueWatching.isEmpty {
                 HStack(spacing: 18) {
@@ -64,15 +74,19 @@ struct HomeView: View {
                 emptyContinueWatching
             } else {
                 ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(alignment: .top, spacing: 34) {
+                    LazyHStack(alignment: .top, spacing: 48) {
                         ForEach(model.continueWatching) { entry in
-                            MovieNavigationCard(movie: entry.movie, progress: entry.progress)
+                            MovieNavigationCard(
+                                movie: entry.movie,
+                                progress: entry.progress,
+                                requestsInitialFocus: entry.id == model.continueWatching.first?.id
+                            )
                         }
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 24)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 34)
+                    .padding(.bottom, 44)
                 }
-                .contentMargins(.horizontal, -10, for: .scrollContent)
                 .scrollClipDisabled()
             }
         }
