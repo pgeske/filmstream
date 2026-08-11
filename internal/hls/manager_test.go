@@ -36,6 +36,7 @@ while :; do sleep 1; done
 		FFprobePath:    ffprobe,
 		SourceBaseURL:  "http://127.0.0.1:8943",
 		StartupTimeout: 5 * time.Second,
+		BufferSeconds:  4,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -87,14 +88,36 @@ JSON
 }
 
 func TestFFmpegArgsPaceInputAndTagHEVC(t *testing.T) {
-	manager := &Manager{segmentSeconds: 4}
+	manager := &Manager{bufferSeconds: 16, segmentSeconds: 4}
 	args := strings.Join(manager.ffmpegArgs("http://source", t.TempDir(), "hevc", 30), " ")
 	for _, expected := range []string{
-		"-readrate 1.05", "-readrate_initial_burst 4", "-ss 30.000", "-c:v copy", "-tag:v hvc1", "-c:a aac",
+		"-readrate 1.05", "-readrate_initial_burst 20", "-noaccurate_seek -ss 30.000", "-c:v copy", "-tag:v hvc1", "-c:a aac",
 	} {
 		if !strings.Contains(args, expected) {
 			t.Fatalf("FFmpeg arguments do not contain %q: %s", expected, args)
 		}
+	}
+}
+
+func TestPlaylistReadyWaitsForStartupBuffer(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "segment-000000.m4s"), []byte("segment"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "index.m3u8"), []byte("#EXTM3U\n#EXTINF:10.5,\nsegment-000000.m4s\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if playlistReady(dir, 16) {
+		t.Fatal("playlist was ready before the startup buffer was available")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "segment-000001.m4s"), []byte("segment"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "index.m3u8"), []byte("#EXTM3U\n#EXTINF:10.5,\nsegment-000000.m4s\n#EXTINF:10.5,\nsegment-000001.m4s\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !playlistReady(dir, 16) {
+		t.Fatal("playlist was not ready after the startup buffer was available")
 	}
 }
 

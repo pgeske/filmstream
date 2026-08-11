@@ -42,19 +42,14 @@ struct PlayerView: View {
                 .padding(.horizontal, 68)
                 .padding(.bottom, 42)
 
-            if controller.isWaiting || controller.errorMessage != nil {
+            if let errorMessage = controller.errorMessage {
                 VStack(spacing: 18) {
-                    if controller.errorMessage == nil {
-                        ProgressView()
-                            .controlSize(.large)
-                    } else {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.largeTitle)
-                            .foregroundStyle(.orange)
-                    }
-                    Text(controller.stateLabel)
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.largeTitle)
+                        .foregroundStyle(.orange)
+                    Text("Unable to Play")
                         .font(.headline)
-                    Text(controller.errorMessage ?? prepared.playback.fileName)
+                    Text(errorMessage)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
@@ -62,6 +57,9 @@ struct PlayerView: View {
                 .padding(30)
                 .background(.black.opacity(0.76), in: RoundedRectangle(cornerRadius: 20))
                 .allowsHitTesting(false)
+            } else if controller.isWaiting {
+                PlaybackLoadingIndicator()
+                    .allowsHitTesting(false)
             }
         }
         .focusable()
@@ -108,14 +106,8 @@ struct PlayerView: View {
     private var controls: some View {
         VStack(alignment: .leading, spacing: 15) {
             HStack {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(movie.title)
-                        .font(.title2.weight(.bold))
-                    Text(prepared.playback.fileName)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
+                Text(movie.title)
+                    .font(.title2.weight(.bold))
                 Spacer()
                 Label(
                     controller.stateLabel,
@@ -132,9 +124,6 @@ struct PlayerView: View {
 
             HStack {
                 Text(formatTime(controller.positionSeconds))
-                Spacer()
-                Text("Center or Play/Pause toggles playback • Left/right seeks 30 seconds anywhere")
-                    .foregroundStyle(.secondary)
                 Spacer()
                 Text(formatTime(controller.durationSeconds))
             }
@@ -183,6 +172,30 @@ struct PlayerView: View {
             return String(format: "%d:%02d:%02d", hours, minutes, remainingSeconds)
         }
         return String(format: "%d:%02d", minutes, remainingSeconds)
+    }
+}
+
+private struct PlaybackLoadingIndicator: View {
+    @State private var isRotating = false
+
+    var body: some View {
+        Circle()
+            .trim(from: 0.08, to: 0.82)
+            .stroke(
+                Color.filmstreamAccent,
+                style: StrokeStyle(lineWidth: 7, lineCap: .round)
+            )
+            .frame(width: 68, height: 68)
+            .rotationEffect(.degrees(isRotating ? 360 : 0))
+            .shadow(color: .black.opacity(0.65), radius: 12)
+            .animation(
+                .linear(duration: 0.9).repeatForever(autoreverses: false),
+                value: isRotating
+            )
+            .onAppear {
+                isRotating = true
+            }
+            .accessibilityLabel("Buffering")
     }
 }
 

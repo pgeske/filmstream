@@ -122,6 +122,7 @@ The optional configuration file is `~/.config/filmstream/config.json`:
   "ffmpeg_path": "ffmpeg",
   "ffprobe_path": "ffprobe",
   "hls_startup_seconds": 90,
+  "hls_startup_buffer_seconds": 16,
   "hls_segment_seconds": 4,
   "max_candidate_gib": 60,
   "readahead_mib": 32,
@@ -231,7 +232,7 @@ The config file is written with mode `0600` because it contains API keys. The CL
 
 ## Smart streaming, cleanup, and ratio behavior
 
-Filmstream only requests the pieces needed by MPV's current HTTP Range request, a 32 MiB read-ahead window, and a small tail window used to find container metadata. Native HLS packaging reads at approximately playback speed with a small initial segment burst, so it also avoids racing through an entire movie in the background. Closing either player closes its readers and removes temporary HLS segments.
+Filmstream only requests the pieces needed by MPV's current HTTP Range request, a 32 MiB read-ahead window, and a small tail window used to find container metadata. Native HLS prepares `hls_startup_buffer_seconds` of media before opening the player, then packages at approximately playback speed so it avoids racing through an entire movie in the background. Closing either player closes its readers and removes temporary HLS segments.
 
 MPV waits for a two-second initial cache before playback to avoid startup jitter. Native Windows MPV uses its D3D11 hardware-decoding and GPU-rendering path. Linux MPV on WSL uses `gpu-next` with `nvdec-copy` when supported and retains `wlshm` as a compatibility fallback; other environments keep MPV's portable automatic output and software-decoding fallback. Apple clients request streaming-optimized H.264/H.265 releases, avoid known-incompatible Dolby Vision releases, copy video without quality loss, and transcode only audio for AVPlayer compatibility.
 

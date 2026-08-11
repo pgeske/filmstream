@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	defaultStartupTimeout = 90 * time.Second
-	defaultSegmentSeconds = 4
+	defaultStartupTimeout       = 90 * time.Second
+	defaultStartupBufferSeconds = 16
+	defaultSegmentSeconds       = 4
 )
 
 type Config struct {
@@ -26,6 +27,7 @@ type Config struct {
 	FFprobePath    string
 	SourceBaseURL  string
 	StartupTimeout time.Duration
+	BufferSeconds  int
 	SegmentSeconds int
 	Logger         *slog.Logger
 }
@@ -43,6 +45,7 @@ type Manager struct {
 	ffprobePath    string
 	sourceBaseURL  string
 	startupTimeout time.Duration
+	bufferSeconds  int
 	segmentSeconds int
 	logger         *slog.Logger
 
@@ -92,6 +95,9 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.StartupTimeout <= 0 {
 		cfg.StartupTimeout = defaultStartupTimeout
 	}
+	if cfg.BufferSeconds <= 0 {
+		cfg.BufferSeconds = defaultStartupBufferSeconds
+	}
 	if cfg.SegmentSeconds <= 0 {
 		cfg.SegmentSeconds = defaultSegmentSeconds
 	}
@@ -111,6 +117,7 @@ func New(cfg Config) (*Manager, error) {
 		ffprobePath:    ffprobePath,
 		sourceBaseURL:  strings.TrimRight(cfg.SourceBaseURL, "/"),
 		startupTimeout: cfg.StartupTimeout,
+		bufferSeconds:  cfg.BufferSeconds,
 		segmentSeconds: cfg.SegmentSeconds,
 		logger:         cfg.Logger,
 		ctx:            ctx,
@@ -286,12 +293,17 @@ func compatibleVideo(probe mediaProbe) (string, float64, error) {
 }
 
 func (m *Manager) ffmpegArgs(sourceURL, dir, codec string, startSeconds float64) []string {
+	// Allow one segment beyond the target buffer to be packaged without rate limiting.
+	// Stream-copied video can only cut on keyframes, so segment lengths may exceed the target.
+	initialBurstSeconds := m.bufferSeconds + m.segmentSeconds
 	args := []string{
 		"-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
-		"-readrate", "1.05", "-readrate_initial_burst", strconv.Itoa(m.segmentSeconds),
+		"-readrate", "1.05", "-readrate_initial_burst", strconv.Itoa(initialBurstSeconds),
 	}
 	if startSeconds > 0 {
-		args = append(args, "-ss", strconv.FormatFloat(startSeconds, 'f', 3, 64))
+		// Video is stream-copied while audio is transcoded. Keeping pre-roll for both
+		// prevents accurate input seeking from discarding audio before the first video keyframe.
+		args = append(args, "-noaccurate_seek", "-ss", strconv.FormatFloat(startSeconds, 'f', 3, 64))
 	}
 	args = append(args,
 		"-i", sourceURL,
@@ -321,14 +333,14 @@ func (m *Manager) waitUntilReady(ctx context.Context, stream *runningStream) err
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if playlistReady(stream.dir) {
+		if playlistReady(stream.dir, m.bufferSeconds) {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("wait for initial HLS segment: %w", ctx.Err())
+			return fmt.Errorf("wait for HLS startup buffer: %w", ctx.Err())
 		case <-stream.done:
-			if playlistReady(stream.dir) {
+			if playlistReady(stream.dir, m.bufferSeconds) {
 				return nil
 			}
 			stream.errMu.RLock()
@@ -343,13 +355,31 @@ func (m *Manager) waitUntilReady(ctx context.Context, stream *runningStream) err
 	}
 }
 
-func playlistReady(dir string) bool {
+func playlistReady(dir string, minimumSeconds int) bool {
 	playlist, err := os.ReadFile(filepath.Join(dir, "index.m3u8"))
-	if err != nil || !strings.Contains(string(playlist), "segment-") {
+	if err != nil {
+		return false
+	}
+
+	var duration float64
+	segmentCount := 0
+	for _, line := range strings.Split(string(playlist), "\n") {
+		if !strings.HasPrefix(line, "#EXTINF:") {
+			continue
+		}
+		value := strings.TrimSuffix(strings.TrimPrefix(line, "#EXTINF:"), ",")
+		seconds, err := strconv.ParseFloat(value, 64)
+		if err != nil || seconds <= 0 {
+			continue
+		}
+		duration += seconds
+		segmentCount++
+	}
+	if segmentCount == 0 || duration < float64(minimumSeconds) {
 		return false
 	}
 	matches, _ := filepath.Glob(filepath.Join(dir, "segment-*.m4s"))
-	return len(matches) > 0
+	return len(matches) >= segmentCount
 }
 
 func validPlaybackID(id string) bool {

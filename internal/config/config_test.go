@@ -24,9 +24,10 @@ func TestDefaultsMatchLocalMVP(t *testing.T) {
 	if cfg.PreferredResolution != "1080p" {
 		t.Fatalf("resolution = %q", cfg.PreferredResolution)
 	}
-	if cfg.HLSDir == "" || cfg.FFmpegPath != "ffmpeg" || cfg.FFprobePath != "ffprobe" || cfg.HLSSegmentSeconds != 4 {
-		t.Fatalf("HLS defaults = dir %q, ffmpeg %q, ffprobe %q, segment %d",
-			cfg.HLSDir, cfg.FFmpegPath, cfg.FFprobePath, cfg.HLSSegmentSeconds)
+	if cfg.HLSDir == "" || cfg.FFmpegPath != "ffmpeg" || cfg.FFprobePath != "ffprobe" ||
+		cfg.HLSBufferSeconds != 16 || cfg.HLSSegmentSeconds != 4 {
+		t.Fatalf("HLS defaults = dir %q, ffmpeg %q, ffprobe %q, startup buffer %d, segment %d",
+			cfg.HLSDir, cfg.FFmpegPath, cfg.FFprobePath, cfg.HLSBufferSeconds, cfg.HLSSegmentSeconds)
 	}
 }
 

@@ -17,6 +17,7 @@ const (
 	defaultSeedMaxHours      = 24
 	defaultIdleGraceSeconds  = 120
 	defaultHLSStartupSeconds = 90
+	defaultHLSBufferSeconds  = 16
 	defaultHLSSegmentSeconds = 4
 )
 
@@ -53,6 +54,7 @@ type Config struct {
 	FFmpegPath          string    `json:"ffmpeg_path"`
 	FFprobePath         string    `json:"ffprobe_path"`
 	HLSStartupSeconds   int       `json:"hls_startup_seconds"`
+	HLSBufferSeconds    int       `json:"hls_startup_buffer_seconds"`
 	HLSSegmentSeconds   int       `json:"hls_segment_seconds"`
 	MaxCandidateGiB     int64     `json:"max_candidate_gib"`
 	ReadaheadMiB        int64     `json:"readahead_mib"`
@@ -79,6 +81,7 @@ func Defaults() Config {
 		FFmpegPath:          "ffmpeg",
 		FFprobePath:         "ffprobe",
 		HLSStartupSeconds:   defaultHLSStartupSeconds,
+		HLSBufferSeconds:    defaultHLSBufferSeconds,
 		HLSSegmentSeconds:   defaultHLSSegmentSeconds,
 		MaxCandidateGiB:     defaultMaxCandidateGiB,
 		ReadaheadMiB:        defaultReadaheadMiB,
@@ -191,8 +194,8 @@ func (c Config) Validate() error {
 	if c.HLSDir == "" || c.FFmpegPath == "" || c.FFprobePath == "" {
 		return errors.New("hls_dir, ffmpeg_path, and ffprobe_path cannot be empty")
 	}
-	if c.HLSStartupSeconds <= 0 || c.HLSSegmentSeconds <= 0 {
-		return errors.New("HLS timeout and segment duration must be positive")
+	if c.HLSStartupSeconds <= 0 || c.HLSBufferSeconds <= 0 || c.HLSSegmentSeconds <= 0 {
+		return errors.New("HLS timeout, startup buffer, and segment duration must be positive")
 	}
 	if c.MaxCandidateGiB <= 0 {
 		return errors.New("max_candidate_gib must be positive")

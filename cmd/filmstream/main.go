@@ -124,6 +124,7 @@ func runServer(args []string) error {
 		FFprobePath:    cfg.FFprobePath,
 		SourceBaseURL:  sourceBaseURL,
 		StartupTimeout: time.Duration(cfg.HLSStartupSeconds) * time.Second,
+		BufferSeconds:  cfg.HLSBufferSeconds,
 		SegmentSeconds: cfg.HLSSegmentSeconds,
 		Logger:         logger,
 	})

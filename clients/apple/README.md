@@ -29,7 +29,7 @@ Search starts automatically after two title characters with a short debounce; se
 - `GET /v1/watch-history?continue=true` for the home screen; and
 - `PUT /v1/watch-history` to sync playback progress.
 
-The HLS backend requires FFmpeg and FFprobe. It copies compatible H.264/H.265 video without re-encoding, converts the first audio track to AAC, and paces packaging close to playback speed. Known Dolby Vision releases are skipped initially in favor of compatible SDR or HDR10 alternatives.
+The HLS backend requires FFmpeg and FFprobe. It copies compatible H.264/H.265 video without re-encoding, converts the first audio track to AAC, and paces packaging close to playback speed. It prepares an initial media buffer before opening the player and preserves audio pre-roll when seeking so copied video and transcoded audio stay synchronized. Known Dolby Vision releases are skipped initially in favor of compatible SDR or HDR10 alternatives.
 
 During playback, Center or Play/Pause toggles playback and left/right seeks 30 seconds. The timeline always represents the full movie rather than the currently generated HLS window. Seeking outside that window asks the server to resume HLS packaging at the target timestamp, which can briefly buffer while the new window starts.
 
