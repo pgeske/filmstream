@@ -15,8 +15,13 @@ struct SearchView: View {
             Color.filmstreamBackground.ignoresSafeArea()
             ScrollView {
                 VStack(alignment: .leading, spacing: 36) {
-                    Text("Search")
-                        .font(.system(size: 48, weight: .bold, design: .rounded))
+                    HStack(spacing: 18) {
+                        Text("Search")
+                            .font(.system(size: 48, weight: .bold, design: .rounded))
+                        if isSearching, !results.isEmpty {
+                            ProgressView()
+                        }
+                    }
 
                     content
 
@@ -32,18 +37,25 @@ struct SearchView: View {
             }
         }
         .navigationTitle("Search")
-        .searchable(text: $query, prompt: "Movie title or description")
-        .onSubmit(of: .search) {
-            Task { await search() }
+        .searchable(text: $query, prompt: "Movie title")
+        .task(id: query) {
+            await searchAfterTypingPause()
         }
     }
 
     @ViewBuilder
     private var content: some View {
-        if isSearching {
+        if !results.isEmpty {
+            LazyVGrid(columns: columns, alignment: .leading, spacing: 44) {
+                ForEach(results) { movie in
+                    MovieNavigationCard(movie: movie)
+                }
+            }
+            .padding(.vertical, 20)
+        } else if isSearching {
             HStack(spacing: 18) {
                 ProgressView()
-                Text("Searching Filmstream…")
+                Text("Finding movies…")
                     .font(.title3)
                     .foregroundStyle(.secondary)
             }
@@ -55,36 +67,50 @@ struct SearchView: View {
                 description: Text(errorMessage)
             )
             .frame(minHeight: 340)
-        } else if query.isEmpty && results.isEmpty {
+        } else if trimmedQuery.count < 2 {
             ContentUnavailableView(
                 "Find Your Next Movie",
                 systemImage: "magnifyingglass",
-                description: Text("Search by title, or describe the movie you remember.")
+                description: Text("Type at least two letters of a movie title.")
             )
             .frame(minHeight: 340)
-        } else if results.isEmpty {
-            ContentUnavailableView.search(text: query)
-                .frame(minHeight: 340)
         } else {
-            LazyVGrid(columns: columns, alignment: .leading, spacing: 44) {
-                ForEach(results) { movie in
-                    MovieNavigationCard(movie: movie)
-                }
-            }
-            .padding(.vertical, 20)
+            ContentUnavailableView.search(text: trimmedQuery)
+                .frame(minHeight: 340)
         }
     }
 
-    private func search() async {
-        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedQuery.isEmpty else { return }
-        isSearching = true
-        defer { isSearching = false }
-        do {
-            results = try await model.api.search(trimmedQuery)
-            errorMessage = nil
-        } catch {
+    private var trimmedQuery: String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func searchAfterTypingPause() async {
+        let submittedQuery = trimmedQuery
+        guard submittedQuery.count >= 2 else {
             results = []
+            errorMessage = nil
+            isSearching = false
+            return
+        }
+
+        do {
+            try await Task.sleep(for: .milliseconds(350))
+        } catch {
+            return
+        }
+        guard !Task.isCancelled else { return }
+
+        isSearching = true
+        errorMessage = nil
+        do {
+            let movies = try await model.api.search(submittedQuery)
+            guard !Task.isCancelled, submittedQuery == trimmedQuery else { return }
+            results = movies
+            isSearching = false
+        } catch {
+            guard !Task.isCancelled, submittedQuery == trimmedQuery else { return }
+            results = []
+            isSearching = false
             errorMessage = error.localizedDescription
         }
     }

@@ -20,7 +20,7 @@ The app defaults to `http://filmstream.home.alyoshukai.com`. `FilmstreamTV/Info.
 
 ## Server capabilities
 
-The tvOS client uses:
+Search starts automatically after two title characters with a short debounce; selecting a TMDB result opens its movie details and playback action. The tvOS client uses:
 
 - `GET /v1/catalog/search` for movie metadata and artwork;
 - `POST /v1/playbacks` for streaming-optimized torrent selection;
