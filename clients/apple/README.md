@@ -31,6 +31,8 @@ Search starts automatically after two title characters with a short debounce; se
 
 The HLS backend requires FFmpeg and FFprobe. It copies compatible H.264/H.265 video without re-encoding, converts the first audio track to AAC, and paces packaging close to playback speed. Known Dolby Vision releases are skipped initially in favor of compatible SDR or HDR10 alternatives.
 
+During playback, Center or Play/Pause toggles playback and left/right seeks 30 seconds. The timeline always represents the full movie rather than the currently generated HLS window. Seeking outside that window asks the server to resume HLS packaging at the target timestamp, which can briefly buffer while the new window starts.
+
 Configure the server's optional `metadata` provider with a TMDB API read token to enable posters, backdrops, release details, and descriptions. Filmstream keeps the token on the server; it is never included in the app.
 
 Movie data and images are provided by TMDB. This product uses the TMDB API but is not endorsed or certified by TMDB.

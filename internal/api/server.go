@@ -551,10 +551,10 @@ func (s *Server) serveHLSAsset(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	switch {
 	case strings.HasSuffix(name, ".m3u8"):
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		w.Header().Set("Cache-Control", "no-store")
 	case strings.HasSuffix(name, ".m4s"):
 		w.Header().Set("Content-Type", "video/iso.segment")
 	case strings.HasSuffix(name, ".mp4"):
