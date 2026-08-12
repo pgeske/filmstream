@@ -14,7 +14,9 @@ struct PlayerView: View {
 
     @StateObject private var controller: NativePlaybackController
     @State private var didClose = false
+    @State private var isPlaybackChromeVisible = true
     @State private var isSubtitlePickerPresented = false
+    @State private var chromeAutoHideTask: Task<Void, Never>?
     @FocusState private var receivesRemoteCommands: Bool
 
     init(movie: Movie, prepared: PreparedPlayback, api: FilmstreamAPI) {
@@ -32,13 +34,16 @@ struct PlayerView: View {
             NativePlayerSurface(player: controller.player)
                 .ignoresSafeArea()
 
-            LinearGradient(
-                colors: [.clear, .black.opacity(0.86)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .frame(height: 270)
-            .allowsHitTesting(false)
+            if isPlaybackChromePresented {
+                LinearGradient(
+                    colors: [.clear, .black.opacity(0.86)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(height: 270)
+                .transition(.opacity)
+                .allowsHitTesting(false)
+            }
 
             if let subtitle = controller.activeSubtitleText {
                 Text(subtitle)
@@ -48,16 +53,20 @@ struct PlayerView: View {
                     .lineSpacing(5)
                     .frame(maxWidth: 1_500)
                     .padding(.horizontal, 80)
-                    .padding(.bottom, 245)
+                    .padding(.bottom, isPlaybackChromePresented ? 245 : 82)
                     .shadow(color: .black, radius: 3, x: 2, y: 2)
                     .shadow(color: .black.opacity(0.9), radius: 7)
                     .transition(.opacity)
+                    .animation(.easeOut(duration: 0.22), value: isPlaybackChromePresented)
                     .allowsHitTesting(false)
             }
 
-            controls
-                .padding(.horizontal, 68)
-                .padding(.bottom, 42)
+            if isPlaybackChromePresented {
+                controls
+                    .padding(.horizontal, 68)
+                    .padding(.bottom, 42)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
 
             if let errorMessage = controller.errorMessage {
                 VStack(spacing: 18) {
@@ -102,25 +111,36 @@ struct PlayerView: View {
             controller.play()
         }
         .onDisappear {
+            chromeAutoHideTask?.cancel()
             closePlayback()
         }
         .onTapGesture {
             guard !isSubtitlePickerPresented else { return }
-            controller.togglePlayback()
+            if isPlaybackChromeVisible {
+                controller.togglePlayback()
+            }
+            revealPlaybackChrome()
         }
         .onPlayPauseCommand {
             guard !isSubtitlePickerPresented else { return }
             controller.togglePlayback()
+            revealPlaybackChrome()
         }
         .onMoveCommand { direction in
             guard !isSubtitlePickerPresented else { return }
             switch direction {
             case .left:
+                revealPlaybackChrome(autoHide: false)
                 controller.jump(by: -30)
             case .right:
+                revealPlaybackChrome(autoHide: false)
                 controller.jump(by: 30)
             case .up, .down:
-                guard !controller.subtitleOptions.isEmpty else { return }
+                guard !controller.subtitleOptions.isEmpty else {
+                    revealPlaybackChrome()
+                    return
+                }
+                revealPlaybackChrome(autoHide: false)
                 receivesRemoteCommands = false
                 withAnimation(.easeOut(duration: 0.2)) {
                     isSubtitlePickerPresented = true
@@ -128,6 +148,15 @@ struct PlayerView: View {
             default:
                 break
             }
+        }
+        .onChange(of: controller.isPlaying) { _, _ in
+            synchronizePlaybackChrome()
+        }
+        .onChange(of: controller.isWaiting) { _, _ in
+            synchronizePlaybackChrome()
+        }
+        .onChange(of: controller.isSeeking) { _, _ in
+            synchronizePlaybackChrome()
         }
         .onExitCommand {
             if isSubtitlePickerPresented {
@@ -147,6 +176,10 @@ struct PlayerView: View {
                 await reportProgress()
             }
         }
+    }
+
+    private var isPlaybackChromePresented: Bool {
+        isPlaybackChromeVisible || isSubtitlePickerPresented
     }
 
     private var controls: some View {
@@ -186,12 +219,61 @@ struct PlayerView: View {
         }
     }
 
+    private func revealPlaybackChrome(autoHide: Bool = true) {
+        chromeAutoHideTask?.cancel()
+        chromeAutoHideTask = nil
+        withAnimation(.easeOut(duration: 0.22)) {
+            isPlaybackChromeVisible = true
+        }
+        if autoHide {
+            schedulePlaybackChromeAutoHide()
+        }
+    }
+
+    private func schedulePlaybackChromeAutoHide() {
+        chromeAutoHideTask?.cancel()
+        chromeAutoHideTask = nil
+        guard isPlaybackChromeVisible,
+              !isSubtitlePickerPresented,
+              controller.isPlaying,
+              !controller.isWaiting,
+              !controller.isSeeking else {
+            return
+        }
+        chromeAutoHideTask = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .seconds(4))
+            } catch {
+                return
+            }
+            guard controller.isPlaying,
+                  !controller.isWaiting,
+                  !controller.isSeeking,
+                  !isSubtitlePickerPresented else {
+                return
+            }
+            withAnimation(.easeOut(duration: 0.28)) {
+                isPlaybackChromeVisible = false
+            }
+            chromeAutoHideTask = nil
+        }
+    }
+
+    private func synchronizePlaybackChrome() {
+        if controller.isSeeking || (!controller.isPlaying && !controller.isWaiting) {
+            revealPlaybackChrome(autoHide: false)
+        } else if isPlaybackChromeVisible {
+            schedulePlaybackChromeAutoHide()
+        }
+    }
+
     private func closeSubtitlePicker() {
         withAnimation(.easeOut(duration: 0.18)) {
             isSubtitlePickerPresented = false
         }
         Task { @MainActor in
             receivesRemoteCommands = true
+            schedulePlaybackChromeAutoHide()
         }
     }
 
