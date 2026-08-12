@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -40,6 +41,7 @@ type CreatePlaybackResponse struct {
 
 type HLSStreamManager interface {
 	Start(context.Context, string, float64) (hls.Stream, error)
+	StartSubtitle(context.Context, string, int) error
 	AssetPath(string, string) (string, error)
 	Stop(string)
 }
@@ -132,6 +134,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("HEAD /v1/playbacks/{id}/stream", s.streamPlayback)
 	mux.HandleFunc("POST /v1/playbacks/{id}/hls", s.startHLSPlayback)
 	mux.HandleFunc("DELETE /v1/playbacks/{id}/hls", s.stopHLSPlayback)
+	mux.HandleFunc("POST /v1/playbacks/{id}/hls/subtitles/{index}", s.startHLSSubtitle)
 	mux.HandleFunc("GET /v1/playbacks/{id}/hls/{asset}", s.serveHLSAsset)
 	return mux
 }
@@ -521,6 +524,30 @@ func (s *Server) startHLSPlayback(w http.ResponseWriter, r *http.Request) {
 		Stream:      stream,
 		PlaylistURL: fmt.Sprintf("%s://%s/v1/playbacks/%s/hls/index.m3u8", requestScheme(r), r.Host, id),
 	})
+}
+
+func (s *Server) startHLSSubtitle(w http.ResponseWriter, r *http.Request) {
+	s.hlsMu.RLock()
+	manager := s.hlsManager
+	s.hlsMu.RUnlock()
+	if manager == nil {
+		writeError(w, http.StatusNotImplemented, "HLS playback is not configured")
+		return
+	}
+	index, err := strconv.Atoi(r.PathValue("index"))
+	if err != nil || index < 0 {
+		writeError(w, http.StatusBadRequest, "invalid subtitle index")
+		return
+	}
+	if err := manager.StartSubtitle(r.Context(), r.PathValue("id"), index); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, "subtitle track not found")
+			return
+		}
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "preparing"})
 }
 
 func (s *Server) stopHLSPlayback(w http.ResponseWriter, r *http.Request) {

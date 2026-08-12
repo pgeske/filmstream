@@ -258,6 +258,15 @@ private extension HLSSubtitleTrack {
     }
 }
 
+private struct SubtitleOptionButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.82 : 1)
+            .scaleEffect(configuration.isPressed ? 0.985 : 1)
+            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+    }
+}
+
 private struct SubtitlePicker: View {
     let tracks: [HLSSubtitleTrack]
     let selected: HLSSubtitleTrack?
@@ -266,25 +275,29 @@ private struct SubtitlePicker: View {
 
     @FocusState private var focusedOption: Int?
 
+    private var listHeight: CGFloat {
+        min(CGFloat(tracks.count + 1) * 76, 520)
+    }
+
     var body: some View {
         ZStack(alignment: .trailing) {
-            Color.black.opacity(0.42)
+            Color.black.opacity(0.34)
                 .ignoresSafeArea()
 
-            VStack(alignment: .leading, spacing: 28) {
+            VStack(alignment: .leading, spacing: 20) {
                 HStack(spacing: 14) {
                     Image(systemName: "captions.bubble.fill")
                         .foregroundStyle(Color.filmstreamAccent)
                     Text("Subtitles")
-                        .font(.system(size: 38, weight: .bold, design: .rounded))
+                        .font(.system(size: 34, weight: .bold, design: .rounded))
                 }
 
-                Text("Choose a language")
-                    .font(.title3)
-                    .foregroundStyle(.secondary)
+                Text("Choose a track")
+                    .font(.headline)
+                    .foregroundStyle(.white.opacity(0.55))
 
                 ScrollView {
-                    LazyVStack(spacing: 10) {
+                    LazyVStack(spacing: 8) {
                         optionRow(id: -1, title: "Off", isSelected: selected == nil) {
                             onSelect(nil)
                         }
@@ -299,18 +312,25 @@ private struct SubtitlePicker: View {
                         }
                     }
                 }
+                .frame(height: listHeight)
                 .scrollIndicators(.hidden)
             }
-            .padding(42)
-            .frame(width: 660)
-            .frame(maxHeight: 830, alignment: .topLeading)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+            .padding(34)
+            .frame(width: 570)
+            .background(
+                LinearGradient(
+                    colors: [Color(red: 0.08, green: 0.085, blue: 0.105), .black.opacity(0.96)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
+                in: RoundedRectangle(cornerRadius: 26, style: .continuous)
+            )
             .overlay {
-                RoundedRectangle(cornerRadius: 28, style: .continuous)
-                    .stroke(.white.opacity(0.12), lineWidth: 1)
+                RoundedRectangle(cornerRadius: 26, style: .continuous)
+                    .stroke(.white.opacity(0.1), lineWidth: 1)
             }
-            .shadow(color: .black.opacity(0.55), radius: 38, x: -12)
-            .padding(.trailing, 58)
+            .shadow(color: .black.opacity(0.6), radius: 38, x: -12)
+            .padding(.trailing, 68)
         }
         .onExitCommand(perform: onDismiss)
         .task {
@@ -335,9 +355,13 @@ private struct SubtitlePicker: View {
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
-            HStack(spacing: 18) {
+            HStack(spacing: 16) {
+                Capsule()
+                    .fill(focusedOption == id ? Color.filmstreamAccent : .clear)
+                    .frame(width: 4, height: 32)
                 Text(title)
                     .font(.title3.weight(.semibold))
+                    .foregroundStyle(.white)
                     .lineLimit(1)
                 Spacer()
                 if isSelected {
@@ -346,20 +370,21 @@ private struct SubtitlePicker: View {
                         .foregroundStyle(Color.filmstreamAccent)
                 }
             }
-            .padding(.horizontal, 22)
+            .padding(.horizontal, 16)
             .frame(height: 66)
+            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .background(
-                focusedOption == id ? Color.white.opacity(0.16) : Color.clear,
+                focusedOption == id ? Color.white.opacity(0.11) : Color.clear,
                 in: RoundedRectangle(cornerRadius: 14, style: .continuous)
             )
             .overlay {
                 if focusedOption == id {
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(Color.filmstreamAccent.opacity(0.9), lineWidth: 2)
+                        .stroke(Color.white.opacity(0.14), lineWidth: 1)
                 }
             }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(SubtitleOptionButtonStyle())
         .focusEffectDisabled()
         .focused($focusedOption, equals: id)
     }
@@ -684,8 +709,14 @@ private final class NativePlaybackController: ObservableObject {
 
         let offset = streamStartSeconds
         subtitleTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.api.startSubtitle(playbackID: self.playback.id, track: track)
+            } catch {
+                return
+            }
             while !Task.isCancelled {
-                guard let self, !self.stopped,
+                guard !self.stopped,
                       self.selectedSubtitle?.index == track.index,
                       self.streamStartSeconds == offset else {
                     return

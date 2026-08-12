@@ -74,6 +74,17 @@ public struct FilmstreamAPI: Sendable {
         let _: HealthResponse = try await send(request)
     }
 
+    public func startSubtitle(playbackID: String, track: HLSSubtitleTrack) async throws {
+        var request = URLRequest(
+            url: baseURL.appendingPathComponent(
+                "v1/playbacks/\(playbackID)/hls/subtitles/\(track.index)"
+            )
+        )
+        request.httpMethod = "POST"
+        request.timeoutInterval = 15
+        let _: HealthResponse = try await send(request)
+    }
+
     public func subtitleCues(
         playbackID: String,
         track: HLSSubtitleTrack,

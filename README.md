@@ -122,7 +122,7 @@ The optional configuration file is `~/.config/filmstream/config.json`:
   "ffmpeg_path": "ffmpeg",
   "ffprobe_path": "ffprobe",
   "hls_startup_seconds": 90,
-  "hls_startup_buffer_seconds": 16,
+  "hls_startup_buffer_seconds": 10,
   "hls_segment_seconds": 4,
   "max_candidate_gib": 60,
   "readahead_mib": 32,

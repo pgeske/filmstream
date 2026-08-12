@@ -12,22 +12,37 @@ import (
 
 func TestManagerCreatesAndServesIncrementalPlaylist(t *testing.T) {
 	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
+case " $* " in
+  *" -read_intervals "*) printf '118.500\n'; exit 0 ;;
+esac
 cat <<'JSON'
-{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]}],"format":{"duration":"7200.5"}}
+{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]},{"index":3,"codec_name":"subrip","codec_type":"subtitle","tags":{"language":"eng"}}],"format":{"duration":"7200.5"}}
 JSON
 `)
 	ffmpeg := writeExecutable(t, "ffmpeg", `#!/bin/sh
 for last do :; done
 dir=$(dirname "$last")
-printf 'init' > "$dir/init.mp4"
-printf 'segment' > "$dir/segment-000000.m4s"
-cat > "$dir/index.m3u8" <<'PLAYLIST'
+case "$last" in
+  *.vtt)
+    cat > "$last" <<'SUBTITLES'
+WEBVTT
+
+00:02.000 --> 00:04.000
+Hello
+SUBTITLES
+    ;;
+  *)
+    printf 'init' > "$dir/init.mp4"
+    printf 'segment' > "$dir/segment-000000.m4s"
+    cat > "$dir/index.m3u8" <<'PLAYLIST'
 #EXTM3U
 #EXT-X-VERSION:7
 #EXT-X-MAP:URI="init.mp4"
 #EXTINF:4.0,
 segment-000000.m4s
 PLAYLIST
+    ;;
+esac
 while :; do sleep 1; done
 `)
 	manager, err := New(Config{
@@ -47,7 +62,7 @@ while :; do sleep 1; done
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stream.VideoCodec != "h264" || stream.DurationSeconds != 7200.5 || stream.StartSeconds != 120 {
+	if stream.VideoCodec != "h264" || stream.DurationSeconds != 7200.5 || stream.StartSeconds != 118.5 || len(stream.Subtitles) != 1 {
 		t.Fatalf("stream = %+v", stream)
 	}
 	path, err := manager.AssetPath(stream.PlaybackID, "index.m3u8")
@@ -60,6 +75,23 @@ while :; do sleep 1; done
 	}
 	if !strings.Contains(string(contents), "segment-000000.m4s") {
 		t.Fatalf("playlist = %q", contents)
+	}
+	if _, err := manager.AssetPath(stream.PlaybackID, "subtitle-3.vtt"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("subtitle existed before selection: %v", err)
+	}
+	if err := manager.StartSubtitle(context.Background(), stream.PlaybackID, 3); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		path, err = manager.AssetPath(stream.PlaybackID, "subtitle-3.vtt")
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("subtitle was not created: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	manager.Stop(stream.PlaybackID)
 	if _, err := manager.AssetPath(stream.PlaybackID, "index.m3u8"); !errors.Is(err, os.ErrNotExist) {
@@ -89,13 +121,34 @@ JSON
 
 func TestFFmpegArgsPaceInputAndTagHEVC(t *testing.T) {
 	manager := &Manager{bufferSeconds: 16, segmentSeconds: 4}
-	args := strings.Join(manager.ffmpegArgs("http://source", t.TempDir(), "hevc", 30, []SubtitleTrack{{Index: 4}}), " ")
+	args := strings.Join(manager.ffmpegArgs("http://source", t.TempDir(), "hevc", 30), " ")
 	for _, expected := range []string{
 		"-readrate 1.05", "-readrate_initial_burst 20", "-noaccurate_seek -ss 30.000", "-c:v copy", "-tag:v hvc1", "-c:a aac",
-		"-map 0:4 -c:s webvtt -flush_packets 1 -f webvtt",
 	} {
 		if !strings.Contains(args, expected) {
 			t.Fatalf("FFmpeg arguments do not contain %q: %s", expected, args)
+		}
+	}
+	if strings.Contains(args, "-c:s") {
+		t.Fatalf("video packager includes subtitle conversion: %s", args)
+	}
+}
+
+func TestSubtitleArgsAlignToKeyframeTimeline(t *testing.T) {
+	manager := &Manager{bufferSeconds: 16, segmentSeconds: 4}
+	stream := &runningStream{
+		info:           Stream{StartSeconds: 118.5},
+		dir:            t.TempDir(),
+		sourceURL:      "http://source",
+		requestedStart: 120,
+	}
+	args := strings.Join(manager.subtitleArgs(stream, 4), " ")
+	for _, expected := range []string{
+		"-noaccurate_seek -ss 120.000", "-map 0:4", "-c:s webvtt",
+		"-output_ts_offset 1.500", "-flush_packets 1 -f webvtt",
+	} {
+		if !strings.Contains(args, expected) {
+			t.Fatalf("subtitle arguments do not contain %q: %s", expected, args)
 		}
 	}
 }

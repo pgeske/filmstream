@@ -66,12 +66,20 @@ type Manager struct {
 }
 
 type runningStream struct {
-	info   Stream
-	dir    string
-	cancel context.CancelFunc
-	done   chan struct{}
-	errMu  sync.RWMutex
-	err    error
+	info           Stream
+	dir            string
+	sourceURL      string
+	requestedStart float64
+	ctx            context.Context
+	cancel         context.CancelFunc
+	done           chan struct{}
+	errMu          sync.RWMutex
+	err            error
+
+	subtitleMu     sync.Mutex
+	subtitleIndex  int
+	subtitleCancel context.CancelFunc
+	subtitleDone   chan struct{}
 }
 
 type mediaProbe struct {
@@ -166,6 +174,14 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 		return Stream{}, err
 	}
 	subtitles := supportedSubtitles(probe)
+	timelineStart := startSeconds
+	if startSeconds > 0 {
+		if keyframeStart, err := m.probeTimelineStart(ctx, sourceURL, startSeconds); err != nil {
+			m.logger.Warn("probe HLS keyframe start", "playback_id", playbackID, "error", err)
+		} else {
+			timelineStart = keyframeStart
+		}
+	}
 
 	dir := filepath.Join(m.dataDir, playbackID)
 	if err := os.RemoveAll(dir); err != nil {
@@ -180,7 +196,7 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 	}
 
 	streamContext, cancel := context.WithCancel(m.ctx)
-	args := m.ffmpegArgs(sourceURL, dir, codec, startSeconds, subtitles)
+	args := m.ffmpegArgs(sourceURL, dir, codec, startSeconds)
 	command := exec.CommandContext(streamContext, m.ffmpegPath, args...)
 	command.Stdout = logFile
 	command.Stderr = logFile
@@ -191,12 +207,16 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 	}
 	stream := &runningStream{
 		info: Stream{
-			PlaybackID: playbackID, StartSeconds: startSeconds, DurationSeconds: duration,
+			PlaybackID: playbackID, StartSeconds: timelineStart, DurationSeconds: duration,
 			VideoCodec: codec, Subtitles: subtitles,
 		},
-		dir:    dir,
-		cancel: cancel,
-		done:   make(chan struct{}),
+		dir:            dir,
+		sourceURL:      sourceURL,
+		requestedStart: startSeconds,
+		ctx:            streamContext,
+		cancel:         cancel,
+		done:           make(chan struct{}),
+		subtitleIndex:  -1,
 	}
 	m.mu.Lock()
 	m.streams[playbackID] = stream
@@ -219,8 +239,65 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 		m.Stop(playbackID)
 		return Stream{}, err
 	}
-	m.logger.Info("HLS stream ready", "playback_id", playbackID, "codec", codec, "start_seconds", startSeconds)
+	m.logger.Info("HLS stream ready", "playback_id", playbackID, "codec", codec,
+		"requested_start_seconds", startSeconds, "timeline_start_seconds", timelineStart)
 	return stream.info, nil
+}
+
+func (m *Manager) StartSubtitle(_ context.Context, playbackID string, index int) error {
+	if !validPlaybackID(playbackID) || index < 0 {
+		return os.ErrNotExist
+	}
+	m.mu.RLock()
+	stream := m.streams[playbackID]
+	m.mu.RUnlock()
+	if stream == nil || !hasSubtitle(stream.info.Subtitles, index) {
+		return os.ErrNotExist
+	}
+
+	stream.subtitleMu.Lock()
+	defer stream.subtitleMu.Unlock()
+	if stream.subtitleIndex == index && stream.subtitleCancel != nil {
+		return nil
+	}
+	m.stopSubtitleLocked(stream)
+
+	for _, match := range []string{"subtitle-*.vtt", "subtitle-*.log"} {
+		paths, _ := filepath.Glob(filepath.Join(stream.dir, match))
+		for _, path := range paths {
+			_ = os.Remove(path)
+		}
+	}
+
+	logPath := filepath.Join(stream.dir, fmt.Sprintf("subtitle-%d.log", index))
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("create subtitle log: %w", err)
+	}
+	subtitleContext, cancel := context.WithCancel(stream.ctx)
+	args := m.subtitleArgs(stream, index)
+	command := exec.CommandContext(subtitleContext, m.ffmpegPath, args...)
+	command.Stdout = logFile
+	command.Stderr = logFile
+	if err := command.Start(); err != nil {
+		cancel()
+		_ = logFile.Close()
+		return fmt.Errorf("start subtitle conversion: %w", err)
+	}
+	stream.subtitleIndex = index
+	stream.subtitleCancel = cancel
+	stream.subtitleDone = make(chan struct{})
+	done := stream.subtitleDone
+	go func() {
+		err := command.Wait()
+		_ = logFile.Close()
+		close(done)
+		if err != nil && subtitleContext.Err() == nil {
+			m.logger.Warn("subtitle conversion stopped", "playback_id", playbackID, "index", index, "error", err)
+		}
+	}()
+	m.logger.Info("subtitle conversion started", "playback_id", playbackID, "index", index)
+	return nil
 }
 
 func (m *Manager) AssetPath(playbackID, name string) (string, error) {
@@ -249,6 +326,9 @@ func (m *Manager) Stop(playbackID string) {
 	if stream == nil {
 		return
 	}
+	stream.subtitleMu.Lock()
+	m.stopSubtitleLocked(stream)
+	stream.subtitleMu.Unlock()
 	stream.cancel()
 	select {
 	case <-stream.done:
@@ -257,6 +337,22 @@ func (m *Manager) Stop(playbackID string) {
 	if err := os.RemoveAll(stream.dir); err != nil {
 		m.logger.Warn("remove HLS stream", "playback_id", playbackID, "error", err)
 	}
+}
+
+func (m *Manager) stopSubtitleLocked(stream *runningStream) {
+	if stream.subtitleCancel == nil {
+		return
+	}
+	stream.subtitleCancel()
+	if stream.subtitleDone != nil {
+		select {
+		case <-stream.subtitleDone:
+		case <-time.After(5 * time.Second):
+		}
+	}
+	stream.subtitleIndex = -1
+	stream.subtitleCancel = nil
+	stream.subtitleDone = nil
 }
 
 func (m *Manager) Close() error {
@@ -298,6 +394,33 @@ func (m *Manager) probe(parent context.Context, sourceURL string) (mediaProbe, e
 	return probe, nil
 }
 
+func (m *Manager) probeTimelineStart(parent context.Context, sourceURL string, requested float64) (float64, error) {
+	ctx, cancel := context.WithTimeout(parent, m.startupTimeout)
+	defer cancel()
+	interval := strconv.FormatFloat(requested, 'f', 3, 64) + "%+#1"
+	command := exec.CommandContext(ctx, m.ffprobePath,
+		"-v", "error",
+		"-read_intervals", interval,
+		"-select_streams", "v:0",
+		"-show_entries", "packet=pts_time",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		sourceURL,
+	)
+	output, err := command.Output()
+	if err != nil {
+		return requested, fmt.Errorf("probe video keyframe: %w", err)
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) == 0 {
+		return requested, errors.New("probe video keyframe returned no timestamp")
+	}
+	start, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil || start < 0 || start > requested+0.5 {
+		return requested, fmt.Errorf("invalid video keyframe timestamp %q", fields[0])
+	}
+	return start, nil
+}
+
 func compatibleVideo(probe mediaProbe) (string, float64, error) {
 	for _, stream := range probe.Streams {
 		if stream.CodecType != "video" {
@@ -336,6 +459,15 @@ func supportedSubtitles(probe mediaProbe) []SubtitleTrack {
 	return tracks
 }
 
+func hasSubtitle(tracks []SubtitleTrack, index int) bool {
+	for _, track := range tracks {
+		if track.Index == index {
+			return true
+		}
+	}
+	return false
+}
+
 func isTextSubtitleCodec(codec string) bool {
 	switch strings.ToLower(codec) {
 	case "ass", "mov_text", "ssa", "subrip", "text", "webvtt":
@@ -365,7 +497,7 @@ func canonicalLanguage(language string) string {
 	return language
 }
 
-func (m *Manager) ffmpegArgs(sourceURL, dir, codec string, startSeconds float64, subtitles []SubtitleTrack) []string {
+func (m *Manager) ffmpegArgs(sourceURL, dir, codec string, startSeconds float64) []string {
 	// Allow one segment beyond the target buffer to be packaged without rate limiting.
 	// Stream-copied video can only cut on keyframes, so segment lengths may exceed the target.
 	initialBurstSeconds := m.bufferSeconds + m.segmentSeconds
@@ -399,14 +531,32 @@ func (m *Manager) ffmpegArgs(sourceURL, dir, codec string, startSeconds float64,
 		"-hls_segment_filename", filepath.Join(dir, "segment-%06d.m4s"),
 		filepath.Join(dir, "index.m3u8"),
 	)
-	for _, subtitle := range subtitles {
+	return args
+}
+
+func (m *Manager) subtitleArgs(stream *runningStream, index int) []string {
+	initialBurstSeconds := m.bufferSeconds + m.segmentSeconds
+	args := []string{
+		"-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
+		"-readrate", "1.05", "-readrate_initial_burst", strconv.Itoa(initialBurstSeconds),
+	}
+	if stream.requestedStart > 0 {
 		args = append(args,
-			"-map", fmt.Sprintf("0:%d", subtitle.Index),
-			"-c:s", "webvtt", "-flush_packets", "1", "-f", "webvtt",
-			filepath.Join(dir, fmt.Sprintf("subtitle-%d.vtt", subtitle.Index)),
+			"-noaccurate_seek", "-ss", strconv.FormatFloat(stream.requestedStart, 'f', 3, 64),
 		)
 	}
-	return args
+	args = append(args,
+		"-i", stream.sourceURL,
+		"-map", fmt.Sprintf("0:%d", index),
+		"-c:s", "webvtt",
+	)
+	if offset := stream.requestedStart - stream.info.StartSeconds; offset > 0 {
+		args = append(args, "-output_ts_offset", strconv.FormatFloat(offset, 'f', 3, 64))
+	}
+	return append(args,
+		"-flush_packets", "1", "-f", "webvtt",
+		filepath.Join(stream.dir, fmt.Sprintf("subtitle-%d.vtt", index)),
+	)
 }
 
 func (m *Manager) waitUntilReady(ctx context.Context, stream *runningStream) error {

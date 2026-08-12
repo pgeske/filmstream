@@ -21,12 +21,20 @@ type fakeResolver struct{}
 type fakeMetadata struct{}
 
 type fakeHLSManager struct {
-	dir     string
-	stopped string
+	dir              string
+	stopped          string
+	subtitlePlayback string
+	subtitleIndex    int
 }
 
 func (f *fakeHLSManager) Start(_ context.Context, id string, start float64) (hls.Stream, error) {
 	return hls.Stream{PlaybackID: id, StartSeconds: start, VideoCodec: "h264"}, nil
+}
+
+func (f *fakeHLSManager) StartSubtitle(_ context.Context, playbackID string, index int) error {
+	f.subtitlePlayback = playbackID
+	f.subtitleIndex = index
+	return nil
 }
 
 func (f *fakeHLSManager) AssetPath(_, name string) (string, error) {
@@ -130,8 +138,15 @@ func TestHLSAssetsAndCleanup(t *testing.T) {
 	manager := &fakeHLSManager{dir: dir}
 	server := &Server{hlsManager: manager}
 
-	request := httptest.NewRequest(http.MethodGet, "/v1/playbacks/abc/hls/index.m3u8", nil)
+	request := httptest.NewRequest(http.MethodPost, "/v1/playbacks/abc/hls/subtitles/6", nil)
 	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted || manager.subtitlePlayback != "abc" || manager.subtitleIndex != 6 {
+		t.Fatalf("subtitle start status = %d, playback = %q, index = %d", response.Code, manager.subtitlePlayback, manager.subtitleIndex)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/v1/playbacks/abc/hls/index.m3u8", nil)
+	response = httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "application/vnd.apple.mpegurl" {
 		t.Fatalf("status = %d, content type = %q", response.Code, response.Header().Get("Content-Type"))
