@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pgeske/filmstream/internal/catalog"
 	"github.com/pgeske/filmstream/internal/history"
@@ -29,6 +30,13 @@ type CreatePlaybackRequest struct {
 	MagnetURI   string              `json:"magnet_uri,omitempty"`
 	TorrentPath string              `json:"torrent_path,omitempty"`
 }
+
+const (
+	maxLiveSwarmCandidates = 3
+	minimumLivePeers       = 3
+	strongLiveSwarmPeers   = 20
+	liveSwarmWait          = 16 * time.Second
+)
 
 type CreatePlaybackResponse struct {
 	ID        string                   `json:"id"`
@@ -413,7 +421,7 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var source torrentstream.Source
+	var session *torrentstream.Session
 	var selected *catalog.RankedCandidate
 	if request.Query != "" {
 		search := catalog.SearchRequest{Query: strings.TrimSpace(request.Query), Year: request.Year, Preferences: preferences}
@@ -427,21 +435,20 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "no matching torrent candidates found")
 			return
 		}
-		selected = &ranked[0]
-		resolved, err := s.indexers.Resolve(r.Context(), selected.Candidate)
+		session, selected, err = s.createRankedPlayback(r.Context(), ranked, preferences.StreamingOptimized)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
 		}
-		source = torrentstream.Source{MagnetURI: resolved.MagnetURI, TorrentURL: resolved.TorrentURL}
 	} else {
-		source = torrentstream.Source{MagnetURI: request.MagnetURI, TorrentPath: request.TorrentPath}
-	}
-
-	session, err := s.engine.Create(r.Context(), source)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
-		return
+		var err error
+		session, err = s.engine.Create(r.Context(), torrentstream.Source{
+			MagnetURI: request.MagnetURI, TorrentPath: request.TorrentPath,
+		})
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
 	}
 	if selected != nil {
 		s.mu.Lock()
@@ -458,6 +465,103 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 		StreamURL: fmt.Sprintf("%s://%s/v1/playbacks/%s/stream", requestScheme(r), r.Host, session.ID),
 		Selected:  selected,
 	})
+}
+
+func (s *Server) createRankedPlayback(
+	ctx context.Context,
+	ranked []catalog.RankedCandidate,
+	validateSwarm bool,
+) (*torrentstream.Session, *catalog.RankedCandidate, error) {
+	type option struct {
+		session   *torrentstream.Session
+		candidate catalog.RankedCandidate
+		peers     int
+	}
+
+	attempts := 1
+	if validateSwarm {
+		attempts = min(maxLiveSwarmCandidates, len(ranked))
+	}
+	options := make([]option, 0, attempts)
+	var failures []string
+	for i := 0; i < attempts; i++ {
+		candidate := ranked[i]
+		resolved, err := s.indexers.Resolve(ctx, candidate.Candidate)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", candidate.Candidate.Name, err))
+			continue
+		}
+		session, err := s.engine.Create(ctx, torrentstream.Source{
+			MagnetURI: resolved.MagnetURI, TorrentURL: resolved.TorrentURL,
+		})
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", candidate.Candidate.Name, err))
+			continue
+		}
+		if !validateSwarm {
+			return session, &candidate, nil
+		}
+		options = append(options, option{session: session, candidate: candidate})
+	}
+	if len(options) == 0 {
+		if len(failures) > 0 {
+			return nil, nil, errors.New(strings.Join(failures, "; "))
+		}
+		return nil, nil, errors.New("no usable torrent candidates found")
+	}
+
+	deadline := time.NewTimer(liveSwarmWait)
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+observe:
+	for {
+		strongest := 0
+		for i := range options {
+			status, ok := s.engine.Status(options[i].session.ID)
+			if !ok {
+				continue
+			}
+			options[i].peers = max(status.ActivePeers, status.ConnectedSeeders)
+			strongest = max(strongest, options[i].peers)
+		}
+		if strongest >= strongLiveSwarmPeers {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			for _, option := range options {
+				_ = s.engine.Drop(option.session.ID)
+			}
+			return nil, nil, ctx.Err()
+		case <-deadline.C:
+			break observe
+		case <-ticker.C:
+		}
+	}
+
+	best := 0
+	for i := 1; i < len(options); i++ {
+		if options[i].peers > options[best].peers {
+			best = i
+		}
+	}
+	chosen := options[best]
+	for i := range options {
+		if i != best {
+			_ = s.engine.Drop(options[i].session.ID)
+		}
+	}
+	if chosen.peers >= minimumLivePeers {
+		s.logger.Info("selected strongest live playback swarm", "id", chosen.session.ID,
+			"name", chosen.candidate.Candidate.Name, "live_peers", chosen.peers,
+			"reported_seeders", chosen.candidate.Candidate.Seeders)
+	} else {
+		s.logger.Warn("using best available playback despite weak live swarm", "id", chosen.session.ID,
+			"name", chosen.candidate.Candidate.Name, "live_peers", chosen.peers,
+			"reported_seeders", chosen.candidate.Candidate.Seeders)
+	}
+	return chosen.session, &chosen.candidate, nil
 }
 
 func (s *Server) playbackStatus(w http.ResponseWriter, r *http.Request) {

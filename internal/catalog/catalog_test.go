@@ -58,6 +58,46 @@ func TestRankStreamingOptimizedPrefersNativeFriendlyEncode(t *testing.T) {
 	}
 }
 
+func TestRankStreamingOptimizedPrioritizesPopularityOverSize(t *testing.T) {
+	popularSeeders, smallerSeeders := 140, 40
+	ranked := Rank(SearchRequest{
+		Query: "The Matrix",
+		Year:  1999,
+		Preferences: Preferences{
+			Resolution:         "1080p",
+			Codecs:             []string{"h264", "h265"},
+			MaxSizeBytes:       50 << 30,
+			StreamingOptimized: true,
+		},
+	}, []Candidate{
+		{Name: "The.Matrix.1999.1080p.BluRay.x264-LARGE", SizeBytes: 30 << 30, Seeders: &popularSeeders},
+		{Name: "The.Matrix.1999.1080p.WEBRip.x264-SMALL", SizeBytes: 6 << 30, Seeders: &smallerSeeders},
+	})
+	if got := ranked[0].Candidate.Name; got != "The.Matrix.1999.1080p.BluRay.x264-LARGE" {
+		t.Fatalf("top candidate = %q, want more popular release", got)
+	}
+}
+
+func TestRankStreamingOptimizedIgnoresFreeleechAsHealthSignal(t *testing.T) {
+	moreSeeders, fewerSeeders := 80, 60
+	freeleech, normal := 0.0, 1.0
+	ranked := Rank(SearchRequest{
+		Query: "The Matrix",
+		Year:  1999,
+		Preferences: Preferences{
+			Resolution:         "1080p",
+			Codecs:             []string{"h264"},
+			StreamingOptimized: true,
+		},
+	}, []Candidate{
+		{Name: "The.Matrix.1999.1080p.BluRay.x264-POPULAR", SizeBytes: 10 << 30, Seeders: &moreSeeders, DownloadVolumeFactor: &normal},
+		{Name: "The.Matrix.1999.1080p.WEBRip.x264-FREE", SizeBytes: 10 << 30, Seeders: &fewerSeeders, DownloadVolumeFactor: &freeleech},
+	})
+	if got := ranked[0].Candidate.Name; got != "The.Matrix.1999.1080p.BluRay.x264-POPULAR" {
+		t.Fatalf("top candidate = %q, want more popular release", got)
+	}
+}
+
 func TestRankStreamingOptimizedAllowsTrustedUnknownCodec(t *testing.T) {
 	ranked := Rank(SearchRequest{
 		Query: "Sintel",

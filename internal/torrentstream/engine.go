@@ -325,6 +325,44 @@ func (e *Engine) Get(id string) (*Session, bool) {
 	return session, ok
 }
 
+func (e *Engine) Drop(id string) error {
+	e.lifecycleMu.Lock()
+	defer e.lifecycleMu.Unlock()
+
+	e.mu.Lock()
+	session, ok := e.sessions[id]
+	if !ok {
+		e.mu.Unlock()
+		return errors.New("playback not found")
+	}
+	if session.activeStreams > 0 {
+		e.mu.Unlock()
+		return errors.New("playback is active")
+	}
+	shared := false
+	for candidateID, candidate := range e.sessions {
+		if candidateID != id && candidate.torrent == session.torrent {
+			shared = true
+			break
+		}
+	}
+	delete(e.sessions, id)
+	handler := e.onCleanup
+	e.mu.Unlock()
+
+	if !shared {
+		paths := e.torrentDataPaths(session.torrent)
+		session.torrent.Drop()
+		if err := e.removeTorrentData(paths); err != nil {
+			e.logger.Warn("could not fully remove rejected torrent cache", "error", err)
+		}
+	}
+	if handler != nil {
+		handler(id, "rejected")
+	}
+	return nil
+}
+
 func (e *Engine) Status(id string) (Status, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()

@@ -86,6 +86,71 @@ func TestCleanupProtectsActiveStreamsThenRemovesIdleCache(t *testing.T) {
 	}
 }
 
+func TestDropRemovesInactivePlayback(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentPath, videoPath, _ := createTestTorrent(t, dataDir)
+	engine := newTestEngine(t, dataDir, Config{})
+	defer engine.Close()
+
+	session, err := engine.Create(context.Background(), Source{TorrentPath: torrentPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Drop(session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := engine.Get(session.ID); ok {
+		t.Fatal("dropped playback is still available")
+	}
+	if _, err := os.Stat(videoPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dropped playback data still exists: %v", err)
+	}
+}
+
+func TestDropKeepsSharedTorrentPlayback(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentPath, videoPath, _ := createTestTorrent(t, dataDir)
+	engine := newTestEngine(t, dataDir, Config{})
+	defer engine.Close()
+
+	first, err := engine.Create(context.Background(), Source{TorrentPath: torrentPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := engine.Create(context.Background(), Source{TorrentPath: torrentPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Drop(first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := engine.Get(second.ID); !ok {
+		t.Fatal("shared torrent playback was removed")
+	}
+	if _, err := os.Stat(videoPath); err != nil {
+		t.Fatalf("shared torrent data was removed: %v", err)
+	}
+}
+
+func TestDropRejectsActivePlayback(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentPath, _, _ := createTestTorrent(t, dataDir)
+	engine := newTestEngine(t, dataDir, Config{})
+	defer engine.Close()
+
+	session, err := engine.Create(context.Background(), Source{TorrentPath: torrentPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := engine.beginStream(session.ID, true); !ok {
+		t.Fatal("could not mark stream active")
+	}
+	defer engine.endStream(session.ID)
+	if err := engine.Drop(session.ID); err == nil {
+		t.Fatal("active playback was dropped")
+	}
+}
+
 func TestEngineUsesConfiguredListenPort(t *testing.T) {
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {

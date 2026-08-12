@@ -140,21 +140,16 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 			reasons = append(reasons, "preferred language")
 		}
 		if request.Preferences.StreamingOptimized {
-			name := normalize(candidate.Name)
-			words := wordSet(name)
+			words := wordSet(normalize(candidate.Name))
 			if candidate.SizeBytes > 0 {
 				sizeGiB := float64(candidate.SizeBytes) / float64(int64(1)<<30)
-				penalty := math.Min(sizeGiB*2, 100)
+				penalty := math.Min(sizeGiB*0.5, 25)
 				score -= penalty
-				reasons = append(reasons, formatReason("streaming size penalty", penalty))
+				reasons = append(reasons, formatReason("streaming size tie-breaker", penalty))
 			}
 			if hasWord(words, "remux") {
 				score -= 100
 				reasons = append(reasons, "remux penalty")
-			}
-			if strings.Contains(name, "web dl") || hasWord(words, "webrip") {
-				score += 30
-				reasons = append(reasons, "streaming-friendly source")
 			}
 			if hasWord(words, "x264") || hasWord(words, "x265") {
 				score += 20
@@ -164,7 +159,11 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 
 		if candidate.Seeders != nil {
 			if *candidate.Seeders > 0 {
-				score += math.Log2(float64(*candidate.Seeders)+1) * 16
+				seederWeight := 16.0
+				if request.Preferences.StreamingOptimized {
+					seederWeight = 24
+				}
+				score += math.Log2(float64(*candidate.Seeders)+1) * seederWeight
 				reasons = append(reasons, formatReason("seeders", float64(*candidate.Seeders)))
 			} else {
 				score -= 60
@@ -176,7 +175,7 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 			score += math.Log2(float64(*candidate.Leechers)+1) * 5
 			reasons = append(reasons, formatReason("leechers", float64(*candidate.Leechers)))
 		}
-		if candidate.DownloadVolumeFactor != nil && *candidate.DownloadVolumeFactor < 1 {
+		if !request.Preferences.StreamingOptimized && candidate.DownloadVolumeFactor != nil && *candidate.DownloadVolumeFactor < 1 {
 			score += (1 - *candidate.DownloadVolumeFactor) * 35
 			reasons = append(reasons, formatReason("download factor", *candidate.DownloadVolumeFactor))
 		}
