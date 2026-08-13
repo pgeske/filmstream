@@ -89,7 +89,6 @@ struct HomeView: View {
                     .padding(.top, 34)
                     .padding(.bottom, 44)
                 }
-                .scrollClipDisabled()
             }
         }
         .focusSection()
@@ -118,7 +117,6 @@ struct HomeView: View {
                     .padding(.top, 34)
                     .padding(.bottom, 44)
                 }
-                .scrollClipDisabled()
             }
             .focusSection()
         }
