@@ -1,6 +1,7 @@
 package torrentstream
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -323,6 +324,21 @@ func (e *Engine) Get(id string) (*Session, bool) {
 	defer e.mu.RUnlock()
 	session, ok := e.sessions[id]
 	return session, ok
+}
+
+func (e *Engine) TorrentMetainfo(id string) ([]byte, error) {
+	e.mu.RLock()
+	session, ok := e.sessions[id]
+	e.mu.RUnlock()
+	if !ok {
+		return nil, errors.New("playback not found")
+	}
+	meta := session.torrent.Metainfo()
+	var contents bytes.Buffer
+	if err := meta.Write(&contents); err != nil {
+		return nil, fmt.Errorf("encode torrent metainfo: %w", err)
+	}
+	return contents.Bytes(), nil
 }
 
 func (e *Engine) Drop(id string) error {

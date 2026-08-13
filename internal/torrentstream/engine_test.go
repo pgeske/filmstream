@@ -86,6 +86,33 @@ func TestCleanupProtectsActiveStreamsThenRemovesIdleCache(t *testing.T) {
 	}
 }
 
+func TestTorrentMetainfoCanRecreatePlayback(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentPath, _, _ := createTestTorrent(t, dataDir)
+	engine := newTestEngine(t, dataDir, Config{})
+	defer engine.Close()
+
+	first, err := engine.Create(t.Context(), Source{TorrentPath: torrentPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := engine.TorrentMetainfo(first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cachedPath := filepath.Join(t.TempDir(), "cached.torrent")
+	if err := os.WriteFile(cachedPath, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := engine.Create(t.Context(), Source{TorrentPath: cachedPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Name != first.Name || second.FileName != first.FileName {
+		t.Fatalf("recreated playback = %+v, want source %+v", second, first)
+	}
+}
+
 func TestDropRemovesInactivePlayback(t *testing.T) {
 	dataDir := t.TempDir()
 	torrentPath, videoPath, _ := createTestTorrent(t, dataDir)

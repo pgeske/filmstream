@@ -48,7 +48,7 @@ The home screen separates resumable movies from watch history. Use:
 - `d` to remove it from tracking
 - `q` to quit
 
-Filmstream records MPV position through its local IPC socket. Continue Watching starts after 30 seconds, and a movie is marked watched at 90%. History is stored privately in `~/.local/state/filmstream/history.json`; torrent data remains temporary and is not needed to remember progress. Resuming searches for an appropriate release again, then starts the new stream at the saved timestamp.
+Filmstream records MPV position through its local IPC socket. Continue Watching starts after 30 seconds, and a movie is marked watched at 90%. History is stored privately in `~/.local/state/filmstream/history.json`; downloaded media remains temporary and is not needed to remember progress. The server privately caches the selected torrent metadata so a later resume can reuse the known-good release without searching indexers again. If that cached swarm is no longer available, Filmstream falls back to a fresh ranked search.
 
 The direct CLI searches configured indexers, selects a release, starts the local server if necessary, and opens MPV:
 
@@ -166,7 +166,7 @@ The optional configuration file is `~/.config/filmstream/config.json`:
 
 Set `FILMSTREAM_CONFIG` to use another path or `FILMSTREAM_SERVER` to use an already-running backend.
 
-Temporary torrent data is stored beneath `<data_dir>/torrents`, and temporary native-player segments are stored beneath `<hls_dir>`. Filmstream owns and clears both locations on clean startup and shutdown; do not place unrelated files there. Durable watch progress is stored separately beneath `<state_dir>`.
+Temporary torrent data is stored beneath `<data_dir>/torrents`, and temporary native-player segments are stored beneath `<hls_dir>`. Filmstream owns and clears both locations on clean startup and shutdown; do not place unrelated files there. Durable watch progress and private selected-torrent metadata are stored separately beneath `<state_dir>` with owner-only permissions.
 
 ## Natural-language movie resolution
 
@@ -234,7 +234,7 @@ The config file is written with mode `0600` because it contains API keys. The CL
 
 Filmstream only requests the pieces needed by MPV's current HTTP Range request, a 32 MiB read-ahead window, and a small tail window used to find container metadata. Native HLS prepares `hls_startup_buffer_seconds` of media before opening the player, then packages at approximately playback speed so it avoids racing through an entire movie in the background. Closing either player closes its readers and removes temporary HLS segments.
 
-MPV waits for a two-second initial cache before playback to avoid startup jitter. Native Windows MPV uses its D3D11 hardware-decoding and GPU-rendering path. Linux MPV on WSL uses `gpu-next` with `nvdec-copy` when supported and retains `wlshm` as a compatibility fallback; other environments keep MPV's portable automatic output and software-decoding fallback. Apple clients request streaming-optimized H.264/H.265 releases, avoid known-incompatible Dolby Vision releases, copy video without quality loss, and transcode only audio for AVPlayer compatibility. Streaming ranking prioritizes reported swarm popularity, uses file size only as a light tie-breaker, and keeps a specific remux penalty. Before choosing a release, Filmstream validates up to three ranked candidates against their live swarms and skips stale indexer results that do not discover enough peers.
+MPV waits for a two-second initial cache before playback to avoid startup jitter. Native Windows MPV uses its D3D11 hardware-decoding and GPU-rendering path. Linux MPV on WSL uses `gpu-next` with `nvdec-copy` when supported and retains `wlshm` as a compatibility fallback; other environments keep MPV's portable automatic output and software-decoding fallback. Apple clients request streaming-optimized H.264/H.265 releases, avoid known-incompatible Dolby Vision releases, copy video without quality loss, and transcode only audio for AVPlayer compatibility. Streaming ranking prioritizes reported swarm popularity, uses file size only as a light tie-breaker, and keeps a specific remux penalty. Filmstream checks ranked candidates progressively and accepts the first high-ranked release that proves it has a strong live swarm, avoiding unnecessary torrent initialization while still falling through to alternatives for stale indexer results.
 
 Every verified piece remains available for upload while the session is retained. After playback becomes idle, Filmstream manages the lifecycle automatically:
 

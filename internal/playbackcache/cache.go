@@ -1,0 +1,241 @@
+package playbackcache
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/pgeske/filmstream/internal/catalog"
+)
+
+type Entry struct {
+	ID          string                  `json:"id"`
+	MediaID     string                  `json:"media_id,omitempty"`
+	Title       string                  `json:"title"`
+	Year        int                     `json:"year,omitempty"`
+	Selected    catalog.RankedCandidate `json:"selected"`
+	UpdatedAt   time.Time               `json:"updated_at"`
+	TorrentPath string                  `json:"-"`
+}
+
+type Store struct {
+	path       string
+	torrentDir string
+	mu         sync.Mutex
+}
+
+func New(stateDir string) *Store {
+	return &Store{
+		path:       filepath.Join(stateDir, "playback-cache.json"),
+		torrentDir: filepath.Join(stateDir, "playback-cache"),
+	}
+}
+
+func (s *Store) Lookup(mediaID, title string, year int) (Entry, bool, error) {
+	mediaID = strings.TrimSpace(mediaID)
+	title = strings.TrimSpace(title)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := s.read()
+	if err != nil {
+		return Entry{}, false, err
+	}
+	index := -1
+	if mediaID != "" {
+		for i := range entries {
+			if entries[i].MediaID == mediaID {
+				index = i
+				break
+			}
+		}
+	}
+	if index < 0 {
+		for i := range entries {
+			if entries[i].Year == year && strings.EqualFold(entries[i].Title, title) {
+				index = i
+				break
+			}
+		}
+	}
+	if index < 0 {
+		return Entry{}, false, nil
+	}
+	entry := entries[index]
+	if !validID(entry.ID) {
+		return Entry{}, false, fmt.Errorf("playback cache contains invalid entry ID %q", entry.ID)
+	}
+	entry.TorrentPath = filepath.Join(s.torrentDir, entry.ID+".torrent")
+	if _, err := os.Stat(entry.TorrentPath); errors.Is(err, os.ErrNotExist) {
+		return Entry{}, false, nil
+	} else if err != nil {
+		return Entry{}, false, fmt.Errorf("inspect cached torrent: %w", err)
+	}
+	return entry, true, nil
+}
+
+func (s *Store) Remove(mediaID, title string, year int) error {
+	mediaID = strings.TrimSpace(mediaID)
+	title = strings.TrimSpace(title)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := s.read()
+	if err != nil {
+		return err
+	}
+	for i := range entries {
+		matchingMediaID := mediaID != "" && entries[i].MediaID == mediaID
+		matchingTitle := entries[i].Year == year && strings.EqualFold(entries[i].Title, title)
+		if !matchingMediaID && !matchingTitle {
+			continue
+		}
+		if validID(entries[i].ID) {
+			path := filepath.Join(s.torrentDir, entries[i].ID+".torrent")
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove cached torrent: %w", err)
+			}
+		}
+		entries = append(entries[:i], entries[i+1:]...)
+		return s.write(entries)
+	}
+	return nil
+}
+
+func (s *Store) Save(
+	mediaID, title string,
+	year int,
+	selected catalog.RankedCandidate,
+	metainfo []byte,
+) (Entry, error) {
+	mediaID = strings.TrimSpace(mediaID)
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return Entry{}, errors.New("cached playback title cannot be empty")
+	}
+	if len(metainfo) == 0 {
+		return Entry{}, errors.New("cached torrent metainfo cannot be empty")
+	}
+	selected.Candidate.MagnetURI = ""
+	selected.Candidate.TorrentURL = ""
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := s.read()
+	if err != nil {
+		return Entry{}, err
+	}
+	id := cacheID(title, year)
+	index := -1
+	for i := range entries {
+		matchingMediaID := mediaID != "" && entries[i].MediaID == mediaID
+		matchingTitle := entries[i].Year == year && strings.EqualFold(entries[i].Title, title)
+		if matchingMediaID || matchingTitle {
+			id = entries[i].ID
+			index = i
+			break
+		}
+	}
+	if !validID(id) {
+		return Entry{}, fmt.Errorf("invalid playback cache ID %q", id)
+	}
+	if err := os.MkdirAll(s.torrentDir, 0o700); err != nil {
+		return Entry{}, fmt.Errorf("create playback cache directory: %w", err)
+	}
+	torrentPath := filepath.Join(s.torrentDir, id+".torrent")
+	if err := writePrivateFile(torrentPath, metainfo); err != nil {
+		return Entry{}, fmt.Errorf("write cached torrent: %w", err)
+	}
+	entry := Entry{
+		ID: id, MediaID: mediaID, Title: title, Year: year,
+		Selected: selected, UpdatedAt: time.Now().UTC(), TorrentPath: torrentPath,
+	}
+	if index >= 0 {
+		entries[index] = entry
+	} else {
+		entries = append(entries, entry)
+	}
+	if err := s.write(entries); err != nil {
+		return Entry{}, err
+	}
+	return entry, nil
+}
+
+func (s *Store) read() ([]Entry, error) {
+	contents, err := os.ReadFile(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read playback cache: %w", err)
+	}
+	var payload struct {
+		Version int     `json:"version"`
+		Entries []Entry `json:"entries"`
+	}
+	if err := json.Unmarshal(contents, &payload); err != nil {
+		return nil, fmt.Errorf("parse playback cache: %w", err)
+	}
+	return payload.Entries, nil
+}
+
+func (s *Store) write(entries []Entry) error {
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+		return fmt.Errorf("create state directory: %w", err)
+	}
+	payload := struct {
+		Version int     `json:"version"`
+		Entries []Entry `json:"entries"`
+	}{Version: 1, Entries: entries}
+	contents, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	contents = append(contents, '\n')
+	if err := writePrivateFile(s.path, contents); err != nil {
+		return fmt.Errorf("replace playback cache: %w", err)
+	}
+	return nil
+}
+
+func writePrivateFile(path string, contents []byte) error {
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".playback-cache-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(contents); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
+}
+
+func cacheID(title string, year int) string {
+	normalized := strings.ToLower(strings.Join(strings.Fields(title), " "))
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s/%d", normalized, year)))
+	return hex.EncodeToString(sum[:8])
+}
+
+func validID(id string) bool {
+	if len(id) != 16 {
+		return false
+	}
+	_, err := hex.DecodeString(id)
+	return err == nil
+}

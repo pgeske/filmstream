@@ -27,6 +27,7 @@ import (
 	"github.com/pgeske/filmstream/internal/hls"
 	"github.com/pgeske/filmstream/internal/indexer"
 	"github.com/pgeske/filmstream/internal/metadata"
+	"github.com/pgeske/filmstream/internal/playbackcache"
 	"github.com/pgeske/filmstream/internal/resolver"
 	"github.com/pgeske/filmstream/internal/torrentstream"
 )
@@ -152,6 +153,7 @@ func runServer(args []string) error {
 	apiServer.SetMovieResolver(movieResolver)
 	apiServer.SetMetadataProvider(metadataProvider)
 	apiServer.SetHistoryStore(history.New(cfg.StateDir))
+	apiServer.SetPlaybackCache(playbackcache.New(cfg.StateDir))
 	if hlsManager != nil {
 		apiServer.SetHLSManager(hlsManager)
 	}

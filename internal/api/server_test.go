@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/pgeske/filmstream/internal/catalog"
 	"github.com/pgeske/filmstream/internal/history"
 	"github.com/pgeske/filmstream/internal/hls"
 	"github.com/pgeske/filmstream/internal/metadata"
@@ -210,6 +211,20 @@ func TestHLSAssetsAndCleanup(t *testing.T) {
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK || manager.stopped != "abc" {
 		t.Fatalf("status = %d, stopped = %q", response.Code, manager.stopped)
+	}
+}
+
+func TestPublicRankedCandidateRemovesPrivateTorrentSources(t *testing.T) {
+	candidate := publicRankedCandidate(catalog.RankedCandidate{Candidate: catalog.Candidate{
+		Name:       "The Movie",
+		MagnetURI:  "magnet:?xt=private",
+		TorrentURL: "https://indexer.example/download?apikey=secret",
+	}})
+	if candidate.Candidate.MagnetURI != "" || candidate.Candidate.TorrentURL != "" {
+		t.Fatalf("public candidate contains private sources: %+v", candidate.Candidate)
+	}
+	if candidate.Candidate.Name != "The Movie" {
+		t.Fatalf("candidate name = %q", candidate.Candidate.Name)
 	}
 }
 

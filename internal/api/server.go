@@ -19,11 +19,13 @@ import (
 	"github.com/pgeske/filmstream/internal/hls"
 	"github.com/pgeske/filmstream/internal/indexer"
 	"github.com/pgeske/filmstream/internal/metadata"
+	"github.com/pgeske/filmstream/internal/playbackcache"
 	"github.com/pgeske/filmstream/internal/resolver"
 	"github.com/pgeske/filmstream/internal/torrentstream"
 )
 
 type CreatePlaybackRequest struct {
+	MediaID     string              `json:"media_id,omitempty"`
 	Query       string              `json:"query,omitempty"`
 	Year        int                 `json:"year,omitempty"`
 	Preferences catalog.Preferences `json:"preferences,omitempty"`
@@ -35,6 +37,8 @@ const (
 	maxLiveSwarmCandidates = 3
 	minimumLivePeers       = 3
 	strongLiveSwarmPeers   = 20
+	progressiveSwarmWait   = time.Second
+	cachedSwarmWait        = 5 * time.Second
 	liveSwarmWait          = 16 * time.Second
 )
 
@@ -61,6 +65,12 @@ type HLSStreamManager interface {
 	Stop(string)
 }
 
+type playbackCacheKey struct {
+	mediaID string
+	title   string
+	year    int
+}
+
 type Server struct {
 	indexers       *indexer.Registry
 	engine         *torrentstream.Engine
@@ -69,28 +79,32 @@ type Server struct {
 	reloadIndexers func() error
 	reloadResolver func() error
 
-	resolverMu       sync.RWMutex
-	movieResolver    resolver.Resolver
-	metadataMu       sync.RWMutex
-	metadataProvider metadata.Provider
-	historyStore     *history.Store
-	hlsMu            sync.RWMutex
-	hlsManager       HLSStreamManager
-	mu               sync.RWMutex
-	selected         map[string]catalog.RankedCandidate
+	resolverMu        sync.RWMutex
+	movieResolver     resolver.Resolver
+	metadataMu        sync.RWMutex
+	metadataProvider  metadata.Provider
+	historyStore      *history.Store
+	playbackCache     *playbackcache.Store
+	hlsMu             sync.RWMutex
+	hlsManager        HLSStreamManager
+	mu                sync.RWMutex
+	selected          map[string]catalog.RankedCandidate
+	playbackCacheKeys map[string]playbackCacheKey
 }
 
 func New(indexers *indexer.Registry, engine *torrentstream.Engine, defaults catalog.Preferences, logger *slog.Logger) *Server {
 	server := &Server{
-		indexers: indexers,
-		engine:   engine,
-		defaults: defaults,
-		logger:   logger,
-		selected: make(map[string]catalog.RankedCandidate),
+		indexers:          indexers,
+		engine:            engine,
+		defaults:          defaults,
+		logger:            logger,
+		selected:          make(map[string]catalog.RankedCandidate),
+		playbackCacheKeys: make(map[string]playbackCacheKey),
 	}
 	engine.SetCleanupHandler(func(id, _ string) {
 		server.mu.Lock()
 		delete(server.selected, id)
+		delete(server.playbackCacheKeys, id)
 		server.mu.Unlock()
 		server.hlsMu.RLock()
 		manager := server.hlsManager
@@ -124,6 +138,10 @@ func (s *Server) SetMetadataProvider(provider metadata.Provider) {
 
 func (s *Server) SetHistoryStore(store *history.Store) {
 	s.historyStore = store
+}
+
+func (s *Server) SetPlaybackCache(store *playbackcache.Store) {
+	s.playbackCache = store
 }
 
 func (s *Server) SetHLSManager(manager HLSStreamManager) {
@@ -461,10 +479,12 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request: "+err.Error())
 		return
 	}
+	request.MediaID = strings.TrimSpace(request.MediaID)
+	request.Query = strings.TrimSpace(request.Query)
 
 	preferences := mergePreferences(s.defaults, request.Preferences)
 	sourceCount := 0
-	if strings.TrimSpace(request.Query) != "" {
+	if request.Query != "" {
 		sourceCount++
 	}
 	if request.MagnetURI != "" {
@@ -481,21 +501,29 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 	var session *torrentstream.Session
 	var selected *catalog.RankedCandidate
 	if request.Query != "" {
-		search := catalog.SearchRequest{Query: strings.TrimSpace(request.Query), Year: request.Year, Preferences: preferences}
-		candidates, err := s.indexers.Search(r.Context(), search)
+		var err error
+		session, selected, err = s.createCachedPlayback(r.Context(), request)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
 		}
-		ranked := catalog.Rank(search, candidates)
-		if len(ranked) == 0 {
-			writeError(w, http.StatusNotFound, "no matching torrent candidates found")
-			return
-		}
-		session, selected, err = s.createRankedPlayback(r.Context(), ranked, preferences.StreamingOptimized)
-		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
-			return
+		if session == nil {
+			search := catalog.SearchRequest{Query: request.Query, Year: request.Year, Preferences: preferences}
+			candidates, err := s.indexers.Search(r.Context(), search)
+			if err != nil {
+				writeError(w, http.StatusBadGateway, err.Error())
+				return
+			}
+			ranked := catalog.Rank(search, candidates)
+			if len(ranked) == 0 {
+				writeError(w, http.StatusNotFound, "no matching torrent candidates found")
+				return
+			}
+			session, selected, err = s.createRankedPlayback(r.Context(), ranked, preferences.StreamingOptimized)
+			if err != nil {
+				writeError(w, http.StatusBadGateway, err.Error())
+				return
+			}
 		}
 	} else {
 		var err error
@@ -508,8 +536,17 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if selected != nil {
+		public := publicRankedCandidate(*selected)
+		selected = &public
 		s.mu.Lock()
-		s.selected[session.ID] = *selected
+		s.selected[session.ID] = public
+		if request.Query != "" {
+			s.playbackCacheKeys[session.ID] = playbackCacheKey{
+				mediaID: request.MediaID,
+				title:   request.Query,
+				year:    request.Year,
+			}
+		}
 		s.mu.Unlock()
 	}
 
@@ -524,27 +561,115 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type playbackOption struct {
+	session   *torrentstream.Session
+	candidate catalog.RankedCandidate
+	peers     int
+}
+
+func (s *Server) createCachedPlayback(
+	ctx context.Context,
+	request CreatePlaybackRequest,
+) (*torrentstream.Session, *catalog.RankedCandidate, error) {
+	if s.playbackCache == nil {
+		return nil, nil, nil
+	}
+	cached, found, err := s.playbackCache.Lookup(request.MediaID, request.Query, request.Year)
+	if err != nil {
+		s.logger.Warn("load cached playback selection", "title", request.Query, "error", err)
+		return nil, nil, nil
+	}
+	if !found {
+		return nil, nil, nil
+	}
+	session, err := s.engine.Create(ctx, torrentstream.Source{TorrentPath: cached.TorrentPath})
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
+		s.logger.Warn("start cached playback selection", "title", request.Query, "error", err)
+		if removeErr := s.playbackCache.Remove(request.MediaID, request.Query, request.Year); removeErr != nil {
+			s.logger.Warn("remove unusable playback cache", "title", request.Query, "error", removeErr)
+		}
+		return nil, nil, nil
+	}
+	options := []playbackOption{{session: session, candidate: cached.Selected}}
+	strong, err := s.observePlaybackOptions(ctx, options, minimumLivePeers, cachedSwarmWait)
+	if err != nil {
+		_ = s.engine.Drop(session.ID)
+		return nil, nil, err
+	}
+	if strong < 0 {
+		_ = s.engine.Drop(session.ID)
+		if removeErr := s.playbackCache.Remove(request.MediaID, request.Query, request.Year); removeErr != nil {
+			s.logger.Warn("remove unavailable playback cache", "title", request.Query, "error", removeErr)
+		}
+		s.logger.Warn("cached playback swarm is unavailable; searching again",
+			"title", request.Query, "live_peers", options[0].peers)
+		return nil, nil, nil
+	}
+	s.logger.Info("reused cached playback selection", "id", session.ID,
+		"name", cached.Selected.Candidate.Name, "live_peers", options[strong].peers)
+	selected := cached.Selected
+	return session, &selected, nil
+}
+
+func (s *Server) cacheSuccessfulPlayback(id string) {
+	if s.playbackCache == nil {
+		return
+	}
+	s.mu.RLock()
+	key, hasKey := s.playbackCacheKeys[id]
+	selected, hasSelection := s.selected[id]
+	s.mu.RUnlock()
+	if !hasKey || !hasSelection {
+		return
+	}
+	contents, err := s.engine.TorrentMetainfo(id)
+	if err != nil {
+		s.logger.Warn("export selected torrent metadata", "title", key.title, "error", err)
+		return
+	}
+	if _, err := s.playbackCache.Save(key.mediaID, key.title, key.year, selected, contents); err != nil {
+		s.logger.Warn("cache playback selection", "title", key.title, "error", err)
+	}
+}
+
+func (s *Server) invalidateCachedPlayback(id string) {
+	if s.playbackCache == nil {
+		return
+	}
+	s.mu.RLock()
+	key, ok := s.playbackCacheKeys[id]
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+	if err := s.playbackCache.Remove(key.mediaID, key.title, key.year); err != nil {
+		s.logger.Warn("invalidate playback cache", "title", key.title, "error", err)
+	}
+}
+
 func (s *Server) createRankedPlayback(
 	ctx context.Context,
 	ranked []catalog.RankedCandidate,
 	validateSwarm bool,
 ) (*torrentstream.Session, *catalog.RankedCandidate, error) {
-	type option struct {
-		session   *torrentstream.Session
-		candidate catalog.RankedCandidate
-		peers     int
-	}
-
 	attempts := 1
 	if validateSwarm {
 		attempts = min(maxLiveSwarmCandidates, len(ranked))
 	}
-	options := make([]option, 0, attempts)
+	options := make([]playbackOption, 0, attempts)
+	observationRemaining := liveSwarmWait
 	var failures []string
 	for i := 0; i < attempts; i++ {
 		candidate := ranked[i]
 		resolved, err := s.indexers.Resolve(ctx, candidate.Candidate)
 		if err != nil {
+			if ctx.Err() != nil {
+				s.dropPlaybackOptions(options)
+				return nil, nil, ctx.Err()
+			}
 			failures = append(failures, fmt.Sprintf("%s: %v", candidate.Candidate.Name, err))
 			continue
 		}
@@ -552,13 +677,31 @@ func (s *Server) createRankedPlayback(
 			MagnetURI: resolved.MagnetURI, TorrentURL: resolved.TorrentURL,
 		})
 		if err != nil {
+			if ctx.Err() != nil {
+				s.dropPlaybackOptions(options)
+				return nil, nil, ctx.Err()
+			}
 			failures = append(failures, fmt.Sprintf("%s: %v", candidate.Candidate.Name, err))
 			continue
 		}
 		if !validateSwarm {
 			return session, &candidate, nil
 		}
-		options = append(options, option{session: session, candidate: candidate})
+		options = append(options, playbackOption{session: session, candidate: candidate})
+
+		if i+1 < attempts && observationRemaining > 0 {
+			wait := min(progressiveSwarmWait, observationRemaining)
+			started := time.Now()
+			strong, err := s.observePlaybackOptions(ctx, options, strongLiveSwarmPeers, wait)
+			observationRemaining -= min(time.Since(started), observationRemaining)
+			if err != nil {
+				s.dropPlaybackOptions(options)
+				return nil, nil, err
+			}
+			if strong >= 0 {
+				return s.choosePlaybackOption(options, strong, true)
+			}
+		}
 	}
 	if len(options) == 0 {
 		if len(failures) > 0 {
@@ -567,58 +710,105 @@ func (s *Server) createRankedPlayback(
 		return nil, nil, errors.New("no usable torrent candidates found")
 	}
 
-	deadline := time.NewTimer(liveSwarmWait)
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer deadline.Stop()
-	defer ticker.Stop()
-observe:
-	for {
-		strongest := 0
-		for i := range options {
-			status, ok := s.engine.Status(options[i].session.ID)
-			if !ok {
-				continue
-			}
-			options[i].peers = max(status.ActivePeers, status.ConnectedSeeders)
-			strongest = max(strongest, options[i].peers)
-		}
-		if strongest >= strongLiveSwarmPeers {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			for _, option := range options {
-				_ = s.engine.Drop(option.session.ID)
-			}
-			return nil, nil, ctx.Err()
-		case <-deadline.C:
-			break observe
-		case <-ticker.C:
-		}
+	strong, err := s.observePlaybackOptions(ctx, options, strongLiveSwarmPeers, observationRemaining)
+	if err != nil {
+		s.dropPlaybackOptions(options)
+		return nil, nil, err
 	}
-
+	if strong >= 0 {
+		return s.choosePlaybackOption(options, strong, true)
+	}
 	best := 0
 	for i := 1; i < len(options); i++ {
 		if options[i].peers > options[best].peers {
 			best = i
 		}
 	}
-	chosen := options[best]
+	return s.choosePlaybackOption(options, best, false)
+}
+
+func (s *Server) observePlaybackOptions(
+	ctx context.Context,
+	options []playbackOption,
+	threshold int,
+	wait time.Duration,
+) (int, error) {
+	refresh := func() int {
+		for i := range options {
+			status, ok := s.engine.Status(options[i].session.ID)
+			if ok {
+				options[i].peers = max(status.ActivePeers, status.ConnectedSeeders)
+			}
+		}
+		for i := range options {
+			if options[i].peers >= threshold {
+				return i
+			}
+		}
+		return -1
+	}
+	if strong := refresh(); strong >= 0 || wait <= 0 {
+		return strong, nil
+	}
+	timer := time.NewTimer(wait)
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer timer.Stop()
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return -1, ctx.Err()
+		case <-timer.C:
+			return refresh(), nil
+		case <-ticker.C:
+			if strong := refresh(); strong >= 0 {
+				return strong, nil
+			}
+		}
+	}
+}
+
+func (s *Server) choosePlaybackOption(
+	options []playbackOption,
+	chosenIndex int,
+	strong bool,
+) (*torrentstream.Session, *catalog.RankedCandidate, error) {
+	chosen := options[chosenIndex]
 	for i := range options {
-		if i != best {
+		if i != chosenIndex {
 			_ = s.engine.Drop(options[i].session.ID)
 		}
 	}
-	if chosen.peers >= minimumLivePeers {
+	reportedSeeders := -1
+	if chosen.candidate.Candidate.Seeders != nil {
+		reportedSeeders = *chosen.candidate.Candidate.Seeders
+	}
+	if strong {
+		s.logger.Info("selected first strong ranked playback swarm", "id", chosen.session.ID,
+			"name", chosen.candidate.Candidate.Name, "live_peers", chosen.peers,
+			"reported_seeders", reportedSeeders)
+	} else if chosen.peers >= minimumLivePeers {
 		s.logger.Info("selected strongest live playback swarm", "id", chosen.session.ID,
 			"name", chosen.candidate.Candidate.Name, "live_peers", chosen.peers,
-			"reported_seeders", chosen.candidate.Candidate.Seeders)
+			"reported_seeders", reportedSeeders)
 	} else {
 		s.logger.Warn("using best available playback despite weak live swarm", "id", chosen.session.ID,
 			"name", chosen.candidate.Candidate.Name, "live_peers", chosen.peers,
-			"reported_seeders", chosen.candidate.Candidate.Seeders)
+			"reported_seeders", reportedSeeders)
 	}
 	return chosen.session, &chosen.candidate, nil
+}
+
+func (s *Server) dropPlaybackOptions(options []playbackOption) {
+	for _, option := range options {
+		_ = s.engine.Drop(option.session.ID)
+	}
+}
+
+func publicRankedCandidate(candidate catalog.RankedCandidate) catalog.RankedCandidate {
+	candidate.Candidate.MagnetURI = ""
+	candidate.Candidate.TorrentURL = ""
+	return candidate
 }
 
 func (s *Server) playbackStatus(w http.ResponseWriter, r *http.Request) {
@@ -675,9 +865,11 @@ func (s *Server) startHLSPlayback(w http.ResponseWriter, r *http.Request) {
 	}
 	stream, err := manager.Start(r.Context(), id, request.StartSeconds)
 	if err != nil {
+		s.invalidateCachedPlayback(id)
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	s.cacheSuccessfulPlayback(id)
 	writeJSON(w, http.StatusCreated, struct {
 		hls.Stream
 		PlaylistURL string `json:"playlist_url"`

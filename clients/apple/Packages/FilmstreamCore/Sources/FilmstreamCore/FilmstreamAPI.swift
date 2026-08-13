@@ -53,6 +53,7 @@ public struct FilmstreamAPI: Sendable {
             path: "v1/playbacks",
             method: "POST",
             body: CreatePlaybackRequest(
+                mediaID: movie.id,
                 query: movie.title,
                 year: movie.year,
                 preferences: .appleTV
@@ -223,9 +224,15 @@ private struct HistoryResponse: Decodable {
 }
 
 private struct CreatePlaybackRequest: Encodable {
+    let mediaID: String
     let query: String
     let year: Int?
     let preferences: PlaybackPreferences
+
+    private enum CodingKeys: String, CodingKey {
+        case mediaID = "media_id"
+        case query, year, preferences
+    }
 }
 
 private struct PlaybackPreferences: Encodable {
