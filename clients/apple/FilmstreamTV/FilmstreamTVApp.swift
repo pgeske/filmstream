@@ -20,6 +20,7 @@ struct FilmstreamTVApp: App {
 final class AppModel {
     let api: FilmstreamAPI
     var continueWatching: [WatchHistoryEntry] = []
+    var discoverySections: [DiscoverySection] = []
     var isLoading = false
     var errorMessage: String?
 
@@ -27,9 +28,27 @@ final class AppModel {
         self.api = api
     }
 
-    func loadContinueWatching() async {
+    func loadHome() async {
         isLoading = true
         defer { isLoading = false }
+
+        async let historyRequest = api.continueWatching()
+        async let discoveryRequest = api.discover()
+        var errors: [String] = []
+        do {
+            continueWatching = try await historyRequest
+        } catch {
+            errors.append(error.localizedDescription)
+        }
+        do {
+            discoverySections = try await discoveryRequest
+        } catch {
+            errors.append(error.localizedDescription)
+        }
+        errorMessage = errors.first
+    }
+
+    func loadContinueWatching() async {
         do {
             continueWatching = try await api.continueWatching()
             errorMessage = nil

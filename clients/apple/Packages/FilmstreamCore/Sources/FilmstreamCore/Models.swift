@@ -43,6 +43,20 @@ public struct Movie: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
+public struct DiscoverySection: Codable, Hashable, Identifiable, Sendable {
+    public let id: String
+    public let title: String
+    public let subtitle: String
+    public let items: [Movie]
+
+    public init(id: String, title: String, subtitle: String, items: [Movie]) {
+        self.id = id
+        self.title = title
+        self.subtitle = subtitle
+        self.items = items
+    }
+}
+
 public struct WatchHistoryEntry: Codable, Hashable, Identifiable, Sendable {
     public let id: String
     public let mediaID: String?

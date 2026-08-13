@@ -17,3 +17,14 @@ type Movie struct {
 type Provider interface {
 	Search(context.Context, string) ([]Movie, error)
 }
+
+type Collection string
+
+const (
+	CollectionPopular  Collection = "popular"
+	CollectionTopRated Collection = "top-rated"
+)
+
+type DiscoveryProvider interface {
+	Discover(context.Context, Collection) ([]Movie, error)
+}

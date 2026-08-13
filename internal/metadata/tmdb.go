@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -19,7 +20,7 @@ const (
 )
 
 type TMDB struct {
-	endpoint string
+	baseURL  string
 	token    string
 	language string
 	client   *http.Client
@@ -43,11 +44,7 @@ func NewTMDB(baseURL, token, language string, client *http.Client) (*TMDB, error
 	if language == "" {
 		language = "en-US"
 	}
-	endpoint, err := url.JoinPath(baseURL, "search", "movie")
-	if err != nil {
-		return nil, err
-	}
-	return &TMDB{endpoint: endpoint, token: strings.TrimSpace(token), language: language, client: client}, nil
+	return &TMDB{baseURL: baseURL, token: strings.TrimSpace(token), language: language, client: client}, nil
 }
 
 func (t *TMDB) Search(ctx context.Context, query string) ([]Movie, error) {
@@ -55,18 +52,46 @@ func (t *TMDB) Search(ctx context.Context, query string) ([]Movie, error) {
 	if query == "" {
 		return nil, errors.New("movie search cannot be empty")
 	}
-	endpoint, err := url.Parse(t.endpoint)
-	if err != nil {
-		return nil, err
-	}
-	values := endpoint.Query()
+	values := make(url.Values)
 	values.Set("query", query)
 	values.Set("include_adult", "false")
 	values.Set("language", t.language)
 	values.Set("page", "1")
-	endpoint.RawQuery = values.Encode()
+	return t.fetchMovies(ctx, "search/movie", values)
+}
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+func (t *TMDB) Discover(ctx context.Context, collection Collection) ([]Movie, error) {
+	values := make(url.Values)
+	values.Set("include_adult", "false")
+	values.Set("include_video", "false")
+	values.Set("language", t.language)
+	values.Set("page", "1")
+	values.Set("release_date.lte", time.Now().UTC().Format(time.DateOnly))
+	values.Set("with_release_type", "4|5|6")
+	switch collection {
+	case CollectionPopular:
+		values.Set("sort_by", "popularity.desc")
+	case CollectionTopRated:
+		values.Set("sort_by", "vote_average.desc")
+		values.Set("vote_count.gte", "1000")
+	default:
+		return nil, fmt.Errorf("unsupported movie collection %q", collection)
+	}
+	return t.fetchMovies(ctx, "discover/movie", values)
+}
+
+func (t *TMDB) fetchMovies(ctx context.Context, path string, values url.Values) ([]Movie, error) {
+	endpoint, err := url.JoinPath(t.baseURL, path)
+	if err != nil {
+		return nil, err
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	parsed.RawQuery = values.Encode()
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +99,7 @@ func (t *TMDB) Search(ctx context.Context, query string) ([]Movie, error) {
 	request.Header.Set("Authorization", "Bearer "+t.token)
 	response, err := t.client.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("search TMDB: %w", err)
+		return nil, fmt.Errorf("request TMDB: %w", err)
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxTMDBResponseBytes))
@@ -100,6 +125,7 @@ func (t *TMDB) Search(ctx context.Context, query string) ([]Movie, error) {
 			PosterPath    string  `json:"poster_path"`
 			BackdropPath  string  `json:"backdrop_path"`
 			VoteAverage   float64 `json:"vote_average"`
+			Adult         bool    `json:"adult"`
 		} `json:"results"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -108,7 +134,7 @@ func (t *TMDB) Search(ctx context.Context, query string) ([]Movie, error) {
 	movies := make([]Movie, 0, len(payload.Results))
 	for _, result := range payload.Results {
 		result.Title = strings.TrimSpace(result.Title)
-		if result.ID <= 0 || result.Title == "" {
+		if result.Adult || result.ID <= 0 || result.Title == "" {
 			continue
 		}
 		movie := Movie{

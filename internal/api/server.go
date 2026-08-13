@@ -47,6 +47,13 @@ type CreatePlaybackResponse struct {
 	Selected  *catalog.RankedCandidate `json:"selected,omitempty"`
 }
 
+type catalogSection struct {
+	ID       string           `json:"id"`
+	Title    string           `json:"title"`
+	Subtitle string           `json:"subtitle"`
+	Items    []metadata.Movie `json:"items"`
+}
+
 type HLSStreamManager interface {
 	Start(context.Context, string, float64) (hls.Stream, error)
 	StartSubtitle(context.Context, string, int) error
@@ -134,6 +141,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/resolver/reload", s.reloadResolverConfiguration)
 	mux.HandleFunc("POST /v1/resolve", s.resolveMovie)
 	mux.HandleFunc("GET /v1/catalog/search", s.searchCatalog)
+	mux.HandleFunc("GET /v1/catalog/discover", s.discoverCatalog)
 	mux.HandleFunc("GET /v1/watch-history", s.listWatchHistory)
 	mux.HandleFunc("PUT /v1/watch-history", s.updateWatchProgress)
 	mux.HandleFunc("POST /v1/playbacks", s.createPlayback)
@@ -201,6 +209,55 @@ func (s *Server) searchCatalog(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, struct {
 		Items []metadata.Movie `json:"items"`
 	}{Items: movies})
+}
+
+func (s *Server) discoverCatalog(w http.ResponseWriter, r *http.Request) {
+	s.metadataMu.RLock()
+	provider, ok := s.metadataProvider.(metadata.DiscoveryProvider)
+	s.metadataMu.RUnlock()
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "catalog discovery is not configured")
+		return
+	}
+
+	collections := []struct {
+		id       metadata.Collection
+		title    string
+		subtitle string
+	}{
+		{id: metadata.CollectionPopular, title: "Popular Now", subtitle: "Popular movies available for home viewing"},
+		{id: metadata.CollectionTopRated, title: "Top Rated", subtitle: "Audience favorites worth discovering"},
+	}
+	sections := make([]catalogSection, 0, len(collections))
+	var firstError error
+	for _, collection := range collections {
+		movies, err := provider.Discover(r.Context(), collection.id)
+		if err != nil {
+			if firstError == nil {
+				firstError = err
+			}
+			if s.logger != nil {
+				s.logger.Warn("load discovery collection", "collection", collection.id, "error", err)
+			}
+			continue
+		}
+		if movies == nil {
+			movies = []metadata.Movie{}
+		}
+		sections = append(sections, catalogSection{
+			ID:       string(collection.id),
+			Title:    collection.title,
+			Subtitle: collection.subtitle,
+			Items:    movies,
+		})
+	}
+	if len(sections) == 0 && firstError != nil {
+		writeError(w, http.StatusBadGateway, firstError.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Sections []catalogSection `json:"sections"`
+	}{Sections: sections})
 }
 
 func (s *Server) searchMovies(ctx context.Context, query string) ([]metadata.Movie, error) {

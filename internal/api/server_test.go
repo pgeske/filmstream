@@ -49,6 +49,17 @@ func (fakeMetadata) Search(_ context.Context, _ string) ([]metadata.Movie, error
 	return []metadata.Movie{{ID: "tmdb:1", Title: "The Movie", Year: 2001, PosterURL: "https://image.example/poster.jpg"}}, nil
 }
 
+func (fakeMetadata) Discover(_ context.Context, collection metadata.Collection) ([]metadata.Movie, error) {
+	switch collection {
+	case metadata.CollectionPopular:
+		return []metadata.Movie{{ID: "tmdb:2", Title: "Popular Movie", Year: 2026}}, nil
+	case metadata.CollectionTopRated:
+		return []metadata.Movie{{ID: "tmdb:3", Title: "Top Rated Movie", Year: 1972}}, nil
+	default:
+		return nil, nil
+	}
+}
+
 func (fakeResolver) Resolve(_ context.Context, input string) (resolver.Result, error) {
 	return resolver.Result{Input: input, Candidates: []resolver.Candidate{{Title: "The Movie", Year: 2001, Confidence: 0.9}}}, nil
 }
@@ -70,6 +81,31 @@ func TestSearchCatalogReturnsMetadata(t *testing.T) {
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "poster.jpg") {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestDiscoverCatalogReturnsMovieSections(t *testing.T) {
+	server := &Server{metadataProvider: fakeMetadata{}}
+	request := httptest.NewRequest(http.MethodGet, "/v1/catalog/discover", nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Sections []catalogSection `json:"sections"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Sections) != 2 {
+		t.Fatalf("sections = %+v", payload.Sections)
+	}
+	if payload.Sections[0].ID != "popular" || payload.Sections[0].Items[0].Title != "Popular Movie" {
+		t.Fatalf("popular = %+v", payload.Sections[0])
+	}
+	if payload.Sections[1].ID != "top-rated" || payload.Sections[1].Items[0].Title != "Top Rated Movie" {
+		t.Fatalf("top rated = %+v", payload.Sections[1])
 	}
 }
 

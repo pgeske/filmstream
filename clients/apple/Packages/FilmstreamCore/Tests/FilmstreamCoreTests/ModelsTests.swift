@@ -10,6 +10,13 @@ import Testing
     #expect(movie.posterURL?.host == "image.tmdb.org")
 }
 
+@Test func decodesDiscoverySections() throws {
+    let data = Data(#"{"id":"popular","title":"Popular Now","subtitle":"Popular movies available for home viewing","items":[{"id":"tmdb:335984","title":"Blade Runner 2049","year":2017}]}"#.utf8)
+    let section = try JSONDecoder().decode(DiscoverySection.self, from: data)
+    #expect(section.id == "popular")
+    #expect(section.items.first?.title == "Blade Runner 2049")
+}
+
 @Test func decodesNativeHLSPlayback() throws {
     let data = Data(#"{"playback_id":"abc123","playlist_url":"https://filmstream.example/v1/playbacks/abc123/hls/index.m3u8","start_seconds":120,"duration_seconds":7200,"video_codec":"h264","subtitles":[{"index":6,"language":"en","title":"SDH"}]}"#.utf8)
     let playback = try JSONDecoder().decode(HLSPlayback.self, from: data)

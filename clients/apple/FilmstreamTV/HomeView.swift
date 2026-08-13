@@ -9,25 +9,29 @@ struct HomeView: View {
             ZStack {
                 TeaBackground()
 
-                VStack(alignment: .leading, spacing: 68) {
-                    header
-                    continueWatchingSection
-                    if let errorMessage = model.errorMessage {
-                        Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
-                            .foregroundStyle(Color.teaAmber)
-                            .font(.headline)
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 68) {
+                        header
+                        continueWatchingSection
+                        ForEach(model.discoverySections) { section in
+                            discoverySection(section)
+                        }
+                        if let errorMessage = model.errorMessage {
+                            Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(Color.teaAmber)
+                                .font(.headline)
+                        }
                     }
-                    Spacer(minLength: 60)
+                    .padding(.horizontal, 88)
+                    .padding(.top, 64)
+                    .padding(.bottom, 110)
                 }
-                .padding(.horizontal, 88)
-                .padding(.top, 64)
-                .padding(.bottom, 80)
             }
             .navigationDestination(for: Movie.self) { movie in
                 MovieDetailView(movie: movie)
             }
             .task {
-                await model.loadContinueWatching()
+                await model.loadHome()
             }
         }
     }
@@ -89,6 +93,35 @@ struct HomeView: View {
             }
         }
         .focusSection()
+    }
+
+    @ViewBuilder
+    private func discoverySection(_ section: DiscoverySection) -> some View {
+        if !section.items.isEmpty {
+            VStack(alignment: .leading, spacing: 30) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(section.title)
+                        .font(.system(size: 42, weight: .bold, design: .rounded))
+                        .foregroundStyle(Color.teaCream)
+                    Text(section.subtitle)
+                        .font(.title3)
+                        .foregroundStyle(Color.teaMuted)
+                }
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    LazyHStack(alignment: .top, spacing: 48) {
+                        ForEach(section.items) { movie in
+                            MovieNavigationCard(movie: movie)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 34)
+                    .padding(.bottom, 44)
+                }
+                .scrollClipDisabled()
+            }
+            .focusSection()
+        }
     }
 
     private var emptyContinueWatching: some View {

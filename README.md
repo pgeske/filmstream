@@ -107,7 +107,7 @@ make apple-test
 make tvos-build
 ```
 
-The app uses the server for catalog search, torrent preparation, and durable watch progress. See [`clients/apple/README.md`](clients/apple/README.md) for project generation, simulator, TMDB, and networking details.
+The app uses the server for catalog search, TMDB-powered Popular Now and Top Rated discovery rails, torrent preparation, and durable watch progress. Discovery excludes upcoming and theater-only titles by requiring an existing digital, physical, or TV release. See [`clients/apple/README.md`](clients/apple/README.md) for project generation, simulator, TMDB, and networking details.
 
 ## Configuration
 
@@ -262,6 +262,7 @@ A 1.0 ratio means one uploaded byte per downloaded byte. This is necessarily bes
 - `POST /v1/resolver/reload`
 - `POST /v1/resolve`
 - `GET /v1/catalog/search?query=...`
+- `GET /v1/catalog/discover`
 - `GET /v1/watch-history?continue=true`
 - `PUT /v1/watch-history`
 - `POST /v1/playbacks`

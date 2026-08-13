@@ -20,9 +20,10 @@ TeaStream defaults to `http://filmstream.home.alyoshukai.com`. `FilmstreamTV/Inf
 
 ## Server capabilities
 
-Search starts automatically after two title characters with a short debounce; selecting a TMDB result opens its movie details and playback action. The tvOS client uses:
+The home screen pairs Continue Watching with TMDB-powered Popular Now and Top Rated discovery rails. Discovery requires an existing digital, physical, or TV release, so upcoming and theater-only titles stay off the shelf. Search starts automatically after two title characters with a short debounce; selecting any movie opens its details and playback action. The tvOS client uses:
 
 - `GET /v1/catalog/search` for movie metadata and artwork;
+- `GET /v1/catalog/discover` for home-screen discovery sections;
 - `POST /v1/playbacks` for streaming-optimized torrent selection;
 - `POST /v1/playbacks/{id}/hls` for incremental AVPlayer-compatible HLS;
 - `DELETE /v1/playbacks/{id}/hls` to stop packaging and remove temporary segments;

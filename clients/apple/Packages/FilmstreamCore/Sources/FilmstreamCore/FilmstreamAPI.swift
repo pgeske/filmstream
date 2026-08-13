@@ -30,6 +30,11 @@ public struct FilmstreamAPI: Sendable {
         return response.items
     }
 
+    public func discover() async throws -> [DiscoverySection] {
+        let response: DiscoveryResponse = try await send(path: "v1/catalog/discover")
+        return response.sections
+    }
+
     public func continueWatching() async throws -> [WatchHistoryEntry] {
         var components = URLComponents(
             url: baseURL.appendingPathComponent("v1/watch-history"),
@@ -207,6 +212,10 @@ private struct HealthResponse: Decodable {
 
 private struct CatalogResponse: Decodable {
     let items: [Movie]
+}
+
+private struct DiscoveryResponse: Decodable {
+    let sections: [DiscoverySection]
 }
 
 private struct HistoryResponse: Decodable {
