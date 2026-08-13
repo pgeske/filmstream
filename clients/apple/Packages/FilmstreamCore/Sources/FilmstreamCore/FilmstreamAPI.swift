@@ -188,15 +188,15 @@ public enum FilmstreamError: LocalizedError, Equatable, Sendable {
     public var errorDescription: String? {
         switch self {
         case .invalidURL:
-            "Filmstream returned an invalid URL."
+            "TeaStream returned an invalid URL."
         case .invalidResponse:
-            "Filmstream returned an invalid response."
+            "TeaStream returned an invalid response."
         case let .network(message):
-            "Could not reach Filmstream: \(message)"
+            "Could not reach TeaStream: \(message)"
         case let .server(_, message):
-            message ?? "Filmstream could not complete the request."
+            message ?? "TeaStream could not complete the request."
         case let .decoding(message):
-            "Could not read the Filmstream response: \(message)"
+            "Could not read the TeaStream response: \(message)"
         }
     }
 }

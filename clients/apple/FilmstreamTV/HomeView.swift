@@ -7,19 +7,14 @@ struct HomeView: View {
     var body: some View {
         NavigationStack {
             ZStack {
-                LinearGradient(
-                    colors: [Color.filmstreamBackgroundTop, Color.filmstreamBackground],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-                .ignoresSafeArea()
+                TeaBackground()
 
                 VStack(alignment: .leading, spacing: 68) {
                     header
                     continueWatchingSection
                     if let errorMessage = model.errorMessage {
                         Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(Color.teaAmber)
                             .font(.headline)
                     }
                     Spacer(minLength: 60)
@@ -46,8 +41,9 @@ struct HomeView: View {
             } label: {
                 Label("Search", systemImage: "magnifyingglass")
                     .font(.title3.weight(.semibold))
-                    .padding(.horizontal, 18)
             }
+            .buttonStyle(TeaActionButtonStyle())
+            .focusEffectDisabled()
         }
         .focusSection()
     }
@@ -58,16 +54,18 @@ struct HomeView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Continue Watching")
                     .font(.system(size: 42, weight: .bold, design: .rounded))
-                Text("Pick up where you left off")
+                    .foregroundStyle(Color.teaCream)
+                Text("Settle in and pick up where you left off")
                     .font(.title3)
-                    .foregroundStyle(.white.opacity(0.58))
+                    .foregroundStyle(Color.teaMuted)
             }
 
             if model.isLoading && model.continueWatching.isEmpty {
                 HStack(spacing: 18) {
                     ProgressView()
-                    Text("Loading your movies…")
-                        .foregroundStyle(.secondary)
+                        .tint(Color.teaAccent)
+                    Text("Steeping your movie shelf…")
+                        .foregroundStyle(Color.teaMuted)
                 }
                 .frame(height: 360)
             } else if model.continueWatching.isEmpty {
@@ -94,26 +92,39 @@ struct HomeView: View {
     }
 
     private var emptyContinueWatching: some View {
-        HStack(spacing: 28) {
-            Image(systemName: "play.circle")
-                .font(.system(size: 76))
-                .foregroundStyle(Color.filmstreamAccent)
+        HStack(spacing: 30) {
+            TeaStreamMark(size: 76)
             VStack(alignment: .leading, spacing: 8) {
                 Text("Your next movie starts here")
                     .font(.title2.weight(.semibold))
-                Text("Search for a movie and Filmstream will remember where you left off.")
+                    .foregroundStyle(Color.teaCream)
+                Text("Find a favorite and TeaStream will remember where you left off.")
                     .font(.title3)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Color.teaMuted)
             }
             Spacer()
             NavigationLink {
                 SearchView()
             } label: {
                 Label("Find a Movie", systemImage: "magnifyingglass")
+                    .font(.headline.weight(.semibold))
             }
+            .buttonStyle(TeaActionButtonStyle())
+            .focusEffectDisabled()
         }
         .padding(36)
         .frame(maxWidth: .infinity, minHeight: 210)
-        .background(Color.filmstreamPanel, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .background(
+            LinearGradient(
+                colors: [Color.teaPanelElevated, Color.teaPanel],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: 28, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .stroke(Color.teaAccent.opacity(0.18), lineWidth: 1)
+        }
     }
 }

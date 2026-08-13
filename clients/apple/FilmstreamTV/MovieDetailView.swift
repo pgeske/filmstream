@@ -21,8 +21,8 @@ struct MovieDetailView: View {
                     LinearGradient(
                         stops: [
                             .init(color: .black.opacity(0.05), location: 0),
-                            .init(color: Color.filmstreamBackground.opacity(0.82), location: 0.62),
-                            .init(color: Color.filmstreamBackground, location: 1),
+                            .init(color: Color.teaBackground.opacity(0.82), location: 0.62),
+                            .init(color: Color.teaBackground, location: 1),
                         ],
                         startPoint: .top,
                         endPoint: .bottom
@@ -30,7 +30,7 @@ struct MovieDetailView: View {
                 }
                 .overlay {
                     LinearGradient(
-                        colors: [Color.filmstreamBackground.opacity(0.9), .clear],
+                        colors: [Color.teaBackground.opacity(0.94), .clear],
                         startPoint: .leading,
                         endPoint: .trailing
                     )
@@ -39,11 +39,16 @@ struct MovieDetailView: View {
             HStack(alignment: .bottom, spacing: 54) {
                 PosterImage(movie: movie)
                     .frame(width: 310, height: 465)
-                    .shadow(color: .black.opacity(0.6), radius: 28, y: 14)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .stroke(Color.teaAccentLight.opacity(0.24), lineWidth: 1.5)
+                    }
+                    .shadow(color: Color.teaAccent.opacity(0.14), radius: 32, y: 14)
 
                 VStack(alignment: .leading, spacing: 22) {
                     Text(movie.title)
                         .font(.system(size: 58, weight: .bold, design: .rounded))
+                        .foregroundStyle(Color.teaCream)
                         .lineLimit(2)
 
                     metadataLine
@@ -51,14 +56,14 @@ struct MovieDetailView: View {
                     if let overview = movie.overview, !overview.isEmpty {
                         Text(overview)
                             .font(.title3)
-                            .foregroundStyle(.white.opacity(0.88))
+                            .foregroundStyle(Color.teaCream.opacity(0.86))
                             .lineLimit(5)
                             .frame(maxWidth: 900, alignment: .leading)
                     }
 
                     if let errorMessage {
                         Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(Color.teaAmber)
                             .font(.headline)
                     }
 
@@ -68,14 +73,16 @@ struct MovieDetailView: View {
                         HStack(spacing: 12) {
                             if isPreparing {
                                 ProgressView()
+                                    .tint(Color.teaBackground)
                             } else {
                                 Image(systemName: "play.fill")
                             }
                             Text(playButtonTitle)
                         }
                         .font(.title3.weight(.bold))
-                        .padding(.horizontal, 18)
                     }
+                    .buttonStyle(TeaActionButtonStyle(prominent: true))
+                    .focusEffectDisabled()
                     .disabled(isPreparing)
                 }
                 .padding(.bottom, 22)
@@ -85,7 +92,7 @@ struct MovieDetailView: View {
             .padding(.horizontal, 76)
             .padding(.bottom, 62)
         }
-        .background(Color.filmstreamBackground)
+        .background(Color.teaBackground)
         .fullScreenCover(item: $preparedPlayback, onDismiss: {
             Task { await model.loadContinueWatching() }
         }) { prepared in
@@ -101,15 +108,15 @@ struct MovieDetailView: View {
             }
             if let voteAverage = movie.voteAverage, voteAverage > 0 {
                 Label(String(format: "%.1f", voteAverage), systemImage: "star.fill")
-                    .foregroundStyle(.yellow)
+                    .foregroundStyle(Color.teaAmber)
             }
             if let history, history.progress > 0 {
                 Text("\(Int(history.progress * 100))% watched")
-                    .foregroundStyle(Color.filmstreamAccent)
+                    .foregroundStyle(Color.teaAccentLight)
             }
         }
         .font(.headline)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(Color.teaMuted)
     }
 
     private var playButtonTitle: String {

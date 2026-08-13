@@ -1,6 +1,6 @@
-# Filmstream for Apple Platforms
+# TeaStream for Apple TV
 
-Filmstream's native Apple client starts with tvOS. The shared `FilmstreamCore` package supports tvOS, iOS, and macOS so future app targets can reuse API models, networking, metadata, and watch progress. Playback uses AVPlayer with server-generated fragmented HLS; the app does not embed VLC or retain indexer, TMDB, or resolver credentials.
+TeaStream is Filmstream's native tvOS experience, with a cozy matcha-inspired interface while retaining the existing Filmstream backend, bundle identifier, and repository structure. The shared `FilmstreamCore` package supports tvOS, iOS, and macOS so future app targets can reuse API models, networking, metadata, and watch progress. Playback uses AVPlayer with server-generated fragmented HLS; the app does not embed VLC or retain indexer, TMDB, or resolver credentials.
 
 ## Generate and build
 
@@ -16,7 +16,7 @@ xcodebuild -project FilmstreamApple.xcodeproj \
   build
 ```
 
-The app defaults to `http://filmstream.home.alyoshukai.com`. `FilmstreamTV/Info.plist` contains a temporary App Transport Security exception for that private hostname. Replace it with HTTPS before distributing the app.
+TeaStream defaults to `http://filmstream.home.alyoshukai.com`. `FilmstreamTV/Info.plist` contains a temporary App Transport Security exception for that private hostname. Replace it with HTTPS before distributing the app.
 
 ## Server capabilities
 

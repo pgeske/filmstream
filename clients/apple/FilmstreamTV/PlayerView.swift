@@ -72,12 +72,12 @@ struct PlayerView: View {
                 VStack(spacing: 18) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.largeTitle)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(Color.teaAmber)
                     Text("Unable to Play")
                         .font(.headline)
                     Text(errorMessage)
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Color.teaMuted)
                         .lineLimit(2)
                 }
                 .padding(30)
@@ -201,14 +201,14 @@ struct PlayerView: View {
                         .font(.footnote)
                     }
                 }
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Color.teaMuted)
             }
 
             ProgressView(
                 value: controller.positionSeconds,
                 total: max(controller.durationSeconds, 1)
             )
-            .tint(Color.filmstreamAccent)
+            .tint(Color.teaAccent)
 
             HStack {
                 Text(formatTime(controller.positionSeconds))
@@ -369,7 +369,7 @@ private struct SubtitlePicker: View {
             VStack(alignment: .leading, spacing: 20) {
                 HStack(spacing: 14) {
                     Image(systemName: "captions.bubble.fill")
-                        .foregroundStyle(Color.filmstreamAccent)
+                        .foregroundStyle(Color.teaAccentLight)
                     Text("Subtitles")
                         .font(.system(size: 34, weight: .bold, design: .rounded))
                 }
@@ -401,7 +401,7 @@ private struct SubtitlePicker: View {
             .frame(width: 570)
             .background(
                 LinearGradient(
-                    colors: [Color(red: 0.08, green: 0.085, blue: 0.105), .black.opacity(0.96)],
+                    colors: [Color.teaPanelElevated, Color.teaBackground.opacity(0.98)],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                 ),
@@ -409,7 +409,7 @@ private struct SubtitlePicker: View {
             )
             .overlay {
                 RoundedRectangle(cornerRadius: 26, style: .continuous)
-                    .stroke(.white.opacity(0.1), lineWidth: 1)
+                    .stroke(Color.teaAccent.opacity(0.2), lineWidth: 1)
             }
             .shadow(color: .black.opacity(0.6), radius: 38, x: -12)
             .padding(.trailing, 68)
@@ -439,30 +439,30 @@ private struct SubtitlePicker: View {
         Button(action: action) {
             HStack(spacing: 16) {
                 Capsule()
-                    .fill(focusedOption == id ? Color.filmstreamAccent : .clear)
+                    .fill(focusedOption == id ? Color.teaAccent : .clear)
                     .frame(width: 4, height: 32)
                 Text(title)
                     .font(.title3.weight(.semibold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(Color.teaCream)
                     .lineLimit(1)
                 Spacer()
                 if isSelected {
                     Image(systemName: "checkmark")
                         .font(.headline.weight(.bold))
-                        .foregroundStyle(Color.filmstreamAccent)
+                        .foregroundStyle(Color.teaAccentLight)
                 }
             }
             .padding(.horizontal, 16)
             .frame(height: 66)
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .background(
-                focusedOption == id ? Color.white.opacity(0.11) : Color.clear,
+                focusedOption == id ? Color.teaAccent.opacity(0.14) : Color.clear,
                 in: RoundedRectangle(cornerRadius: 14, style: .continuous)
             )
             .overlay {
                 if focusedOption == id {
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                        .stroke(Color.teaAccentLight.opacity(0.22), lineWidth: 1)
                 }
             }
         }
@@ -479,7 +479,7 @@ private struct PlaybackLoadingIndicator: View {
         Circle()
             .trim(from: 0.08, to: 0.82)
             .stroke(
-                Color.filmstreamAccent,
+                Color.teaAccent,
                 style: StrokeStyle(lineWidth: 7, lineCap: .round)
             )
             .frame(width: 68, height: 68)

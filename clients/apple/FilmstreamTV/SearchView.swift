@@ -13,14 +13,22 @@ struct SearchView: View {
 
     var body: some View {
         ZStack {
-            Color.filmstreamBackground.ignoresSafeArea()
+            TeaBackground()
             ScrollView {
                 VStack(alignment: .leading, spacing: 36) {
                     HStack(spacing: 18) {
-                        Text("Search")
-                            .font(.system(size: 48, weight: .bold, design: .rounded))
+                        TeaStreamMark(size: 52)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Find Your Next Movie")
+                                .font(.system(size: 46, weight: .bold, design: .rounded))
+                                .foregroundStyle(Color.teaCream)
+                            Text("A cozy movie night starts here")
+                                .font(.headline)
+                                .foregroundStyle(Color.teaMuted)
+                        }
                         if isSearching, !results.isEmpty {
                             ProgressView()
+                                .tint(Color.teaAccent)
                         }
                     }
 
@@ -29,7 +37,7 @@ struct SearchView: View {
                     if !results.isEmpty {
                         Text("Movie data and images provided by TMDB.")
                             .font(.footnote)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(Color.teaMuted)
                             .padding(.top, 24)
                     }
                 }
@@ -39,6 +47,7 @@ struct SearchView: View {
         }
         .navigationTitle("Search")
         .searchable(text: $query, prompt: "Movie title")
+        .tint(Color.teaAccent)
         .navigationDestination(item: $selectedMovie) { movie in
             MovieDetailView(movie: movie)
         }
@@ -61,9 +70,10 @@ struct SearchView: View {
         } else if isSearching {
             HStack(spacing: 18) {
                 ProgressView()
-                Text("Finding movies…")
+                    .tint(Color.teaAccent)
+                Text("Steeping the perfect results…")
                     .font(.title3)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Color.teaMuted)
             }
             .frame(maxWidth: .infinity, minHeight: 340)
         } else if let errorMessage {
@@ -75,7 +85,7 @@ struct SearchView: View {
             .frame(minHeight: 340)
         } else if trimmedQuery.count < 2 {
             ContentUnavailableView(
-                "Find Your Next Movie",
+                "Search by Title",
                 systemImage: "magnifyingglass",
                 description: Text("Type at least two letters of a movie title.")
             )

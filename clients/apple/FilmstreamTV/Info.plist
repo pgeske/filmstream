@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>Filmstream</string>
+	<string>TeaStream</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -36,7 +36,7 @@
 		</dict>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Filmstream connects to your private media server over Tailscale.</string>
+	<string>TeaStream connects to your private media server over Tailscale.</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 </dict>

@@ -28,7 +28,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.alyoshukai.filmstream.tv
-        PRODUCT_NAME: Filmstream
+        PRODUCT_NAME: TeaStream
         INFOPLIST_FILE: FilmstreamTV/Info.plist
         TARGETED_DEVICE_FAMILY: 3
         CODE_SIGN_STYLE: Automatic
