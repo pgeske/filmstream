@@ -43,6 +43,25 @@ public struct Movie: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
+public struct MovieRatings: Codable, Hashable, Sendable {
+    public let imdb: Double?
+    public let rottenTomatoes: Int?
+
+    public init(imdb: Double? = nil, rottenTomatoes: Int? = nil) {
+        self.imdb = imdb
+        self.rottenTomatoes = rottenTomatoes
+    }
+
+    public var isEmpty: Bool {
+        imdb == nil && rottenTomatoes == nil
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case imdb
+        case rottenTomatoes = "rotten_tomatoes"
+    }
+}
+
 public struct DiscoverySection: Codable, Hashable, Identifiable, Sendable {
     public let id: String
     public let title: String

@@ -8,7 +8,7 @@ Use it only with media you are authorized to download and share.
 
 - Local backend bound to `127.0.0.1:8943`
 - Bubble Tea terminal UI with search, continue watching, progress, and history controls
-- TeaStream, a cozy matcha-themed tvOS client with poster search, movie details, selectable subtitles, AVPlayer HLS playback, and shared progress
+- TeaStream, cozy native iPhone and Apple TV clients with poster search, movie details, selectable subtitles, AVPlayer HLS playback, and shared progress
 - One-command CLI that starts the backend when needed and launches MPV
 - A small, trusted open-movie catalog plus an Internet Archive reference indexer
 - Standard Torznab indexers, including Prowlarr and Jackett endpoints
@@ -98,16 +98,17 @@ filmstream status PLAYBACK_ID
 
 An automatically started server logs to `~/.cache/filmstream/server.log`.
 
-## Apple TV client
+## Apple clients
 
-TeaStream, the SwiftUI client in `clients/apple`, is the tvOS product identity for Filmstream. Its shared `FilmstreamCore` package supports future iOS and macOS targets, while the existing `FilmstreamTV` target and bundle identifier remain stable. TeaStream uses AVPlayer for native Apple TV playback and remote controls. The backend copies compatible H.264/H.265 video into fragmented HLS and converts the selected audio track to AAC; the raw HTTP stream remains available to MPV.
+TeaStream provides native SwiftUI apps for iPhone and Apple TV in `clients/apple`. Both targets reuse `FilmstreamCore` for API models, networking, metadata, HLS preparation, subtitles, and watch progress. `FilmstreamIOS` uses touch-first tabs and playback controls, while `FilmstreamTV` retains its remote-focused interface and existing bundle identifier.
 
 ```bash
 make apple-test
+make ios-build
 make tvos-build
 ```
 
-The app uses the server for catalog search, TMDB-powered Popular Now and Top Rated discovery rails, torrent preparation, and durable watch progress. Discovery excludes upcoming and theater-only titles by requiring an existing digital, physical, or TV release. See [`clients/apple/README.md`](clients/apple/README.md) for project generation, simulator, TMDB, and networking details.
+Install a signed development build on one paired iPhone with `make ios-install`. The apps use the server for catalog search, TMDB-powered Popular Now and Top Rated discovery rails, torrent preparation, and durable watch progress. Discovery excludes upcoming and theater-only titles by requiring an existing digital, physical, or TV release. See [`clients/apple/README.md`](clients/apple/README.md) for project generation, simulator, device installation, TMDB, and networking details.
 
 ## Configuration
 

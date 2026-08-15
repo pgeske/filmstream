@@ -2,6 +2,7 @@ name: FilmstreamApple
 options:
   minimumXcodeGenVersion: 2.46.0
   deploymentTarget:
+    iOS: "18.0"
     tvOS: "18.0"
   createIntermediateGroups: true
 packages:
@@ -34,11 +35,38 @@ targets:
         CODE_SIGN_STYLE: Automatic
         ENABLE_USER_SCRIPT_SANDBOXING: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
+  FilmstreamIOS:
+    type: application
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: FilmstreamIOS
+        excludes:
+          - Info.plist
+    dependencies:
+      - package: FilmstreamCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.alyoshukai.filmstream.ios
+        PRODUCT_NAME: TeaStream
+        INFOPLIST_FILE: FilmstreamIOS/Info.plist
+        TARGETED_DEVICE_FAMILY: 1
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_USER_SCRIPT_SANDBOXING: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
 schemes:
   FilmstreamTV:
     build:
       targets:
         FilmstreamTV: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+  FilmstreamIOS:
+    build:
+      targets:
+        FilmstreamIOS: all
     run:
       config: Debug
     archive:
