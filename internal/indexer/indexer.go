@@ -114,6 +114,61 @@ func (r *Registry) Search(ctx context.Context, request catalog.SearchRequest) ([
 	return candidates, nil
 }
 
+func (r *Registry) SearchFirstProtocol(
+	ctx context.Context,
+	request catalog.SearchRequest,
+	protocol string,
+) ([]catalog.Candidate, error) {
+	r.mu.RLock()
+	ordered := append([]Indexer(nil), r.ordered...)
+	r.mu.RUnlock()
+	if len(ordered) == 0 {
+		return nil, errors.New("no indexers are configured")
+	}
+
+	searchContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type result struct {
+		candidates []catalog.Candidate
+		err        error
+	}
+	results := make(chan result, len(ordered))
+	for _, configured := range ordered {
+		go func(indexer Indexer) {
+			candidates, err := indexer.Search(searchContext, request)
+			for i := range candidates {
+				candidates[i].Indexer = indexer.Name()
+			}
+			results <- result{candidates: candidates, err: err}
+		}(configured)
+	}
+
+	var failures []string
+	successes := 0
+	for range ordered {
+		result := <-results
+		if result.err != nil {
+			failures = append(failures, result.err.Error())
+			continue
+		}
+		successes++
+		matches := make([]catalog.Candidate, 0, len(result.candidates))
+		for _, candidate := range result.candidates {
+			if candidate.Protocol == protocol {
+				matches = append(matches, candidate)
+			}
+		}
+		if len(matches) > 0 {
+			cancel()
+			return matches, nil
+		}
+	}
+	if successes == 0 && len(failures) > 0 {
+		return nil, fmt.Errorf("all indexers failed: %s", strings.Join(failures, "; "))
+	}
+	return nil, nil
+}
+
 func (r *Registry) Resolve(ctx context.Context, candidate catalog.Candidate) (Source, error) {
 	r.mu.RLock()
 	configured, ok := r.indexers[candidate.Indexer]

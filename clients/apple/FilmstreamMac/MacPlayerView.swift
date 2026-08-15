@@ -654,7 +654,7 @@ private final class MacPlaybackController: ObservableObject {
     private func installItem(url: URL) {
         statusObservation?.invalidate()
         let item = AVPlayerItem(url: url)
-        item.preferredForwardBufferDuration = 20
+        item.preferredForwardBufferDuration = 30
         statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             Task { @MainActor in
                 guard let self, !self.stopped else { return }

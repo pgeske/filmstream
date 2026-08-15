@@ -17,7 +17,8 @@ const (
 	defaultSeedMaxHours      = 24
 	defaultIdleGraceSeconds  = 120
 	defaultHLSStartupSeconds = 90
-	defaultHLSBufferSeconds  = 10
+	defaultHLSBufferSeconds  = 24
+	defaultHLSReadRate       = 1.25
 	defaultHLSSegmentSeconds = 4
 )
 
@@ -67,6 +68,7 @@ type Config struct {
 	FFprobePath         string    `json:"ffprobe_path"`
 	HLSStartupSeconds   int       `json:"hls_startup_seconds"`
 	HLSBufferSeconds    int       `json:"hls_startup_buffer_seconds"`
+	HLSReadRate         float64   `json:"hls_read_rate"`
 	HLSSegmentSeconds   int       `json:"hls_segment_seconds"`
 	MaxCandidateGiB     int64     `json:"max_candidate_gib"`
 	ReadaheadMiB        int64     `json:"readahead_mib"`
@@ -95,6 +97,7 @@ func Defaults() Config {
 		FFprobePath:         "ffprobe",
 		HLSStartupSeconds:   defaultHLSStartupSeconds,
 		HLSBufferSeconds:    defaultHLSBufferSeconds,
+		HLSReadRate:         defaultHLSReadRate,
 		HLSSegmentSeconds:   defaultHLSSegmentSeconds,
 		MaxCandidateGiB:     defaultMaxCandidateGiB,
 		ReadaheadMiB:        defaultReadaheadMiB,
@@ -211,6 +214,9 @@ func (c Config) Validate() error {
 	}
 	if c.HLSStartupSeconds <= 0 || c.HLSBufferSeconds <= 0 || c.HLSSegmentSeconds <= 0 {
 		return errors.New("HLS timeout, startup buffer, and segment duration must be positive")
+	}
+	if c.HLSReadRate < 1 || c.HLSReadRate > 4 {
+		return errors.New("hls_read_rate must be between 1 and 4")
 	}
 	if c.MaxCandidateGiB <= 0 {
 		return errors.New("max_candidate_gib must be positive")

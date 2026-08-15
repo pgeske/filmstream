@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -139,6 +140,72 @@ func TestCreateAndServeRange(t *testing.T) {
 	}
 }
 
+func TestPreflightVideoSamplesAcrossFileConcurrently(t *testing.T) {
+	var mu sync.Mutex
+	var ranges []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		ranges = append(ranges, r.Header.Get("Range"))
+		mu.Unlock()
+		w.WriteHeader(http.StatusPartialContent)
+		fmt.Fprint(w, "data")
+	}))
+	defer server.Close()
+
+	engine := &Engine{
+		webDAVUser: "user", webDAVPassword: "password", streamClient: server.Client(),
+	}
+	if err := engine.preflightVideo(t.Context(), videoInfo{url: server.URL, size: 9 << 20}); err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(ranges)
+	expected := []string{
+		"bytes=0-1048575",
+		"bytes=4194304-5242879",
+		"bytes=8388608-9437183",
+	}
+	if fmt.Sprint(ranges) != fmt.Sprint(expected) {
+		t.Fatalf("ranges = %v, want %v", ranges, expected)
+	}
+}
+
+func TestWaitForVideoRetriesUntilWebDAVMountIsPopulated(t *testing.T) {
+	var mu sync.Mutex
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		attempts++
+		attempt := attempts
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusMultiStatus)
+		fmt.Fprint(w, `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+			<d:response><d:href>/content/movies/Movie</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`)
+		if attempt > 1 {
+			fmt.Fprint(w, `<d:response><d:href>/content/movies/Movie/movie.mkv</d:href><d:propstat><d:prop><d:resourcetype/><d:getcontentlength>1024</d:getcontentlength></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`)
+		}
+		fmt.Fprint(w, `</d:multistatus>`)
+	}))
+	defer server.Close()
+
+	engine, err := New(Config{
+		BaseURL: server.URL, APIKey: "key", WebDAVUser: "user", WebDAVPassword: "pass",
+		IdleGrace: time.Hour, CleanupInterval: time.Hour,
+		ControlClient: server.Client(), StreamClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+	video, err := engine.waitForVideo(t.Context(), mountInfo{category: "movies", folder: "Movie"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if video.name != "movie.mkv" || attempts < 2 {
+		t.Fatalf("video = %+v, attempts = %d", video, attempts)
+	}
+}
+
 func TestCreateReportsFailedPreparation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -165,6 +232,14 @@ func TestCreateReportsFailedPreparation(t *testing.T) {
 	_, err = engine.Create(context.Background(), Source{NZBURL: server.URL + "/release.nzb"})
 	if err == nil || !strings.Contains(err.Error(), "articles are unavailable") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestCleanDAVPathCanonicalizesEquivalentEscaping(t *testing.T) {
+	escaped := cleanDAVPath("/content/movies/Movie%20%286%29")
+	absolute := cleanDAVPath("http://infinidysk/content/movies/Movie%20(6)")
+	if escaped == "" || escaped != absolute {
+		t.Fatalf("escaped = %q, absolute = %q", escaped, absolute)
 	}
 }
 

@@ -17,7 +17,8 @@ import (
 
 const (
 	defaultStartupTimeout       = 90 * time.Second
-	defaultStartupBufferSeconds = 16
+	defaultStartupBufferSeconds = 24
+	defaultReadRate             = 1.25
 	defaultSegmentSeconds       = 4
 )
 
@@ -28,6 +29,7 @@ type Config struct {
 	SourceBaseURL  string
 	StartupTimeout time.Duration
 	BufferSeconds  int
+	ReadRate       float64
 	SegmentSeconds int
 	Logger         *slog.Logger
 }
@@ -55,6 +57,7 @@ type Manager struct {
 	sourceBaseURL  string
 	startupTimeout time.Duration
 	bufferSeconds  int
+	readRate       float64
 	segmentSeconds int
 	logger         *slog.Logger
 
@@ -127,6 +130,12 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.BufferSeconds <= 0 {
 		cfg.BufferSeconds = defaultStartupBufferSeconds
 	}
+	if cfg.ReadRate == 0 {
+		cfg.ReadRate = defaultReadRate
+	}
+	if cfg.ReadRate < 1 || cfg.ReadRate > 4 {
+		return nil, errors.New("HLS read rate must be between 1 and 4")
+	}
 	if cfg.SegmentSeconds <= 0 {
 		cfg.SegmentSeconds = defaultSegmentSeconds
 	}
@@ -147,6 +156,7 @@ func New(cfg Config) (*Manager, error) {
 		sourceBaseURL:  strings.TrimRight(cfg.SourceBaseURL, "/"),
 		startupTimeout: cfg.StartupTimeout,
 		bufferSeconds:  cfg.BufferSeconds,
+		readRate:       cfg.ReadRate,
 		segmentSeconds: cfg.SegmentSeconds,
 		logger:         cfg.Logger,
 		ctx:            ctx,
@@ -516,7 +526,8 @@ func (m *Manager) ffmpegArgs(sourceURL, dir, codec string, startSeconds float64)
 	initialBurstSeconds := m.bufferSeconds + m.segmentSeconds
 	args := []string{
 		"-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
-		"-readrate", "1.05", "-readrate_initial_burst", strconv.Itoa(initialBurstSeconds),
+		"-readrate", strconv.FormatFloat(m.readRate, 'f', -1, 64),
+		"-readrate_initial_burst", strconv.Itoa(initialBurstSeconds),
 	}
 	if startSeconds > 0 {
 		// Video is stream-copied while audio is transcoded. Keeping pre-roll for both
@@ -551,7 +562,8 @@ func (m *Manager) subtitleArgs(stream *runningStream, index int) []string {
 	initialBurstSeconds := m.bufferSeconds + m.segmentSeconds
 	args := []string{
 		"-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
-		"-readrate", "1.05", "-readrate_initial_burst", strconv.Itoa(initialBurstSeconds),
+		"-readrate", strconv.FormatFloat(m.readRate, 'f', -1, 64),
+		"-readrate_initial_burst", strconv.Itoa(initialBurstSeconds),
 	}
 	if stream.requestedStart > 0 {
 		args = append(args,

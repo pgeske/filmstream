@@ -145,10 +145,10 @@ JSON
 }
 
 func TestFFmpegArgsPaceInputAndTagHEVC(t *testing.T) {
-	manager := &Manager{bufferSeconds: 16, segmentSeconds: 4}
+	manager := &Manager{bufferSeconds: 16, readRate: 1.25, segmentSeconds: 4}
 	args := strings.Join(manager.ffmpegArgs("http://source", t.TempDir(), "hevc", 30), " ")
 	for _, expected := range []string{
-		"-readrate 1.05", "-readrate_initial_burst 20", "-noaccurate_seek -ss 30.000", "-c:v copy", "-tag:v hvc1", "-c:a aac",
+		"-readrate 1.25", "-readrate_initial_burst 20", "-noaccurate_seek -ss 30.000", "-c:v copy", "-tag:v hvc1", "-c:a aac",
 	} {
 		if !strings.Contains(args, expected) {
 			t.Fatalf("FFmpeg arguments do not contain %q: %s", expected, args)
@@ -160,7 +160,7 @@ func TestFFmpegArgsPaceInputAndTagHEVC(t *testing.T) {
 }
 
 func TestSubtitleArgsAlignToKeyframeTimeline(t *testing.T) {
-	manager := &Manager{bufferSeconds: 16, segmentSeconds: 4}
+	manager := &Manager{bufferSeconds: 16, readRate: 1.25, segmentSeconds: 4}
 	stream := &runningStream{
 		info:           Stream{StartSeconds: 118.5},
 		dir:            t.TempDir(),

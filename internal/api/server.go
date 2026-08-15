@@ -619,12 +619,15 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 		var usenetErr error
 
 		if s.usenetEngine != nil {
-			candidates, err := s.indexers.Search(r.Context(), search)
+			candidates, err := s.indexers.SearchFirstProtocol(r.Context(), search, catalog.ProtocolUsenet)
 			if err != nil {
 				searchErr = err
 			} else {
 				ranked = catalog.Rank(search, candidates)
 				session, selected, usenetErr = s.createRankedUsenetPlayback(r.Context(), ranked, preferences)
+				if session == nil {
+					ranked = nil
+				}
 			}
 		}
 

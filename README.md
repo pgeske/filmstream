@@ -126,7 +126,8 @@ The optional configuration file is `~/.config/filmstream/config.json`:
   "ffmpeg_path": "ffmpeg",
   "ffprobe_path": "ffprobe",
   "hls_startup_seconds": 90,
-  "hls_startup_buffer_seconds": 10,
+  "hls_startup_buffer_seconds": 24,
+  "hls_read_rate": 1.25,
   "hls_segment_seconds": 4,
   "max_candidate_gib": 60,
   "readahead_mib": 32,
@@ -255,7 +256,7 @@ The config file is written with mode `0600` because it contains API keys. The CL
 
 ## Smart streaming, cleanup, and ratio behavior
 
-Filmstream only requests the pieces needed by MPV's current HTTP Range request, a 32 MiB read-ahead window, and a small tail window used to find container metadata. Native HLS prepares `hls_startup_buffer_seconds` of media before opening the player, then packages at approximately playback speed so it avoids racing through an entire movie in the background. Closing either player closes its readers and removes temporary HLS segments.
+Filmstream only requests the pieces needed by MPV's current HTTP Range request, a 32 MiB read-ahead window, and small samples used to validate container metadata. Native HLS prepares `hls_startup_buffer_seconds` of media before opening the player, then packages at `hls_read_rate` times playback speed to build resilience against brief source stalls without racing through the full movie immediately. Closing either player closes its readers and removes temporary HLS segments.
 
 MPV waits for a two-second initial cache before playback to avoid startup jitter. Native Windows MPV uses its D3D11 hardware-decoding and GPU-rendering path. Linux MPV on WSL uses `gpu-next` with `nvdec-copy` when supported and retains `wlshm` as a compatibility fallback; other environments keep MPV's portable automatic output and software-decoding fallback. Apple clients request streaming-optimized H.264/H.265 releases, avoid known-incompatible Dolby Vision releases, copy video without quality loss, and transcode only audio for AVPlayer compatibility. Streaming ranking prioritizes reported swarm popularity, uses file size only as a light tie-breaker, and keeps a specific remux penalty. Filmstream checks ranked candidates progressively and accepts the first high-ranked release that proves it has a strong live swarm, avoiding unnecessary torrent initialization while still falling through to alternatives for stale indexer results.
 

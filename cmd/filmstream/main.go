@@ -139,6 +139,7 @@ func runServer(args []string) error {
 		SourceBaseURL:  sourceBaseURL,
 		StartupTimeout: time.Duration(cfg.HLSStartupSeconds) * time.Second,
 		BufferSeconds:  cfg.HLSBufferSeconds,
+		ReadRate:       cfg.HLSReadRate,
 		SegmentSeconds: cfg.HLSSegmentSeconds,
 		Logger:         logger,
 	})

@@ -30,8 +30,11 @@ const (
 	defaultStartupTimeout  = 2 * time.Minute
 	defaultIdleGrace       = 2 * time.Minute
 	defaultCleanupInterval = 30 * time.Second
+	videoReadyTimeout      = 5 * time.Second
 	maxWebDAVDepth         = 4
 )
+
+var errNoSupportedVideo = errors.New("Usenet release contains no supported video files")
 
 type Config struct {
 	BaseURL         string
@@ -205,6 +208,7 @@ func (e *Engine) SetCleanupHandler(handler func(string, string)) {
 }
 
 func (e *Engine) Create(parent context.Context, source Source) (*Session, error) {
+	startedAt := time.Now()
 	if strings.TrimSpace(source.NZBURL) == "" {
 		return nil, errors.New("NZB URL cannot be empty")
 	}
@@ -227,17 +231,21 @@ func (e *Engine) Create(parent context.Context, source Source) (*Session, error)
 		}
 	}()
 
+	mountStartedAt := time.Now()
 	mount, err := e.waitForMount(ctx, nzoID)
 	if err != nil {
 		return nil, err
 	}
-	video, err := e.findLargestVideo(ctx, mount)
+	mountDuration := time.Since(mountStartedAt)
+	video, err := e.waitForVideo(ctx, mount)
 	if err != nil {
 		return nil, err
 	}
+	preflightStartedAt := time.Now()
 	if err := e.preflightVideo(ctx, video); err != nil {
 		return nil, err
 	}
+	preflightDuration := time.Since(preflightStartedAt)
 	id, err := randomID()
 	if err != nil {
 		return nil, err
@@ -252,7 +260,10 @@ func (e *Engine) Create(parent context.Context, source Source) (*Session, error)
 	e.sessions[id] = session
 	e.mu.Unlock()
 	cleanupJob = false
-	e.logger.Info("created Usenet playback", "id", id, "name", session.Name, "file", session.FileName)
+	e.logger.Info("created Usenet playback", "id", id, "name", session.Name, "file", session.FileName,
+		"prepare_duration", time.Since(startedAt).Round(time.Millisecond),
+		"mount_duration", mountDuration.Round(time.Millisecond),
+		"preflight_duration", preflightDuration.Round(time.Millisecond))
 	return session, nil
 }
 
@@ -602,6 +613,24 @@ type videoInfo struct {
 	size int64
 }
 
+func (e *Engine) waitForVideo(ctx context.Context, mount mountInfo) (videoInfo, error) {
+	readyContext, cancel := context.WithTimeout(ctx, videoReadyTimeout)
+	defer cancel()
+	for {
+		video, err := e.findLargestVideo(readyContext, mount)
+		if err == nil || !errors.Is(err, errNoSupportedVideo) {
+			return video, err
+		}
+		select {
+		case <-ctx.Done():
+			return videoInfo{}, ctx.Err()
+		case <-readyContext.Done():
+			return videoInfo{}, err
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
 func (e *Engine) findLargestVideo(ctx context.Context, mount mountInfo) (videoInfo, error) {
 	root := "/content/" + url.PathEscape(mount.category) + "/" + url.PathEscape(mount.folder)
 	rootPath := cleanDAVPath(root)
@@ -647,7 +676,7 @@ func (e *Engine) findLargestVideo(ctx context.Context, mount mountInfo) (videoIn
 		}
 	}
 	if len(videos) == 0 {
-		return videoInfo{}, errors.New("Usenet release contains no supported video files")
+		return videoInfo{}, errNoSupportedVideo
 	}
 	best := videos[0]
 	for _, candidate := range videos[1:] {
@@ -721,34 +750,64 @@ func (e *Engine) propfind(ctx context.Context, davPath string) ([]webDAVItem, er
 }
 
 func (e *Engine) preflightVideo(ctx context.Context, video videoInfo) error {
-	const chunkSize = int64(1 << 20)
-	ranges := [][2]int64{{0, min(video.size-1, chunkSize-1)}}
-	if tailStart := max(int64(0), video.size-chunkSize); tailStart > 0 {
-		ranges = append(ranges, [2]int64{tailStart, video.size - 1})
+	const (
+		chunkSize   = int64(1 << 20)
+		sampleCount = 3
+	)
+	maxStart := max(int64(0), video.size-chunkSize)
+	ranges := make([][2]int64, 0, sampleCount)
+	seen := make(map[int64]bool, sampleCount)
+	for index := range sampleCount {
+		start := maxStart * int64(index) / (sampleCount - 1)
+		if seen[start] {
+			continue
+		}
+		seen[start] = true
+		ranges = append(ranges, [2]int64{start, min(video.size-1, start+chunkSize-1)})
 	}
+
+	preflightContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wait sync.WaitGroup
+	var firstError error
+	var errorOnce sync.Once
 	for _, byteRange := range ranges {
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, video.url, nil)
-		if err != nil {
-			return err
-		}
-		request.SetBasicAuth(e.webDAVUser, e.webDAVPassword)
-		request.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", byteRange[0], byteRange[1]))
-		response, err := e.streamClient.Do(request)
-		if err != nil {
-			return fmt.Errorf("verify Usenet video: %w", requestError(err))
-		}
-		if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent {
-			response.Body.Close()
-			return fmt.Errorf("verify Usenet video returned %s", response.Status)
-		}
-		read, copyErr := io.Copy(io.Discard, io.LimitReader(response.Body, chunkSize))
-		response.Body.Close()
-		if copyErr != nil {
-			return fmt.Errorf("verify Usenet video: %w", copyErr)
-		}
-		if read == 0 {
-			return errors.New("verify Usenet video returned no data")
-		}
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			if err := e.preflightRange(preflightContext, video.url, byteRange, chunkSize); err != nil {
+				errorOnce.Do(func() {
+					firstError = err
+					cancel()
+				})
+			}
+		}()
+	}
+	wait.Wait()
+	return firstError
+}
+
+func (e *Engine) preflightRange(ctx context.Context, videoURL string, byteRange [2]int64, limit int64) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, videoURL, nil)
+	if err != nil {
+		return err
+	}
+	request.SetBasicAuth(e.webDAVUser, e.webDAVPassword)
+	request.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", byteRange[0], byteRange[1]))
+	response, err := e.streamClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("verify Usenet video: %w", requestError(err))
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent {
+		return fmt.Errorf("verify Usenet video returned %s", response.Status)
+	}
+	read, err := io.Copy(io.Discard, io.LimitReader(response.Body, limit))
+	if err != nil {
+		return fmt.Errorf("verify Usenet video: %w", err)
+	}
+	if read == 0 {
+		return errors.New("verify Usenet video returned no data")
 	}
 	return nil
 }
@@ -822,11 +881,11 @@ func cleanDAVPath(value string) string {
 	if err != nil {
 		return ""
 	}
-	cleaned := path.Clean(parsed.EscapedPath())
+	cleaned := path.Clean(parsed.Path)
 	if cleaned == "." || !strings.HasPrefix(cleaned, "/content/") && cleaned != "/content" {
 		return ""
 	}
-	return cleaned
+	return (&url.URL{Path: cleaned}).EscapedPath()
 }
 
 func isVideoFile(name string) bool {
