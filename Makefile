@@ -1,9 +1,10 @@
 BINARY := filmstream
 PREFIX ?= $(HOME)/.local
 APPLE_DIR := clients/apple
+IOS_DESTINATION ?= platform=iOS Simulator,name=iPhone 17 Pro
 TVOS_DESTINATION ?= platform=tvOS Simulator,name=Apple TV 4K (3rd generation)
 
-.PHONY: build install test fmt apple-project apple-test tvos-build
+.PHONY: build install test fmt apple-project apple-test ios-build ios-install tvos-build
 
 build:
 	go build -o bin/$(BINARY) ./cmd/filmstream
@@ -23,6 +24,15 @@ apple-project:
 
 apple-test:
 	cd $(APPLE_DIR)/Packages/FilmstreamCore && swift test
+
+ios-build: apple-project
+	xcodebuild -quiet -project $(APPLE_DIR)/FilmstreamApple.xcodeproj \
+		-scheme FilmstreamIOS \
+		-destination '$(IOS_DESTINATION)' \
+		CODE_SIGNING_ALLOWED=NO clean build
+
+ios-install:
+	./scripts/install-teastream-ios
 
 tvos-build: apple-project
 	xcodebuild -quiet -project $(APPLE_DIR)/FilmstreamApple.xcodeproj \

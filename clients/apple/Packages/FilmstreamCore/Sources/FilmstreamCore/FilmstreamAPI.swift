@@ -35,6 +35,25 @@ public struct FilmstreamAPI: Sendable {
         return response.sections
     }
 
+    public func ratings(for movie: Movie) async throws -> MovieRatings {
+        var components = URLComponents(
+            url: baseURL.appendingPathComponent("v1/catalog/ratings"),
+            resolvingAgainstBaseURL: false
+        )
+        var queryItems = [
+            URLQueryItem(name: "title", value: movie.title),
+            URLQueryItem(name: "media_id", value: movie.id),
+        ]
+        if let year = movie.year {
+            queryItems.append(URLQueryItem(name: "year", value: String(year)))
+        }
+        components?.queryItems = queryItems
+        guard let url = components?.url else {
+            throw FilmstreamError.invalidURL
+        }
+        return try await send(url: url)
+    }
+
     public func continueWatching() async throws -> [WatchHistoryEntry] {
         var components = URLComponents(
             url: baseURL.appendingPathComponent("v1/watch-history"),
@@ -46,6 +65,17 @@ public struct FilmstreamAPI: Sendable {
         }
         let response: HistoryResponse = try await send(url: url)
         return response.entries
+    }
+
+    public func removeFromContinueWatching(_ entry: WatchHistoryEntry) async throws {
+        var request = URLRequest(
+            url: baseURL
+                .appendingPathComponent("v1/watch-history")
+                .appendingPathComponent(entry.id)
+        )
+        request.httpMethod = "DELETE"
+        request.timeoutInterval = 15
+        let _: HealthResponse = try await send(request)
     }
 
     public func createPlayback(for movie: Movie) async throws -> Playback {
@@ -241,19 +271,22 @@ private struct PlaybackPreferences: Encodable {
     let languages: [String]
     let maxSizeBytes: Int64
     let streamingOptimized: Bool
+    let preferTextSubtitles: Bool
 
     static let appleTV = PlaybackPreferences(
         resolution: "1080p",
         codecs: ["h264", "h265"],
         languages: ["en", "english"],
         maxSizeBytes: 50 * 1_073_741_824,
-        streamingOptimized: true
+        streamingOptimized: true,
+        preferTextSubtitles: true
     )
 
     private enum CodingKeys: String, CodingKey {
         case resolution, codecs, languages
         case maxSizeBytes = "max_size_bytes"
         case streamingOptimized = "streaming_optimized"
+        case preferTextSubtitles = "prefer_text_subtitles"
     }
 }
 

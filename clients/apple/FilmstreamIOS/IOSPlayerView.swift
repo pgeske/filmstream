@@ -5,166 +5,105 @@ import Foundation
 import SwiftUI
 import UIKit
 
-struct PlayerView: View {
+struct IOSPlayerView: View {
     @Environment(\.dismiss) private var dismiss
 
     let movie: Movie
     let prepared: PreparedPlayback
     let api: FilmstreamAPI
 
-    @StateObject private var controller: NativePlaybackController
+    @StateObject private var controller: IOSPlaybackController
     @State private var didClose = false
-    @State private var isPlaybackChromeVisible = true
-    @State private var isSubtitlePickerPresented = false
-    @State private var chromeAutoHideTask: Task<Void, Never>?
-    @FocusState private var receivesRemoteCommands: Bool
+    @State private var isChromeVisible = true
+    @State private var scrubPosition: Double?
+    @State private var autoHideTask: Task<Void, Never>?
 
     init(movie: Movie, prepared: PreparedPlayback, api: FilmstreamAPI) {
         self.movie = movie
         self.prepared = prepared
         self.api = api
         _controller = StateObject(
-            wrappedValue: NativePlaybackController(prepared: prepared, api: api)
+            wrappedValue: IOSPlaybackController(prepared: prepared, api: api)
         )
     }
 
     var body: some View {
-        ZStack(alignment: .bottom) {
+        ZStack {
             Color.black.ignoresSafeArea()
-            NativePlayerSurface(player: controller.player)
-                .ignoresSafeArea()
 
-            if isPlaybackChromePresented {
-                LinearGradient(
-                    colors: [.clear, .black.opacity(0.86)],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-                .frame(height: 270)
-                .transition(.opacity)
+            IOSPlayerSurface(player: controller.player)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    revealChrome()
+                }
+
+            if let subtitle = controller.activeSubtitleText {
+                VStack {
+                    Spacer()
+                    Text(subtitle)
+                        .font(.system(size: 22, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white)
+                        .multilineTextAlignment(.center)
+                        .lineSpacing(3)
+                        .padding(.horizontal, 24)
+                        .padding(.bottom, isChromeVisible ? 180 : 28)
+                        .shadow(color: .black, radius: 3, x: 1, y: 1)
+                        .shadow(color: .black.opacity(0.9), radius: 7)
+                        .animation(.easeOut(duration: 0.2), value: isChromeVisible)
+                }
                 .allowsHitTesting(false)
             }
 
-            if let subtitle = controller.activeSubtitleText {
-                Text(subtitle)
-                    .font(.system(size: 44, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.white)
-                    .multilineTextAlignment(.center)
-                    .lineSpacing(5)
-                    .frame(maxWidth: 1_500)
-                    .padding(.horizontal, 80)
-                    .padding(.bottom, isPlaybackChromePresented ? 245 : 82)
-                    .shadow(color: .black, radius: 3, x: 2, y: 2)
-                    .shadow(color: .black.opacity(0.9), radius: 7)
+            if isChromeVisible {
+                chrome
                     .transition(.opacity)
-                    .animation(.easeOut(duration: 0.22), value: isPlaybackChromePresented)
-                    .allowsHitTesting(false)
-            }
-
-            if isPlaybackChromePresented {
-                controls
-                    .padding(.horizontal, 68)
-                    .padding(.bottom, 42)
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
 
             if let errorMessage = controller.errorMessage {
-                VStack(spacing: 18) {
+                VStack(spacing: 12) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.largeTitle)
-                        .foregroundStyle(Color.teaAmber)
+                        .foregroundStyle(Color.mobileTeaAmber)
                     Text("Unable to Play")
                         .font(.headline)
                     Text(errorMessage)
                         .font(.footnote)
-                        .foregroundStyle(Color.teaMuted)
-                        .lineLimit(2)
+                        .foregroundStyle(Color.mobileTeaMuted)
+                        .multilineTextAlignment(.center)
                 }
-                .padding(30)
-                .background(.black.opacity(0.76), in: RoundedRectangle(cornerRadius: 20))
-                .allowsHitTesting(false)
+                .padding(24)
+                .frame(maxWidth: 330)
+                .background(.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 18))
             } else if controller.isWaiting {
-                PlaybackLoadingIndicator()
+                ProgressView()
+                    .controlSize(.large)
+                    .tint(Color.mobileTeaAccent)
+                    .padding(22)
+                    .background(.black.opacity(0.58), in: Circle())
                     .allowsHitTesting(false)
             }
-
-            if isSubtitlePickerPresented {
-                SubtitlePicker(
-                    tracks: controller.subtitleOptions,
-                    selected: controller.selectedSubtitle,
-                    onSelect: { track in
-                        controller.selectSubtitle(track)
-                        Task { @MainActor in
-                            try? await Task.sleep(for: .milliseconds(100))
-                            closeSubtitlePicker()
-                        }
-                    },
-                    onDismiss: closeSubtitlePicker
-                )
-                .transition(.opacity.combined(with: .move(edge: .trailing)))
-            }
         }
-        .focusable(!isSubtitlePickerPresented)
-        .focused($receivesRemoteCommands)
+        .statusBarHidden(true)
+        .persistentSystemOverlays(.hidden)
         .onAppear {
-            receivesRemoteCommands = true
+            UIApplication.shared.isIdleTimerDisabled = true
             controller.play()
+            scheduleAutoHide()
         }
         .onDisappear {
-            chromeAutoHideTask?.cancel()
+            UIApplication.shared.isIdleTimerDisabled = false
+            autoHideTask?.cancel()
             closePlayback()
         }
-        .onTapGesture {
-            guard !isSubtitlePickerPresented else { return }
-            if isPlaybackChromeVisible {
-                controller.togglePlayback()
-            }
-            revealPlaybackChrome()
-        }
-        .onPlayPauseCommand {
-            guard !isSubtitlePickerPresented else { return }
-            controller.togglePlayback()
-            revealPlaybackChrome()
-        }
-        .onMoveCommand { direction in
-            guard !isSubtitlePickerPresented else { return }
-            switch direction {
-            case .left:
-                revealPlaybackChrome(autoHide: false)
-                controller.jump(by: -30)
-            case .right:
-                revealPlaybackChrome(autoHide: false)
-                controller.jump(by: 30)
-            case .up, .down:
-                guard !controller.subtitleOptions.isEmpty else {
-                    revealPlaybackChrome()
-                    return
-                }
-                revealPlaybackChrome(autoHide: false)
-                receivesRemoteCommands = false
-                withAnimation(.easeOut(duration: 0.2)) {
-                    isSubtitlePickerPresented = true
-                }
-            default:
-                break
-            }
-        }
         .onChange(of: controller.isPlaying) { _, _ in
-            synchronizePlaybackChrome()
+            synchronizeChrome()
         }
         .onChange(of: controller.isWaiting) { _, _ in
-            synchronizePlaybackChrome()
+            synchronizeChrome()
         }
         .onChange(of: controller.isSeeking) { _, _ in
-            synchronizePlaybackChrome()
-        }
-        .onExitCommand {
-            if isSubtitlePickerPresented {
-                closeSubtitlePicker()
-            } else {
-                closePlayback()
-                dismiss()
-            }
+            synchronizeChrome()
         }
         .task {
             while !Task.isCancelled {
@@ -178,101 +117,224 @@ struct PlayerView: View {
         }
     }
 
-    private var isPlaybackChromePresented: Bool {
-        isPlaybackChromeVisible || isSubtitlePickerPresented
+    private var chrome: some View {
+        VStack(spacing: 0) {
+            topBar
+            Spacer()
+            bottomBar
+        }
     }
 
-    private var controls: some View {
-        VStack(alignment: .leading, spacing: 15) {
-            HStack {
-                Text(movie.title)
-                    .font(.title2.weight(.bold))
-                Spacer()
-                VStack(alignment: .trailing, spacing: 7) {
-                    Label(
-                        controller.stateLabel,
-                        systemImage: controller.isPlaying ? "pause.fill" : "play.fill"
-                    )
-                    Label(
-                        controller.selectedSubtitle?.displayName
-                            ?? (controller.subtitleOptions.isEmpty ? "No Text Subtitles" : "Subtitles Off"),
-                        systemImage: "captions.bubble"
-                    )
-                    .font(.footnote)
+    private var topBar: some View {
+        HStack(spacing: 14) {
+            Button {
+                closePlayback()
+                dismiss()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.headline.weight(.bold))
+                    .frame(width: 44, height: 44)
+                    .background(.black.opacity(0.52), in: Circle())
+            }
+            .accessibilityLabel("Close player")
+
+            Text(movie.title)
+                .font(.headline)
+                .lineLimit(1)
+
+            Spacer()
+
+            Menu {
+                if controller.subtitleOptions.isEmpty {
+                    Button("No compatible text subtitles in this release") {}
+                        .disabled(true)
+                } else {
+                    Button {
+                        controller.selectSubtitle(nil)
+                        revealChrome()
+                    } label: {
+                        subtitleLabel("Off", selected: controller.selectedSubtitle == nil)
+                    }
+                    Divider()
+                    ForEach(controller.subtitleOptions) { track in
+                        Button {
+                            controller.selectSubtitle(track)
+                            revealChrome()
+                        } label: {
+                            subtitleLabel(
+                                track.mobileDisplayName,
+                                selected: controller.selectedSubtitle?.index == track.index
+                            )
+                        }
+                    }
                 }
-                .foregroundStyle(Color.teaMuted)
+            } label: {
+                Image(systemName: "captions.bubble")
+                    .font(.headline)
+                    .frame(width: 44, height: 44)
+                    .background(.black.opacity(0.52), in: Circle())
+            }
+            .accessibilityLabel("Subtitles")
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 16)
+        .padding(.top, 10)
+        .padding(.bottom, 30)
+        .background(
+            LinearGradient(
+                colors: [.black.opacity(0.82), .clear],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
+    }
+
+    private var bottomBar: some View {
+        VStack(alignment: .leading, spacing: 13) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(controller.stateLabel)
+                        .font(.subheadline.weight(.semibold))
+                    if let subtitle = controller.selectedSubtitle {
+                        Text(subtitle.mobileDisplayName)
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.62))
+                            .lineLimit(1)
+                    }
+                }
+                Spacer()
             }
 
-            ProgressView(
-                value: controller.positionSeconds,
-                total: max(controller.durationSeconds, 1)
+            Slider(
+                value: Binding(
+                    get: { scrubPosition ?? controller.positionSeconds },
+                    set: { scrubPosition = $0 }
+                ),
+                in: 0...max(controller.durationSeconds, 1),
+                onEditingChanged: handleScrubbing
             )
-            .tint(Color.teaAccent)
+            .tint(Color.mobileTeaAccent)
 
             HStack {
-                Text(formatTime(controller.positionSeconds))
+                Text(formatTime(scrubPosition ?? controller.positionSeconds))
                 Spacer()
                 Text(formatTime(controller.durationSeconds))
             }
-            .font(.footnote.monospacedDigit())
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.white.opacity(0.72))
+
+            HStack(spacing: 30) {
+                Spacer()
+                playerButton(systemImage: "gobackward.30", label: "Back 30 seconds") {
+                    controller.jump(by: -30)
+                    revealChrome()
+                }
+                playerButton(
+                    systemImage: controller.isPlaying ? "pause.fill" : "play.fill",
+                    label: controller.isPlaying ? "Pause" : "Play",
+                    prominent: true
+                ) {
+                    controller.togglePlayback()
+                    revealChrome()
+                }
+                playerButton(systemImage: "goforward.30", label: "Forward 30 seconds") {
+                    controller.jump(by: 30)
+                    revealChrome()
+                }
+                Spacer()
+            }
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 20)
+        .padding(.top, 42)
+        .padding(.bottom, 16)
+        .background(
+            LinearGradient(
+                colors: [.clear, .black.opacity(0.88)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
+    }
+
+    private func playerButton(
+        systemImage: String,
+        label: String,
+        prominent: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: prominent ? 25 : 21, weight: .semibold))
+                .frame(width: prominent ? 58 : 48, height: prominent ? 58 : 48)
+                .background(
+                    prominent ? Color.mobileTeaAccent : Color.white.opacity(0.14),
+                    in: Circle()
+                )
+                .foregroundStyle(prominent ? Color.mobileTeaBackground : .white)
+        }
+        .accessibilityLabel(label)
+    }
+
+    private func subtitleLabel(_ title: String, selected: Bool) -> some View {
+        HStack {
+            Text(title)
+            if selected {
+                Image(systemName: "checkmark")
+            }
         }
     }
 
-    private func revealPlaybackChrome(autoHide: Bool = true) {
-        chromeAutoHideTask?.cancel()
-        chromeAutoHideTask = nil
-        withAnimation(.easeOut(duration: 0.22)) {
-            isPlaybackChromeVisible = true
+    private func handleScrubbing(_ isEditing: Bool) {
+        if isEditing {
+            autoHideTask?.cancel()
+            if scrubPosition == nil {
+                scrubPosition = controller.positionSeconds
+            }
+            return
+        }
+        guard let target = scrubPosition else { return }
+        scrubPosition = nil
+        controller.seek(to: target)
+        revealChrome(autoHide: false)
+    }
+
+    private func revealChrome(autoHide: Bool = true) {
+        autoHideTask?.cancel()
+        withAnimation(.easeOut(duration: 0.18)) {
+            isChromeVisible = true
         }
         if autoHide {
-            schedulePlaybackChromeAutoHide()
+            scheduleAutoHide()
         }
     }
 
-    private func schedulePlaybackChromeAutoHide() {
-        chromeAutoHideTask?.cancel()
-        chromeAutoHideTask = nil
-        guard isPlaybackChromeVisible,
-              !isSubtitlePickerPresented,
+    private func scheduleAutoHide() {
+        autoHideTask?.cancel()
+        guard isChromeVisible,
               controller.isPlaying,
               !controller.isWaiting,
               !controller.isSeeking else {
             return
         }
-        chromeAutoHideTask = Task { @MainActor in
+        autoHideTask = Task { @MainActor in
             do {
                 try await Task.sleep(for: .seconds(4))
             } catch {
                 return
             }
-            guard controller.isPlaying,
-                  !controller.isWaiting,
-                  !controller.isSeeking,
-                  !isSubtitlePickerPresented else {
-                return
+            guard controller.isPlaying, !controller.isWaiting, !controller.isSeeking else { return }
+            withAnimation(.easeOut(duration: 0.25)) {
+                isChromeVisible = false
             }
-            withAnimation(.easeOut(duration: 0.28)) {
-                isPlaybackChromeVisible = false
-            }
-            chromeAutoHideTask = nil
         }
     }
 
-    private func synchronizePlaybackChrome() {
+    private func synchronizeChrome() {
         if controller.isSeeking || (!controller.isPlaying && !controller.isWaiting) {
-            revealPlaybackChrome(autoHide: false)
-        } else if isPlaybackChromeVisible {
-            schedulePlaybackChromeAutoHide()
-        }
-    }
-
-    private func closeSubtitlePicker() {
-        withAnimation(.easeOut(duration: 0.18)) {
-            isSubtitlePickerPresented = false
-        }
-        Task { @MainActor in
-            receivesRemoteCommands = true
-            schedulePlaybackChromeAutoHide()
+            revealChrome(autoHide: false)
+        } else if isChromeVisible {
+            scheduleAutoHide()
         }
     }
 
@@ -320,196 +382,27 @@ struct PlayerView: View {
     }
 }
 
-private extension HLSSubtitleTrack {
-    var displayName: String {
-        let languageName: String
-        if let language, !language.isEmpty {
-            languageName = Locale.current.localizedString(forLanguageCode: language)?.capitalized
-                ?? language.uppercased()
-        } else {
-            languageName = "Unknown Language"
-        }
-        if let title, !title.isEmpty {
-            return "\(languageName) (\(title))"
-        }
-        if isForced == true {
-            return "\(languageName) (Forced)"
-        }
-        return languageName
-    }
-}
-
-private struct SubtitleOptionButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .opacity(configuration.isPressed ? 0.82 : 1)
-            .scaleEffect(configuration.isPressed ? 0.985 : 1)
-            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
-    }
-}
-
-private struct SubtitlePicker: View {
-    let tracks: [HLSSubtitleTrack]
-    let selected: HLSSubtitleTrack?
-    let onSelect: (HLSSubtitleTrack?) -> Void
-    let onDismiss: () -> Void
-
-    @FocusState private var focusedOption: Int?
-
-    private var listHeight: CGFloat {
-        min(CGFloat(tracks.count + 1) * 76, 520)
-    }
-
-    var body: some View {
-        ZStack(alignment: .trailing) {
-            Color.black.opacity(0.34)
-                .ignoresSafeArea()
-
-            VStack(alignment: .leading, spacing: 20) {
-                HStack(spacing: 14) {
-                    Image(systemName: "captions.bubble.fill")
-                        .foregroundStyle(Color.teaAccentLight)
-                    Text("Subtitles")
-                        .font(.system(size: 34, weight: .bold, design: .rounded))
-                }
-
-                Text("Choose a track")
-                    .font(.headline)
-                    .foregroundStyle(.white.opacity(0.55))
-
-                ScrollView {
-                    LazyVStack(spacing: 8) {
-                        optionRow(id: -1, title: "Off", isSelected: selected == nil) {
-                            onSelect(nil)
-                        }
-                        ForEach(tracks) { track in
-                            optionRow(
-                                id: track.index,
-                                title: displayName(for: track),
-                                isSelected: selected?.index == track.index
-                            ) {
-                                onSelect(track)
-                            }
-                        }
-                    }
-                }
-                .frame(height: listHeight)
-                .scrollIndicators(.hidden)
-            }
-            .padding(34)
-            .frame(width: 570)
-            .background(
-                LinearGradient(
-                    colors: [Color.teaPanelElevated, Color.teaBackground.opacity(0.98)],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                ),
-                in: RoundedRectangle(cornerRadius: 26, style: .continuous)
-            )
-            .overlay {
-                RoundedRectangle(cornerRadius: 26, style: .continuous)
-                    .stroke(Color.teaAccent.opacity(0.2), lineWidth: 1)
-            }
-            .shadow(color: .black.opacity(0.6), radius: 38, x: -12)
-            .padding(.trailing, 68)
-        }
-        .onExitCommand(perform: onDismiss)
-        .task {
-            focusedOption = selected?.index ?? -1
-        }
-    }
-
-    private func displayName(for track: HLSSubtitleTrack) -> String {
-        let matching = tracks.filter { $0.displayName == track.displayName }
-        guard matching.count > 1,
-              let position = matching.firstIndex(where: { $0.index == track.index }),
-              position > 0 else {
-            return track.displayName
-        }
-        return "\(track.displayName) \(position + 1)"
-    }
-
-    private func optionRow(
-        id: Int,
-        title: String,
-        isSelected: Bool,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            HStack(spacing: 16) {
-                Capsule()
-                    .fill(focusedOption == id ? Color.teaAccent : .clear)
-                    .frame(width: 4, height: 32)
-                Text(title)
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(Color.teaCream)
-                    .lineLimit(1)
-                Spacer()
-                if isSelected {
-                    Image(systemName: "checkmark")
-                        .font(.headline.weight(.bold))
-                        .foregroundStyle(Color.teaAccentLight)
-                }
-            }
-            .padding(.horizontal, 16)
-            .frame(height: 66)
-            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .background(
-                focusedOption == id ? Color.teaAccent.opacity(0.14) : Color.clear,
-                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
-            )
-            .overlay {
-                if focusedOption == id {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(Color.teaAccentLight.opacity(0.22), lineWidth: 1)
-                }
-            }
-        }
-        .buttonStyle(SubtitleOptionButtonStyle())
-        .focusEffectDisabled()
-        .focused($focusedOption, equals: id)
-    }
-}
-
-private struct PlaybackLoadingIndicator: View {
-    @State private var isRotating = false
-
-    var body: some View {
-        Circle()
-            .trim(from: 0.08, to: 0.82)
-            .stroke(
-                Color.teaAccent,
-                style: StrokeStyle(lineWidth: 7, lineCap: .round)
-            )
-            .frame(width: 68, height: 68)
-            .rotationEffect(.degrees(isRotating ? 360 : 0))
-            .shadow(color: .black.opacity(0.65), radius: 12)
-            .animation(
-                .linear(duration: 0.9).repeatForever(autoreverses: false),
-                value: isRotating
-            )
-            .onAppear {
-                isRotating = true
-            }
-            .accessibilityLabel("Buffering")
-    }
-}
-
-private struct NativePlayerSurface: UIViewRepresentable {
+private struct IOSPlayerSurface: UIViewRepresentable {
     let player: AVPlayer
 
-    func makeUIView(context: Context) -> PlayerViewSurface {
-        let view = PlayerViewSurface()
+    func makeUIView(context: Context) -> IOSPlayerSurfaceView {
+        let view = IOSPlayerSurfaceView()
         view.player = player
         return view
     }
 
-    func updateUIView(_ view: PlayerViewSurface, context: Context) {
-        view.player = player
+    func updateUIView(_ view: IOSPlayerSurfaceView, context: Context) {
+        if view.player !== player {
+            view.player = player
+        }
+    }
+
+    static func dismantleUIView(_ view: IOSPlayerSurfaceView, coordinator: Void) {
+        view.player = nil
     }
 }
 
-private final class PlayerViewSurface: UIView {
+private final class IOSPlayerSurfaceView: UIView {
     override class var layerClass: AnyClass { AVPlayerLayer.self }
 
     var player: AVPlayer? {
@@ -532,8 +425,27 @@ private final class PlayerViewSurface: UIView {
     }
 }
 
+private extension HLSSubtitleTrack {
+    var mobileDisplayName: String {
+        let languageName: String
+        if let language, !language.isEmpty {
+            languageName = Locale.current.localizedString(forLanguageCode: language)?.capitalized
+                ?? language.uppercased()
+        } else {
+            languageName = "Unknown Language"
+        }
+        if let title, !title.isEmpty {
+            return "\(languageName) (\(title))"
+        }
+        if isForced == true {
+            return "\(languageName) (Forced)"
+        }
+        return languageName
+    }
+}
+
 @MainActor
-private final class NativePlaybackController: ObservableObject {
+private final class IOSPlaybackController: ObservableObject {
     let player = AVPlayer()
 
     @Published private(set) var positionSeconds: Double
@@ -567,11 +479,14 @@ private final class NativePlaybackController: ObservableObject {
         self.api = api
         playback = prepared.playback
         streamStartSeconds = max(0, prepared.hls.startSeconds)
-        positionSeconds = max(0, prepared.hls.startSeconds)
+        positionSeconds = streamStartSeconds
         durationSeconds = max(0, prepared.hls.durationSeconds ?? 0)
-        seekOriginSeconds = max(0, prepared.hls.startSeconds)
+        seekOriginSeconds = streamStartSeconds
         subtitleOptions = prepared.hls.subtitles ?? []
         selectedSubtitle = Self.preferredSubtitle(in: subtitleOptions)
+
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+        try? AVAudioSession.sharedInstance().setActive(true)
 
         player.automaticallyWaitsToMinimizeStalling = true
         player.actionAtItemEnd = .pause
@@ -649,37 +564,8 @@ private final class NativePlaybackController: ObservableObject {
         seek(to: origin + seconds)
     }
 
-    func selectSubtitle(_ track: HLSSubtitleTrack?) {
-        selectedSubtitle = track
-        let defaults = UserDefaults.standard
-        defaults.set(track != nil, forKey: "filmstream.subtitles.enabled")
-        defaults.set(track?.language, forKey: "filmstream.subtitles.language")
-        defaults.set(track?.title, forKey: "filmstream.subtitles.title")
-        restartSubtitleUpdates()
-    }
-
-    func stop() {
-        guard !stopped else { return }
-        stopped = true
-        seekGeneration += 1
-        seekTask?.cancel()
-        seekTask = nil
-        subtitleTask?.cancel()
-        subtitleTask = nil
-        player.pause()
-        player.isMuted = true
-        player.replaceCurrentItem(with: nil)
-        if let timeObserver {
-            player.removeTimeObserver(timeObserver)
-            self.timeObserver = nil
-        }
-        statusObservation?.invalidate()
-        statusObservation = nil
-        playbackObservation?.invalidate()
-        playbackObservation = nil
-    }
-
-    private func seek(to requestedSeconds: Double) {
+    func seek(to requestedSeconds: Double) {
+        guard !stopped, durationSeconds > 0 else { return }
         let target = min(max(0, requestedSeconds), max(0, durationSeconds - 1))
         if !isSeeking {
             seekOriginSeconds = positionSeconds
@@ -705,6 +591,35 @@ private final class NativePlaybackController: ObservableObject {
                 return
             }
         }
+    }
+
+    func selectSubtitle(_ track: HLSSubtitleTrack?) {
+        selectedSubtitle = track
+        let defaults = UserDefaults.standard
+        defaults.set(track != nil, forKey: "filmstream.subtitles.enabled")
+        defaults.set(track?.language, forKey: "filmstream.subtitles.language")
+        defaults.set(track?.title, forKey: "filmstream.subtitles.title")
+        restartSubtitleUpdates()
+    }
+
+    func stop() {
+        guard !stopped else { return }
+        stopped = true
+        seekGeneration += 1
+        seekTask?.cancel()
+        seekTask = nil
+        subtitleTask?.cancel()
+        subtitleTask = nil
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        if let timeObserver {
+            player.removeTimeObserver(timeObserver)
+            self.timeObserver = nil
+        }
+        statusObservation?.invalidate()
+        statusObservation = nil
+        playbackObservation?.invalidate()
+        playbackObservation = nil
     }
 
     private func performSeek(to target: Double, generation: Int) async {
@@ -817,7 +732,7 @@ private final class NativePlaybackController: ObservableObject {
                         self.updateActiveSubtitle()
                     }
                 } catch {
-                    // Subtitle polling is best-effort while the growing WebVTT file is written.
+                    // Subtitle polling is best-effort while the WebVTT file grows.
                 }
                 do {
                     try await Task.sleep(for: .seconds(2))
