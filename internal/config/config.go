@@ -46,6 +46,18 @@ type Metadata struct {
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 }
 
+type Usenet struct {
+	Provider              string `json:"provider,omitempty"`
+	BaseURL               string `json:"base_url,omitempty"`
+	APIKeyEnv             string `json:"api_key_env,omitempty"`
+	APIKeyFile            string `json:"api_key_file,omitempty"`
+	WebDAVUser            string `json:"webdav_user,omitempty"`
+	WebDAVPasswordEnv     string `json:"webdav_password_env,omitempty"`
+	WebDAVPasswordFile    string `json:"webdav_password_file,omitempty"`
+	Category              string `json:"category,omitempty"`
+	StartupTimeoutSeconds int    `json:"startup_timeout_seconds,omitempty"`
+}
+
 type Config struct {
 	Listen              string    `json:"listen"`
 	DataDir             string    `json:"data_dir"`
@@ -69,6 +81,7 @@ type Config struct {
 	Player              string    `json:"player"`
 	Resolver            Resolver  `json:"resolver,omitempty"`
 	Metadata            Metadata  `json:"metadata,omitempty"`
+	Usenet              Usenet    `json:"usenet,omitempty"`
 	Indexers            []Indexer `json:"indexers"`
 }
 
@@ -132,6 +145,8 @@ func Load(path string) (Config, error) {
 	cfg.FFprobePath = expandHome(cfg.FFprobePath)
 	cfg.Resolver.APIKeyFile = expandHome(cfg.Resolver.APIKeyFile)
 	cfg.Metadata.APIKeyFile = expandHome(cfg.Metadata.APIKeyFile)
+	cfg.Usenet.APIKeyFile = expandHome(cfg.Usenet.APIKeyFile)
+	cfg.Usenet.WebDAVPasswordFile = expandHome(cfg.Usenet.WebDAVPasswordFile)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -238,6 +253,20 @@ func (c Config) Validate() error {
 		}
 		if c.Metadata.TimeoutSeconds < 0 {
 			return errors.New("metadata timeout_seconds cannot be negative")
+		}
+	}
+	if c.Usenet.Provider != "" {
+		if c.Usenet.Provider != "infinidysk" {
+			return fmt.Errorf("unsupported Usenet provider %q", c.Usenet.Provider)
+		}
+		if c.Usenet.BaseURL == "" || c.Usenet.WebDAVUser == "" {
+			return errors.New("Usenet base_url and webdav_user are required")
+		}
+		if c.Usenet.Category == "" {
+			return errors.New("Usenet category is required")
+		}
+		if c.Usenet.StartupTimeoutSeconds < 0 {
+			return errors.New("Usenet startup_timeout_seconds cannot be negative")
 		}
 	}
 	for i, indexer := range c.Indexers {

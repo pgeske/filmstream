@@ -60,6 +60,31 @@ func TestTorznabCapabilitiesSearchAndResolve(t *testing.T) {
 	}
 }
 
+func TestTorznabRecognizesUsenetEnclosure(t *testing.T) {
+	configured, err := NewTorznab("test", "https://indexer.example/6/api", "secret", http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := torznabItem{Title: "Sintel.2010.1080p.WEB.H264-GROUP", GUID: "release-1"}
+	item.Enclosure.URL = "/download/1"
+	item.Enclosure.Length = "607836000"
+	item.Enclosure.Type = "application/x-nzb"
+	candidate, ok := configured.candidate(item)
+	if !ok {
+		t.Fatal("candidate was rejected")
+	}
+	if candidate.Protocol != catalog.ProtocolUsenet || candidate.NZBURL != "https://indexer.example/download/1" || candidate.TorrentURL != "" {
+		t.Fatalf("candidate = %+v", candidate)
+	}
+	source, err := configured.Resolve(context.Background(), candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source.Protocol != catalog.ProtocolUsenet || source.NZBURL != candidate.NZBURL {
+		t.Fatalf("source = %+v", source)
+	}
+}
+
 func TestTorznabHandlesProtocolError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, `<error code="100" description="Incorrect credentials"/>`)

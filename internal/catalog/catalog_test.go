@@ -33,6 +33,28 @@ func TestRankPrefersMatchingHealthySwarm(t *testing.T) {
 	}
 }
 
+func TestRankStreamingOptimizedPrefersUsenet(t *testing.T) {
+	manySeeders := 500
+	ranked := Rank(SearchRequest{
+		Query: "Sintel",
+		Year:  2010,
+		Preferences: Preferences{
+			Resolution:         "1080p",
+			Codecs:             []string{"h264"},
+			StreamingOptimized: true,
+		},
+	}, []Candidate{
+		{Name: "Sintel.2010.1080p.WEB.H264-USENET", Protocol: ProtocolUsenet},
+		{Name: "Sintel.2010.1080p.WEB.H264-TORRENT", Protocol: ProtocolTorrent, Seeders: &manySeeders},
+	})
+	if len(ranked) != 2 {
+		t.Fatalf("ranked = %+v", ranked)
+	}
+	if got := ranked[0].Candidate.Protocol; got != ProtocolUsenet {
+		t.Fatalf("top protocol = %q, want Usenet", got)
+	}
+}
+
 func TestRankStreamingOptimizedPrefersNativeFriendlyEncode(t *testing.T) {
 	manySeeders, enoughSeeders := 300, 20
 	ranked := Rank(SearchRequest{

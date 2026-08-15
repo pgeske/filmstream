@@ -24,10 +24,16 @@ type Preferences struct {
 	PreferTextSubtitles bool     `json:"prefer_text_subtitles,omitempty"`
 }
 
+const (
+	ProtocolTorrent = "torrent"
+	ProtocolUsenet  = "usenet"
+)
+
 type Candidate struct {
 	ID                   string   `json:"id"`
 	Indexer              string   `json:"indexer"`
 	Name                 string   `json:"name"`
+	Protocol             string   `json:"protocol,omitempty"`
 	Year                 int      `json:"year,omitempty"`
 	SizeBytes            int64    `json:"size_bytes,omitempty"`
 	Seeders              *int     `json:"seeders,omitempty"`
@@ -42,6 +48,7 @@ type Candidate struct {
 	Popularity           int64    `json:"popularity,omitempty"`
 	MagnetURI            string   `json:"magnet_uri,omitempty"`
 	TorrentURL           string   `json:"torrent_url,omitempty"`
+	NZBURL               string   `json:"nzb_url,omitempty"`
 }
 
 type RankedCandidate struct {
@@ -141,6 +148,10 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 			reasons = append(reasons, "preferred language")
 		}
 		if request.Preferences.StreamingOptimized {
+			if candidate.Protocol == ProtocolUsenet {
+				score += 500
+				reasons = append(reasons, "preferred Usenet source")
+			}
 			words := wordSet(normalize(candidate.Name))
 			if candidate.SizeBytes > 0 {
 				sizeGiB := float64(candidate.SizeBytes) / float64(int64(1)<<30)

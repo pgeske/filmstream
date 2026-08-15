@@ -73,6 +73,7 @@ func (i *InternetArchive) Search(ctx context.Context, request catalog.SearchRequ
 			name = doc.Identifier
 		}
 		candidates = append(candidates, catalog.Candidate{
+			Protocol:   catalog.ProtocolTorrent,
 			ID:         doc.Identifier,
 			Name:       name,
 			Year:       int(doc.Year),

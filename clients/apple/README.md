@@ -76,14 +76,14 @@ The home screens pair Continue Watching with TMDB-powered Popular Now and Top Ra
 - `GET /v1/catalog/search` for movie metadata and artwork;
 - `GET /v1/catalog/discover` for home-screen discovery sections;
 - `GET /v1/catalog/ratings` for optional IMDb and Rotten Tomatoes scores;
-- `POST /v1/playbacks` for streaming-optimized torrent selection;
+- `POST /v1/playbacks` for streaming-optimized Usenet-or-torrent selection;
 - `POST /v1/playbacks/{id}/hls` for incremental AVPlayer-compatible HLS;
 - `DELETE /v1/playbacks/{id}/hls` to stop packaging and remove temporary segments;
 - `GET /v1/watch-history?continue=true` for the home screen;
 - `PUT /v1/watch-history` to sync playback progress; and
 - `DELETE /v1/watch-history/{id}` to clear a saved resume point.
 
-The HLS backend requires FFmpeg and FFprobe. It copies compatible H.264/H.265 video without re-encoding, converts the first audio track to AAC, and paces packaging close to playback speed. It prepares an initial media buffer before opening the player and preserves audio pre-roll when seeking so copied video and transcoded audio stay synchronized. Known Dolby Vision releases are skipped initially in favor of compatible SDR or HDR10 alternatives. Streaming selection prioritizes popular releases regardless of size, penalizes remuxes, and checks ranked candidates progressively so the first strong live swarm can start without waiting for unnecessary alternatives. The server privately caches the selected torrent metadata for Continue Watching and falls back to a fresh search if the cached swarm becomes unavailable.
+The HLS backend requires FFmpeg and FFprobe. It copies compatible H.264/H.265 video without re-encoding, converts the first audio track to AAC, and paces packaging close to playback speed. It prepares an initial media buffer before opening the player and preserves audio pre-roll when seeking so copied video and transcoded audio stay synchronized. Known Dolby Vision releases are skipped initially in favor of compatible SDR or HDR10 alternatives. Streaming selection strongly prefers healthy Usenet releases, then automatically falls back to cached or newly ranked torrents. Torrent fallback prioritizes popular releases regardless of size, penalizes remuxes, and checks candidates progressively so the first strong live swarm can start without unnecessary delay. The server privately caches selected torrent metadata for Continue Watching and falls back to a fresh search if that cached swarm becomes unavailable.
 
 During tvOS playback, Center or Play/Pause toggles playback and left/right seeks 30 seconds; iPhone and Mac provide equivalent native controls and timeline scrubbing. All clients expose embedded text subtitle tracks and remember the selected language across movies and seeks. Apple playback requests prefer a live release with a usable text track, falling back to the best available release when none is available. Filmstream converts only the selected SRT, ASS/SSA, WebVTT, or other text track into a growing WebVTT sidecar in a separate paced process, so subtitle-heavy releases do not delay video startup. Resume packaging aligns subtitles to the actual preceding video keyframe. Image-based PGS/VobSub tracks require OCR and are not offered.
 

@@ -22,6 +22,7 @@ import (
 	"github.com/pgeske/filmstream/internal/playbackcache"
 	"github.com/pgeske/filmstream/internal/resolver"
 	"github.com/pgeske/filmstream/internal/torrentstream"
+	"github.com/pgeske/filmstream/internal/usenetstream"
 )
 
 type CreatePlaybackRequest struct {
@@ -34,6 +35,7 @@ type CreatePlaybackRequest struct {
 }
 
 const (
+	maxUsenetCandidates    = 3
 	maxLiveSwarmCandidates = 3
 	minimumLivePeers       = 3
 	strongLiveSwarmPeers   = 20
@@ -47,8 +49,17 @@ type CreatePlaybackResponse struct {
 	Name      string                   `json:"name"`
 	FileName  string                   `json:"file_name"`
 	FileSize  int64                    `json:"file_size"`
+	Source    string                   `json:"source"`
 	StreamURL string                   `json:"stream_url"`
 	Selected  *catalog.RankedCandidate `json:"selected,omitempty"`
+}
+
+type playbackSession struct {
+	ID       string
+	Name     string
+	FileName string
+	FileSize int64
+	Source   string
 }
 
 type catalogSection struct {
@@ -66,6 +77,15 @@ type HLSStreamManager interface {
 	Stop(string)
 }
 
+type usenetPlaybackEngine interface {
+	SetCleanupHandler(func(string, string))
+	Create(context.Context, usenetstream.Source) (*usenetstream.Session, error)
+	Get(string) (*usenetstream.Session, bool)
+	Status(string) (usenetstream.Status, bool)
+	ServeHTTP(http.ResponseWriter, *http.Request, string) error
+	Drop(string) error
+}
+
 type playbackCacheKey struct {
 	mediaID string
 	title   string
@@ -75,6 +95,7 @@ type playbackCacheKey struct {
 type Server struct {
 	indexers       *indexer.Registry
 	engine         *torrentstream.Engine
+	usenetEngine   usenetPlaybackEngine
 	defaults       catalog.Preferences
 	logger         *slog.Logger
 	reloadIndexers func() error
@@ -104,18 +125,31 @@ func New(indexers *indexer.Registry, engine *torrentstream.Engine, defaults cata
 		playbackCacheKeys: make(map[string]playbackCacheKey),
 	}
 	engine.SetCleanupHandler(func(id, _ string) {
-		server.mu.Lock()
-		delete(server.selected, id)
-		delete(server.playbackCacheKeys, id)
-		server.mu.Unlock()
-		server.hlsMu.RLock()
-		manager := server.hlsManager
-		server.hlsMu.RUnlock()
-		if manager != nil {
-			manager.Stop(id)
-		}
+		server.cleanupPlayback(id)
 	})
 	return server
+}
+
+func (s *Server) SetUsenetEngine(engine *usenetstream.Engine) {
+	s.usenetEngine = engine
+	if engine != nil {
+		engine.SetCleanupHandler(func(id, _ string) {
+			s.cleanupPlayback(id)
+		})
+	}
+}
+
+func (s *Server) cleanupPlayback(id string) {
+	s.mu.Lock()
+	delete(s.selected, id)
+	delete(s.playbackCacheKeys, id)
+	s.mu.Unlock()
+	s.hlsMu.RLock()
+	manager := s.hlsManager
+	s.hlsMu.RUnlock()
+	if manager != nil {
+		manager.Stop(id)
+	}
 }
 
 func (s *Server) SetIndexerReloader(reload func() error) {
@@ -576,49 +610,82 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var session *torrentstream.Session
+	var session *playbackSession
 	var selected *catalog.RankedCandidate
 	if request.Query != "" {
-		var err error
-		session, selected, err = s.createCachedPlayback(r.Context(), request, preferences)
-		if err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
-			return
-		}
-		if session == nil {
-			search := catalog.SearchRequest{Query: request.Query, Year: request.Year, Preferences: preferences}
+		search := catalog.SearchRequest{Query: request.Query, Year: request.Year, Preferences: preferences}
+		var ranked []catalog.RankedCandidate
+		var searchErr error
+		var usenetErr error
+
+		if s.usenetEngine != nil {
 			candidates, err := s.indexers.Search(r.Context(), search)
 			if err != nil {
-				writeError(w, http.StatusBadGateway, err.Error())
-				return
+				searchErr = err
+			} else {
+				ranked = catalog.Rank(search, candidates)
+				session, selected, usenetErr = s.createRankedUsenetPlayback(r.Context(), ranked, preferences)
 			}
-			ranked := catalog.Rank(search, candidates)
-			if len(ranked) == 0 {
-				writeError(w, http.StatusNotFound, "no matching torrent candidates found")
-				return
-			}
-			session, selected, err = s.createRankedPlayback(r.Context(), ranked, preferences)
+		}
+
+		if session == nil {
+			var err error
+			session, selected, err = s.createCachedPlayback(r.Context(), request, preferences)
 			if err != nil {
 				writeError(w, http.StatusBadGateway, err.Error())
 				return
+			}
+			if session != nil && usenetErr != nil {
+				s.logger.Warn("Usenet playback unavailable; using cached torrent", "title", request.Query, "error", usenetErr)
+			}
+		}
+		if session == nil {
+			if ranked == nil && searchErr == nil {
+				candidates, err := s.indexers.Search(r.Context(), search)
+				if err != nil {
+					searchErr = err
+				} else {
+					ranked = catalog.Rank(search, candidates)
+				}
+			}
+			if searchErr != nil {
+				writeError(w, http.StatusBadGateway, searchErr.Error())
+				return
+			}
+			if len(ranked) == 0 {
+				writeError(w, http.StatusNotFound, "no matching streaming candidates found")
+				return
+			}
+			torrentSession, torrentSelected, err := s.createRankedPlayback(r.Context(), ranked, preferences)
+			if err != nil {
+				if usenetErr != nil {
+					err = fmt.Errorf("Usenet candidates failed: %v; torrent fallback failed: %w", usenetErr, err)
+				}
+				writeError(w, http.StatusBadGateway, err.Error())
+				return
+			}
+			session = wrapTorrentSession(torrentSession)
+			selected = torrentSelected
+			if usenetErr != nil {
+				s.logger.Warn("Usenet playback unavailable; using torrent fallback", "title", request.Query, "error", usenetErr)
 			}
 		}
 	} else {
-		var err error
-		session, err = s.engine.Create(r.Context(), torrentstream.Source{
+		torrentSession, err := s.engine.Create(r.Context(), torrentstream.Source{
 			MagnetURI: request.MagnetURI, TorrentPath: request.TorrentPath,
 		})
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
 		}
+		session = wrapTorrentSession(torrentSession)
 	}
 	if selected != nil {
 		public := publicRankedCandidate(*selected)
 		selected = &public
 		s.mu.Lock()
 		s.selected[session.ID] = public
-		if request.Query != "" {
+		if request.Query != "" && session.Source == catalog.ProtocolTorrent {
 			s.playbackCacheKeys[session.ID] = playbackCacheKey{
 				mediaID: request.MediaID,
 				title:   request.Query,
@@ -628,15 +695,30 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 	}
 
-	s.logger.Info("created playback", "id", session.ID, "name", session.Name, "file", session.FileName)
+	s.logger.Info("created playback", "id", session.ID, "source", session.Source, "name", session.Name, "file", session.FileName)
 	writeJSON(w, http.StatusCreated, CreatePlaybackResponse{
 		ID:        session.ID,
 		Name:      session.Name,
 		FileName:  session.FileName,
 		FileSize:  session.FileSize,
+		Source:    session.Source,
 		StreamURL: fmt.Sprintf("%s://%s/v1/playbacks/%s/stream", requestScheme(r), r.Host, session.ID),
 		Selected:  selected,
 	})
+}
+
+func wrapTorrentSession(session *torrentstream.Session) *playbackSession {
+	return &playbackSession{
+		ID: session.ID, Name: session.Name, FileName: session.FileName,
+		FileSize: session.FileSize, Source: catalog.ProtocolTorrent,
+	}
+}
+
+func wrapUsenetSession(session *usenetstream.Session) *playbackSession {
+	return &playbackSession{
+		ID: session.ID, Name: session.Name, FileName: session.FileName,
+		FileSize: session.FileSize, Source: catalog.ProtocolUsenet,
+	}
 }
 
 type playbackOption struct {
@@ -649,7 +731,7 @@ func (s *Server) createCachedPlayback(
 	ctx context.Context,
 	request CreatePlaybackRequest,
 	preferences catalog.Preferences,
-) (*torrentstream.Session, *catalog.RankedCandidate, error) {
+) (*playbackSession, *catalog.RankedCandidate, error) {
 	if s.playbackCache == nil {
 		return nil, nil, nil
 	}
@@ -703,7 +785,7 @@ func (s *Server) createCachedPlayback(
 	s.logger.Info("reused cached playback selection", "id", session.ID,
 		"name", cached.Selected.Candidate.Name, "live_peers", options[strong].peers)
 	selected := cached.Selected
-	return session, &selected, nil
+	return wrapTorrentSession(session), &selected, nil
 }
 
 func (s *Server) cacheSuccessfulPlayback(id string) {
@@ -742,11 +824,94 @@ func (s *Server) invalidateCachedPlayback(id string) {
 	}
 }
 
+func (s *Server) createRankedUsenetPlayback(
+	ctx context.Context,
+	ranked []catalog.RankedCandidate,
+	preferences catalog.Preferences,
+) (*playbackSession, *catalog.RankedCandidate, error) {
+	if s.usenetEngine == nil {
+		return nil, nil, nil
+	}
+	attempts := 0
+	var failures []string
+	var fallbackSession *usenetstream.Session
+	var fallbackCandidate *catalog.RankedCandidate
+	for _, candidate := range ranked {
+		if candidate.Candidate.Protocol != catalog.ProtocolUsenet && candidate.Candidate.NZBURL == "" {
+			continue
+		}
+		if attempts >= maxUsenetCandidates {
+			break
+		}
+		attempts++
+		resolved, err := s.indexers.Resolve(ctx, candidate.Candidate)
+		if err == nil {
+			var session *usenetstream.Session
+			session, err = s.usenetEngine.Create(ctx, usenetstream.Source{
+				NZBURL: resolved.NZBURL, Name: candidate.Candidate.Name,
+			})
+			if err == nil {
+				if !preferences.PreferTextSubtitles {
+					s.logger.Info("selected Usenet playback", "id", session.ID, "name", candidate.Candidate.Name)
+					return wrapUsenetSession(session), &candidate, nil
+				}
+				hasTextSubtitles, probeErr := s.playbackHasTextSubtitles(ctx, session.ID)
+				if probeErr != nil {
+					s.logger.Warn("probe Usenet playback subtitles", "id", session.ID,
+						"name", candidate.Candidate.Name, "error", probeErr)
+				} else if hasTextSubtitles {
+					if fallbackSession != nil {
+						_ = s.usenetEngine.Drop(fallbackSession.ID)
+					}
+					s.logger.Info("selected Usenet playback with text subtitles",
+						"id", session.ID, "name", candidate.Candidate.Name)
+					return wrapUsenetSession(session), &candidate, nil
+				}
+				if fallbackSession == nil {
+					fallbackSession = session
+					fallback := candidate
+					fallbackCandidate = &fallback
+				} else {
+					_ = s.usenetEngine.Drop(session.ID)
+				}
+				continue
+			}
+		}
+		if ctx.Err() != nil {
+			if fallbackSession != nil {
+				_ = s.usenetEngine.Drop(fallbackSession.ID)
+			}
+			return nil, nil, ctx.Err()
+		}
+		failures = append(failures, fmt.Sprintf("%s: %v", candidate.Candidate.Name, err))
+	}
+	if fallbackSession != nil {
+		s.logger.Warn("no Usenet candidate exposed text subtitles; using best available release",
+			"id", fallbackSession.ID, "name", fallbackCandidate.Candidate.Name)
+		return wrapUsenetSession(fallbackSession), fallbackCandidate, nil
+	}
+	if len(failures) > 0 {
+		return nil, nil, errors.New(strings.Join(failures, "; "))
+	}
+	return nil, nil, nil
+}
+
 func (s *Server) createRankedPlayback(
 	ctx context.Context,
 	ranked []catalog.RankedCandidate,
 	preferences catalog.Preferences,
 ) (*torrentstream.Session, *catalog.RankedCandidate, error) {
+	torrents := make([]catalog.RankedCandidate, 0, len(ranked))
+	for _, candidate := range ranked {
+		if candidate.Candidate.Protocol == catalog.ProtocolUsenet || candidate.Candidate.NZBURL != "" {
+			continue
+		}
+		torrents = append(torrents, candidate)
+	}
+	if len(torrents) == 0 {
+		return nil, nil, errors.New("no usable torrent candidates found")
+	}
+	ranked = torrents
 	attempts := 1
 	if preferences.StreamingOptimized {
 		attempts = min(maxLiveSwarmCandidates, len(ranked))
@@ -944,41 +1109,78 @@ func (s *Server) dropPlaybackOptions(options []playbackOption) {
 func publicRankedCandidate(candidate catalog.RankedCandidate) catalog.RankedCandidate {
 	candidate.Candidate.MagnetURI = ""
 	candidate.Candidate.TorrentURL = ""
+	candidate.Candidate.NZBURL = ""
 	return candidate
 }
 
 func (s *Server) playbackStatus(w http.ResponseWriter, r *http.Request) {
-	status, ok := s.engine.Status(r.PathValue("id"))
-	if !ok {
-		writeError(w, http.StatusNotFound, "playback not found")
-		return
-	}
-	type response struct {
-		torrentstream.Status
-		Selected *catalog.RankedCandidate `json:"selected,omitempty"`
-	}
+	id := r.PathValue("id")
 	var selected *catalog.RankedCandidate
 	s.mu.RLock()
-	if value, ok := s.selected[status.ID]; ok {
+	if value, ok := s.selected[id]; ok {
 		copy := value
 		selected = &copy
 	}
 	s.mu.RUnlock()
-	writeJSON(w, http.StatusOK, response{Status: status, Selected: selected})
+
+	if status, ok := s.engine.Status(id); ok {
+		type response struct {
+			torrentstream.Status
+			Source   string                   `json:"source"`
+			Selected *catalog.RankedCandidate `json:"selected,omitempty"`
+		}
+		writeJSON(w, http.StatusOK, response{Status: status, Source: catalog.ProtocolTorrent, Selected: selected})
+		return
+	}
+	if s.usenetEngine != nil {
+		if status, ok := s.usenetEngine.Status(id); ok {
+			type response struct {
+				usenetstream.Status
+				Selected *catalog.RankedCandidate `json:"selected,omitempty"`
+			}
+			writeJSON(w, http.StatusOK, response{Status: status, Selected: selected})
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, "playback not found")
 }
 
 func (s *Server) streamPlayback(w http.ResponseWriter, r *http.Request) {
-	if err := s.engine.ServeHTTP(w, r, r.PathValue("id")); err != nil {
-		if errors.Is(err, context.Canceled) {
+	id := r.PathValue("id")
+	var err error
+	if _, ok := s.engine.Get(id); ok {
+		err = s.engine.ServeHTTP(w, r, id)
+	} else if s.usenetEngine != nil {
+		if _, ok := s.usenetEngine.Get(id); ok {
+			err = s.usenetEngine.ServeHTTP(w, r, id)
+		} else {
+			err = errors.New("playback not found")
+		}
+	} else {
+		err = errors.New("playback not found")
+	}
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, r.Context().Err()) {
 			return
 		}
 		writeError(w, http.StatusNotFound, err.Error())
 	}
 }
 
+func (s *Server) playbackExists(id string) bool {
+	if _, ok := s.engine.Get(id); ok {
+		return true
+	}
+	if s.usenetEngine != nil {
+		_, ok := s.usenetEngine.Get(id)
+		return ok
+	}
+	return false
+}
+
 func (s *Server) startHLSPlayback(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, ok := s.engine.Get(id); !ok {
+	if !s.playbackExists(id) {
 		writeError(w, http.StatusNotFound, "playback not found")
 		return
 	}

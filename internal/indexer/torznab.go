@@ -162,10 +162,13 @@ func (t *Torznab) Search(ctx context.Context, request catalog.SearchRequest) ([]
 }
 
 func (t *Torznab) Resolve(_ context.Context, candidate catalog.Candidate) (Source, error) {
-	if candidate.MagnetURI == "" && candidate.TorrentURL == "" {
-		return Source{}, errors.New("Torznab candidate has no magnet or torrent URL")
+	if candidate.MagnetURI == "" && candidate.TorrentURL == "" && candidate.NZBURL == "" {
+		return Source{}, errors.New("Torznab candidate has no downloadable source")
 	}
-	return Source{MagnetURI: candidate.MagnetURI, TorrentURL: candidate.TorrentURL}, nil
+	return Source{
+		Protocol: candidate.Protocol, MagnetURI: candidate.MagnetURI,
+		TorrentURL: candidate.TorrentURL, NZBURL: candidate.NZBURL,
+	}, nil
 }
 
 func (t *Torznab) candidate(item torznabItem) (catalog.Candidate, bool) {
@@ -187,12 +190,16 @@ func (t *Torznab) candidate(item torznabItem) (catalog.Candidate, bool) {
 	candidate := catalog.Candidate{
 		ID:           firstNonempty(item.GUID, attributes["infohash"], item.Title),
 		Name:         item.Title,
+		Protocol:     catalog.ProtocolTorrent,
 		SizeBytes:    parseInt64(firstNonempty(attributes["size"], item.Enclosure.Length)),
 		Year:         int(parseInt64(attributes["year"])),
 		ReleaseGroup: firstNonempty(attributes["releasegroup"], attributes["group"]),
 	}
 	if strings.HasPrefix(download, "magnet:") {
 		candidate.MagnetURI = download
+	} else if strings.Contains(strings.ToLower(item.Enclosure.Type), "nzb") || strings.EqualFold(attributes["protocol"], catalog.ProtocolUsenet) {
+		candidate.Protocol = catalog.ProtocolUsenet
+		candidate.NZBURL = download
 	} else {
 		candidate.TorrentURL = download
 	}
@@ -243,6 +250,7 @@ type torznabItem struct {
 	Enclosure struct {
 		URL    string `xml:"url,attr"`
 		Length string `xml:"length,attr"`
+		Type   string `xml:"type,attr"`
 	} `xml:"enclosure"`
 	Attributes []struct {
 		Name  string `xml:"name,attr"`

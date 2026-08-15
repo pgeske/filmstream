@@ -30,6 +30,7 @@ import (
 	"github.com/pgeske/filmstream/internal/playbackcache"
 	"github.com/pgeske/filmstream/internal/resolver"
 	"github.com/pgeske/filmstream/internal/torrentstream"
+	"github.com/pgeske/filmstream/internal/usenetstream"
 )
 
 const version = "0.5.7"
@@ -115,6 +116,18 @@ func runServer(args []string) error {
 	}
 	defer engine.Close()
 
+	usenetEngine, err := usenetstream.FromConfig(
+		cfg.Usenet,
+		time.Duration(cfg.IdleGraceSeconds)*time.Second,
+		logger,
+	)
+	if err != nil {
+		return err
+	}
+	if usenetEngine != nil {
+		defer usenetEngine.Close()
+	}
+
 	sourceBaseURL, err := loopbackBaseURL(cfg.Listen)
 	if err != nil {
 		return err
@@ -154,6 +167,7 @@ func runServer(args []string) error {
 		return err
 	}
 	apiServer := api.New(registry, engine, defaults, logger)
+	apiServer.SetUsenetEngine(usenetEngine)
 	apiServer.SetMovieResolver(movieResolver)
 	apiServer.SetMetadataProvider(metadataProvider)
 	apiServer.SetRatingsProvider(ratingsProvider)
@@ -196,7 +210,12 @@ func runServer(args []string) error {
 		_ = server.Shutdown(shutdownContext)
 	}()
 
-	logger.Info("filmstream server listening", "address", cfg.Listen, "data", cfg.DataDir, "torrent_listen_port", engine.ListenPort())
+	logger.Info("filmstream server listening",
+		"address", cfg.Listen,
+		"data", cfg.DataDir,
+		"torrent_listen_port", engine.ListenPort(),
+		"usenet_enabled", usenetEngine != nil,
+	)
 	err = server.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
@@ -222,7 +241,7 @@ func runPlay(args []string) error {
 	resolution := flags.String("resolution", "", "preferred resolution")
 	languages := flags.String("language", "", "comma-separated preferred languages")
 	codecs := flags.String("codecs", "", "comma-separated accepted codecs")
-	maxSize := flags.Int64("max-size-gib", 0, "maximum torrent size in GiB")
+	maxSize := flags.Int64("max-size-gib", 0, "maximum release size in GiB")
 	player := flags.String("player", "", "player executable")
 	printURL := flags.Bool("print-url", false, "print the stream URL without launching a player")
 	noAI := flags.Bool("no-ai", false, "skip natural-language movie resolution")
@@ -356,7 +375,11 @@ func runPlay(args []string) error {
 	if err := command.Run(); err != nil {
 		return err
 	}
-	fmt.Fprintln(os.Stderr, "Playback ended; Filmstream will seed and retire temporary data automatically.")
+	if response.Source == catalog.ProtocolTorrent {
+		fmt.Fprintln(os.Stderr, "Playback ended; Filmstream will seed and retire temporary data automatically.")
+	} else {
+		fmt.Fprintln(os.Stderr, "Playback ended; Filmstream will retire temporary session data automatically.")
+	}
 	return nil
 }
 
@@ -385,11 +408,23 @@ func runStatus(args []string) error {
 	if response.StatusCode != http.StatusOK {
 		return responseError(response)
 	}
-	var status torrentstream.Status
+	var status struct {
+		torrentstream.Status
+		Source string `json:"source"`
+	}
 	if err := json.NewDecoder(response.Body).Decode(&status); err != nil {
 		return err
 	}
-	fmt.Printf("%s\nfile: %s\nstate: %s\nstreamed: %.1f%%\nstored: %s\npeers: %d\nratio: %.3f / %.3f\n",
+	if status.Source == catalog.ProtocolUsenet {
+		fmt.Printf("%s\nfile: %s\nsource: Usenet\nstate: %s\nstreamed: %s\n",
+			status.Name,
+			status.FileName,
+			status.State,
+			formatBytes(status.DownloadedBytes),
+		)
+		return nil
+	}
+	fmt.Printf("%s\nfile: %s\nsource: torrent\nstate: %s\nstreamed: %.1f%%\nstored: %s\npeers: %d\nratio: %.3f / %.3f\n",
 		status.Name,
 		status.FileName,
 		status.State,
@@ -517,7 +552,7 @@ func percent(part, total int64) float64 {
 }
 
 func printUsage() {
-	fmt.Print(`filmstream streams authorized torrent media to a local player.
+	fmt.Print(`filmstream streams authorized Usenet or torrent media to a local player.
 
 Usage:
   filmstream                         # open the TUI

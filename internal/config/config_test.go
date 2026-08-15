@@ -66,6 +66,21 @@ func TestSaveUsesPrivatePermissions(t *testing.T) {
 	}
 }
 
+func TestUsenetConfigurationValidation(t *testing.T) {
+	cfg := Defaults()
+	cfg.Usenet = Usenet{
+		Provider: "infinidysk", BaseURL: "http://infinidysk:3000",
+		WebDAVUser: "filmstream", Category: "movies", StartupTimeoutSeconds: 120,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Usenet.Provider = "unknown"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected unsupported Usenet provider error")
+	}
+}
+
 func TestLoadOverlaysDefaults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"readahead_mib":64,"indexers":[]}`), 0o644); err != nil {

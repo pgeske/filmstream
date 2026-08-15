@@ -1,8 +1,8 @@
 # filmstream
 
-`filmstream` is a local Go service that streams authorized torrent media to MPV over HTTP. It can search pluggable indexers, rank releases deterministically, or bypass discovery and play a supplied magnet URI or `.torrent` file.
+`filmstream` is a local Go service that streams authorized media from Usenet or BitTorrent to MPV and native Apple clients over HTTP. It searches pluggable indexers, prefers seekable Usenet releases when configured, falls back to live torrent swarms, and can bypass discovery with a supplied magnet URI or `.torrent` file.
 
-Use it only with media you are authorized to download and share.
+Use it only with media you are authorized to access, download, or share.
 
 ## Current MVP
 
@@ -11,7 +11,9 @@ Use it only with media you are authorized to download and share.
 - TeaStream, cozy native iPhone, Apple TV, and Mac clients with poster search, movie details, selectable subtitles, AVPlayer HLS playback, and shared progress
 - One-command CLI that starts the backend when needed and launches MPV
 - A small, trusted open-movie catalog plus an Internet Archive reference indexer
-- Standard Torznab indexers, including Prowlarr and Jackett endpoints
+- Standard Torznab indexers, including Prowlarr and Jackett endpoints for both NZBs and torrents
+- On-demand Usenet streaming through InfiniDysk, including HTTP Range seeking and virtual RAR/7z access
+- Automatic torrent fallback when Usenet preparation or article retrieval fails
 - Optional natural-language movie resolution through OpenAI-compatible models
 - Release ranking by title, year, resolution, language, codec, size, seeders, and leechers
 - Direct magnet and `.torrent` playback
@@ -109,7 +111,7 @@ make tvos-build
 make macos-build
 ```
 
-Install signed development builds with `make ios-install` or `make tvos-install`. The apps use the server for catalog search, TMDB-powered Popular Now and Top Rated discovery rails, optional IMDb and Rotten Tomatoes scores from OMDb, torrent preparation, and durable watch progress. Discovery excludes upcoming and theater-only titles by requiring an existing digital, physical, or TV release. See [`clients/apple/README.md`](clients/apple/README.md) for project generation, builds, device installation, metadata providers, and networking details.
+Install signed development builds with `make ios-install` or `make tvos-install`. The apps use the server for catalog search, TMDB-powered Popular Now and Top Rated discovery rails, optional IMDb and Rotten Tomatoes scores from OMDb, Usenet-or-torrent playback preparation, and durable watch progress. Discovery excludes upcoming and theater-only titles by requiring an existing digital, physical, or TV release. See [`clients/apple/README.md`](clients/apple/README.md) for project generation, builds, device installation, metadata providers, and networking details.
 
 ## Configuration
 
@@ -151,6 +153,15 @@ The optional configuration file is `~/.config/filmstream/config.json`:
     "api_key_file": "~/.config/filmstream/tmdb-api-key",
     "timeout_seconds": 30
   },
+  "usenet": {
+    "provider": "infinidysk",
+    "base_url": "http://infinidysk:3000",
+    "api_key_file": "~/.config/filmstream/infinidysk-api-key",
+    "webdav_user": "filmstream",
+    "webdav_password_file": "~/.config/filmstream/infinidysk-webdav-password",
+    "category": "movies",
+    "startup_timeout_seconds": 180
+  },
   "indexers": [
     {
       "name": "open-media",
@@ -169,6 +180,16 @@ The optional configuration file is `~/.config/filmstream/config.json`:
 Set `FILMSTREAM_CONFIG` to use another path or `FILMSTREAM_SERVER` to use an already-running backend. Set `OMDB_API_KEY` to enable the optional `GET /v1/catalog/ratings` endpoint. When a client opens movie details, the server resolves a supplied TMDB movie ID to its IMDb ID, queries OMDb, and caches successful results in memory. This avoids misses caused by localized or alternate titles, and the API key never leaves the server.
 
 Temporary torrent data is stored beneath `<data_dir>/torrents`, and temporary native-player segments are stored beneath `<hls_dir>`. Filmstream owns and clears both locations on clean startup and shutdown; do not place unrelated files there. Durable watch progress and private selected-torrent metadata are stored separately beneath `<state_dir>` with owner-only permissions.
+
+## Usenet streaming
+
+Filmstream delegates NNTP article retrieval, yEnc decoding, archive mapping, and provider failover to an internal InfiniDysk service. Filmstream downloads the selected NZB from its Torznab endpoint, submits it through the SABnzbd-compatible API, waits for the virtual media tree, selects the largest supported video, and proxies authenticated WebDAV range requests through the existing playback URL. FFprobe and FFmpeg therefore use the same seekable HTTP contract for either source.
+
+Streaming-optimized ranking gives compatible Usenet releases a strong preference. Filmstream tries several ranked NZBs before reusing a cached torrent or validating new torrent candidates. Missing articles, invalid archives, unsupported files, and Usenet timeouts fall through automatically to the torrent path.
+
+Usenet credentials belong only in InfiniDysk or an orchestrator secret. Filmstream stores only a private InfiniDysk API key and WebDAV credential; it never receives NNTP usernames or passwords. Idle Usenet sessions and their virtual mounts are removed automatically after `idle_grace_seconds`, and closing Filmstream removes any remaining managed sessions.
+
+InfiniDysk is a separate open-source component and should remain accessible only on a trusted network. Its WebDAV and SAB-compatible APIs must retain authentication even when they are cluster-internal.
 
 ## Natural-language movie resolution
 
@@ -226,7 +247,7 @@ filmstream indexer test movies
 filmstream indexer remove movies
 ```
 
-Registration calls the Torznab `t=caps` endpoint and refuses endpoints that support neither basic nor movie searches. Each configured endpoint is searched concurrently. Filmstream normalizes standard Torznab fields such as size, seeders, peers, magnet/download URL, language, release group, and upload/download volume factors before ranking candidates.
+Registration calls the Torznab `t=caps` endpoint and refuses endpoints that support neither basic nor movie searches. Each configured endpoint is searched concurrently. Filmstream identifies `application/x-nzb` enclosures as Usenet sources and normalizes standard Torznab fields such as protocol, size, seeders, peers, magnet/download URL, language, release group, and upload/download volume factors before ranking candidates.
 
 Prowlarr exposes one Torznab URL per configured indexer, conventionally `http://HOST/INDEXER_ID/api`. Register each desired endpoint separately. Filmstream does not use Prowlarr's proprietary aggregate-search API.
 
@@ -247,7 +268,7 @@ Every verified piece remains available for upload while the session is retained.
 5. Retire the oldest inactive sessions early if completed pieces exceed `cache_limit_gib`.
 6. Clear managed torrent data on server startup and shutdown, so crashes or restarts do not leave an unmanaged cache indefinitely.
 
-Active playback is never evicted, even if it temporarily exceeds the cache limit. A full watch may naturally download the full selected video, but its data is still retired by the same policy.
+Active playback is never evicted, even if it temporarily exceeds the cache limit. A full torrent watch may naturally download the full selected video, but its data is still retired by the same policy. Usenet sessions fetch only article ranges requested by the player; their virtual release metadata is deleted after the idle grace period and has no seeding lifecycle.
 
 Inspect an active session with:
 
@@ -284,7 +305,7 @@ make apple-test
 make tvos-build
 ```
 
-The end-to-end torrent test builds a local `.torrent`, loads already-authorized test bytes through the torrent engine, and verifies HTTP byte-range seeking without contacting a public swarm.
+The end-to-end torrent test builds a local `.torrent`, loads already-authorized test bytes through the torrent engine, and verifies HTTP byte-range seeking without contacting a public swarm. Usenet tests use fake NZB, SAB-compatible, WebDAV, and range-serving endpoints, so they do not contact an indexer or provider.
 
 ## Next steps
 

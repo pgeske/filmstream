@@ -14,8 +14,10 @@ import (
 )
 
 type Source struct {
+	Protocol   string `json:"protocol,omitempty"`
 	MagnetURI  string `json:"magnet_uri,omitempty"`
 	TorrentURL string `json:"torrent_url,omitempty"`
+	NZBURL     string `json:"nzb_url,omitempty"`
 }
 
 type Indexer interface {

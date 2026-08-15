@@ -38,6 +38,7 @@ func (o *OpenMedia) Search(_ context.Context, _ catalog.SearchRequest) ([]catalo
 			return nil, err
 		}
 		candidates = append(candidates, catalog.Candidate{
+			Protocol:   catalog.ProtocolTorrent,
 			ID:         item.id,
 			Name:       item.name,
 			Year:       item.year,

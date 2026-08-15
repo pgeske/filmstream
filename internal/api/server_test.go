@@ -1,9 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,13 +14,19 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/anacrolix/torrent/bencode"
+	"github.com/anacrolix/torrent/metainfo"
 	"github.com/pgeske/filmstream/internal/catalog"
+	"github.com/pgeske/filmstream/internal/config"
 	"github.com/pgeske/filmstream/internal/history"
 	"github.com/pgeske/filmstream/internal/hls"
+	"github.com/pgeske/filmstream/internal/indexer"
 	"github.com/pgeske/filmstream/internal/metadata"
 	"github.com/pgeske/filmstream/internal/resolver"
 	"github.com/pgeske/filmstream/internal/torrentstream"
+	"github.com/pgeske/filmstream/internal/usenetstream"
 )
 
 type fakeResolver struct{}
@@ -26,6 +34,42 @@ type fakeResolver struct{}
 type fakeMetadata struct{}
 
 type fakeRatings struct{}
+
+type fakeUsenetPlaybackEngine struct {
+	createdSource usenetstream.Source
+	createErr     error
+	session       *usenetstream.Session
+	cleanup       func(string, string)
+}
+
+func (f *fakeUsenetPlaybackEngine) SetCleanupHandler(handler func(string, string)) {
+	f.cleanup = handler
+}
+
+func (f *fakeUsenetPlaybackEngine) Create(_ context.Context, source usenetstream.Source) (*usenetstream.Session, error) {
+	f.createdSource = source
+	if f.createErr != nil {
+		return nil, f.createErr
+	}
+	return f.session, nil
+}
+
+func (f *fakeUsenetPlaybackEngine) Get(id string) (*usenetstream.Session, bool) {
+	return f.session, f.session != nil && f.session.ID == id
+}
+
+func (f *fakeUsenetPlaybackEngine) Status(id string) (usenetstream.Status, bool) {
+	if f.session == nil || f.session.ID != id {
+		return usenetstream.Status{}, false
+	}
+	return usenetstream.Status{ID: id, Source: catalog.ProtocolUsenet}, true
+}
+
+func (*fakeUsenetPlaybackEngine) ServeHTTP(http.ResponseWriter, *http.Request, string) error {
+	return nil
+}
+
+func (*fakeUsenetPlaybackEngine) Drop(string) error { return nil }
 
 type fakeHLSManager struct {
 	dir              string
@@ -99,6 +143,152 @@ func (fakeMetadata) Discover(_ context.Context, collection metadata.Collection) 
 
 func (fakeResolver) Resolve(_ context.Context, input string) (resolver.Result, error) {
 	return resolver.Result{Input: input, Candidates: []resolver.Candidate{{Title: "The Movie", Year: 2001, Confidence: 0.9}}}, nil
+}
+
+func TestCreatePlaybackPrefersUsenetCandidate(t *testing.T) {
+	indexerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("apikey") != "secret" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Query().Get("t") {
+		case "caps":
+			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><movie-search available="yes" supportedParams="q,year"/></searching></caps>`)
+		case "movie":
+			fmt.Fprint(w, `<?xml version="1.0"?><rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel><item><title>Sintel.2010.1080p.WEB.H264-GROUP</title><guid>release-1</guid><enclosure url="/download/1" length="607836000" type="application/x-nzb"/></item></channel></rss>`)
+		default:
+			http.Error(w, "unsupported", http.StatusBadRequest)
+		}
+	}))
+	defer indexerServer.Close()
+	registry, err := indexer.NewRegistry([]config.Indexer{{
+		Name: "usenet", Type: "torznab", Endpoint: indexerServer.URL + "/6/api", APIKey: "secret",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	torrentEngine, err := torrentstream.New(torrentstream.Config{
+		DataDir: t.TempDir(), MetadataTimeout: time.Second, CleanOnClose: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer torrentEngine.Close()
+	server := New(registry, torrentEngine, catalog.Preferences{
+		Codecs: []string{"h264", "h265"}, MaxSizeBytes: 60 << 30,
+	}, slog.Default())
+	fakeUsenet := &fakeUsenetPlaybackEngine{session: &usenetstream.Session{
+		ID: "usenet-playback", Name: "Sintel", FileName: "Sintel.mkv", FileSize: 607836000,
+	}}
+	server.usenetEngine = fakeUsenet
+	server.hlsManager = &fakeHLSManager{subtitleTracks: map[string][]hls.SubtitleTrack{
+		"usenet-playback": {{Index: 2, Language: "en"}},
+	}}
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/playbacks", strings.NewReader(
+		`{"query":"Sintel","year":2010,"preferences":{"streaming_optimized":true,"prefer_text_subtitles":true,"codecs":["h264","h265"]}}`,
+	))
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var payload CreatePlaybackResponse
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Source != catalog.ProtocolUsenet || payload.ID != "usenet-playback" {
+		t.Fatalf("payload = %+v", payload)
+	}
+	if fakeUsenet.createdSource.NZBURL != indexerServer.URL+"/download/1" {
+		t.Fatalf("source = %+v", fakeUsenet.createdSource)
+	}
+	if payload.Selected == nil || payload.Selected.Candidate.Protocol != catalog.ProtocolUsenet || payload.Selected.Candidate.NZBURL != "" {
+		t.Fatalf("selected = %+v", payload.Selected)
+	}
+}
+
+func TestCreatePlaybackFallsBackToTorrent(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentContents := createAPITestTorrent(t, dataDir)
+	indexerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/download/2" {
+			w.Header().Set("Content-Type", "application/x-bittorrent")
+			_, _ = w.Write(torrentContents)
+			return
+		}
+		switch r.URL.Query().Get("t") {
+		case "caps":
+			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><movie-search available="yes" supportedParams="q,year"/></searching></caps>`)
+		case "movie":
+			fmt.Fprint(w, `<?xml version="1.0"?><rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel>
+				<item><title>Sintel.2010.1080p.WEB.H264-USENET</title><guid>release-1</guid><enclosure url="/download/1" length="607836000" type="application/x-nzb"/></item>
+				<item><title>Sintel.2010.1080p.WEB.H264-TORRENT</title><guid>release-2</guid><enclosure url="/download/2" length="43008" type="application/x-bittorrent"/></item>
+			</channel></rss>`)
+		default:
+			http.Error(w, "unsupported", http.StatusBadRequest)
+		}
+	}))
+	defer indexerServer.Close()
+	registry, err := indexer.NewRegistry([]config.Indexer{{
+		Name: "mixed", Type: "torznab", Endpoint: indexerServer.URL + "/api",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	torrentEngine, err := torrentstream.New(torrentstream.Config{
+		DataDir: dataDir, MetadataTimeout: 5 * time.Second, CleanOnClose: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer torrentEngine.Close()
+	server := New(registry, torrentEngine, catalog.Preferences{MaxSizeBytes: 1 << 30}, slog.Default())
+	server.usenetEngine = &fakeUsenetPlaybackEngine{createErr: errors.New("articles unavailable")}
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/playbacks", strings.NewReader(
+		`{"query":"Sintel","year":2010}`,
+	))
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var payload CreatePlaybackResponse
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Source != catalog.ProtocolTorrent || payload.Selected == nil || payload.Selected.Candidate.Protocol != catalog.ProtocolTorrent {
+		t.Fatalf("payload = %+v", payload)
+	}
+}
+
+func createAPITestTorrent(t *testing.T, dataDir string) []byte {
+	t.Helper()
+	torrentDataDir := filepath.Join(dataDir, "torrents")
+	if err := os.MkdirAll(torrentDataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	videoPath := filepath.Join(torrentDataDir, "Sintel.mp4")
+	if err := os.WriteFile(videoPath, bytes.Repeat([]byte("filmstream-test"), 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	meta := metainfo.MetaInfo{}
+	meta.SetDefaults()
+	info := metainfo.Info{PieceLength: 16 << 10}
+	if err := info.BuildFromFilePath(videoPath); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	meta.InfoBytes, err = bencode.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := meta.Write(&output); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
 }
 
 func TestResolveMovie(t *testing.T) {
