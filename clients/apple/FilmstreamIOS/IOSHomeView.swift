@@ -35,14 +35,13 @@ struct IOSRootView: View {
 
 struct IOSHomeView: View {
     @Environment(IOSAppModel.self) private var model
-    @State private var removingEntryID: String?
 
     var body: some View {
         ZStack {
             MobileTeaBackground()
 
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 34) {
+                LazyVStack(alignment: .leading, spacing: 32) {
                     header
                     continueWatchingSection
                     ForEach(model.discoverySections) { section in
@@ -86,9 +85,9 @@ struct IOSHomeView: View {
 
     @ViewBuilder
     private var continueWatchingSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 12) {
             MobileSectionHeader(title: "Continue Watching")
-            .padding(.horizontal, 18)
+                .padding(.horizontal, 18)
 
             if model.isLoading && model.continueWatching.isEmpty {
                 loadingShelf
@@ -97,13 +96,16 @@ struct IOSHomeView: View {
                     .padding(.horizontal, 18)
             } else {
                 ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(alignment: .top, spacing: 15) {
+                    LazyHStack(alignment: .top, spacing: 14) {
                         ForEach(model.continueWatching) { entry in
-                            continueWatchingCard(entry)
+                            NavigationLink(value: entry.movie) {
+                                MobileMovieCard(movie: entry.movie, progress: entry.progress)
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
                     .padding(.horizontal, 18)
-                    .padding(.vertical, 4)
+                    .padding(.vertical, 5)
                 }
             }
         }
@@ -112,12 +114,12 @@ struct IOSHomeView: View {
     @ViewBuilder
     private func discoverySection(_ section: DiscoverySection) -> some View {
         if !section.items.isEmpty {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 12) {
                 MobileSectionHeader(title: section.title)
                     .padding(.horizontal, 18)
 
                 ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(alignment: .top, spacing: 15) {
+                    LazyHStack(alignment: .top, spacing: 14) {
                         ForEach(section.items) { movie in
                             NavigationLink(value: movie) {
                                 MobileMovieCard(movie: movie)
@@ -126,48 +128,9 @@ struct IOSHomeView: View {
                         }
                     }
                     .padding(.horizontal, 18)
-                    .padding(.vertical, 4)
+                    .padding(.vertical, 5)
                 }
             }
-        }
-    }
-
-    private func continueWatchingCard(_ entry: WatchHistoryEntry) -> some View {
-        ZStack(alignment: .topTrailing) {
-            NavigationLink(value: entry.movie) {
-                MobileMovieCard(movie: entry.movie, progress: entry.progress)
-            }
-            .buttonStyle(.plain)
-
-            Menu {
-                Button(role: .destructive) {
-                    Task { await remove(entry) }
-                } label: {
-                    Label("Remove from Continue Watching", systemImage: "xmark")
-                }
-            } label: {
-                ZStack {
-                    Circle()
-                        .fill(Color.mobileTeaBackground.opacity(0.86))
-                    if removingEntryID == entry.id {
-                        ProgressView()
-                            .controlSize(.small)
-                            .tint(Color.mobileTeaCream)
-                    } else {
-                        Image(systemName: "ellipsis")
-                            .font(.footnote.weight(.bold))
-                            .foregroundStyle(Color.mobileTeaCream)
-                    }
-                }
-                .frame(width: 32, height: 32)
-                .overlay {
-                    Circle()
-                        .stroke(Color.mobileTeaCream.opacity(0.16), lineWidth: 1)
-                }
-            }
-            .disabled(removingEntryID != nil)
-            .padding(8)
-            .accessibilityLabel("Options for \(entry.title)")
         }
     }
 
@@ -207,17 +170,6 @@ struct IOSHomeView: View {
         .overlay {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(Color.mobileTeaAccent.opacity(0.18), lineWidth: 1)
-        }
-    }
-
-    private func remove(_ entry: WatchHistoryEntry) async {
-        removingEntryID = entry.id
-        defer { removingEntryID = nil }
-        do {
-            try await model.removeFromContinueWatching(entry)
-            model.errorMessage = nil
-        } catch {
-            model.errorMessage = error.localizedDescription
         }
     }
 }

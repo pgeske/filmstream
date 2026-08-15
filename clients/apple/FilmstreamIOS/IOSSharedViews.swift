@@ -100,40 +100,97 @@ struct MobileSectionHeader: View {
 struct MobileMovieCard: View {
     let movie: Movie
     var progress: Double? = nil
-    var width: CGFloat = 132
+    var width: CGFloat = 286
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            MobilePosterImage(movie: movie)
-                .frame(width: width, height: width * 1.5)
+            MobileShelfArtwork(movie: movie)
+                .frame(width: width, height: width * 9 / 16)
                 .overlay {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(Color.mobileTeaCream.opacity(0.12), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: 15, style: .continuous)
+                        .stroke(Color.mobileTeaAccentLight.opacity(0.22), lineWidth: 1)
                 }
                 .overlay(alignment: .bottom) {
                     if let progress, progress > 0 {
                         ProgressView(value: progress)
                             .tint(Color.mobileTeaAccent)
-                            .padding(.horizontal, 8)
+                            .padding(.horizontal, 9)
                             .padding(.bottom, 8)
                     }
                 }
-                .shadow(color: .black.opacity(0.32), radius: 9, y: 5)
+                .shadow(color: .black.opacity(0.36), radius: 11, y: 6)
 
             Text(movie.title)
-                .font(.subheadline.weight(.semibold))
+                .font(.headline.weight(.bold))
                 .foregroundStyle(Color.mobileTeaCream)
-                .lineLimit(3)
+                .lineLimit(1)
                 .frame(width: width, alignment: .leading)
 
-            if let year = movie.year {
-                Text(String(year))
+            HStack(spacing: 6) {
+                Text("Movie")
+                if let year = movie.year {
+                    Text("•")
+                    Text(String(year))
+                }
+                if let progress, progress > 0 {
+                    Text("•")
+                    Text("\(Int(progress * 100))% watched")
+                        .foregroundStyle(Color.mobileTeaAccentLight)
+                }
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(Color.mobileTeaMuted)
+
+            if let overview = movie.overview, !overview.isEmpty {
+                Text(overview)
                     .font(.caption)
-                    .foregroundStyle(Color.mobileTeaMuted)
+                    .foregroundStyle(Color.mobileTeaCream.opacity(0.72))
+                    .lineLimit(2)
+                    .frame(width: width, alignment: .leading)
             }
         }
         .frame(width: width, alignment: .leading)
         .contentShape(Rectangle())
+    }
+}
+
+private struct MobileShelfArtwork: View {
+    let movie: Movie
+
+    var body: some View {
+        AsyncImage(url: movie.backdropURL ?? movie.posterURL) { phase in
+            switch phase {
+            case let .success(image):
+                image
+                    .resizable()
+                    .scaledToFill()
+            case .empty:
+                ZStack {
+                    Color.mobileTeaPanel
+                    ProgressView()
+                        .tint(Color.mobileTeaAccent)
+                }
+            default:
+                LinearGradient(
+                    colors: [Color.mobileTeaPanelElevated, Color.mobileTeaBackground],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .overlay {
+                    Image(systemName: "film.stack")
+                        .font(.system(size: 34))
+                        .foregroundStyle(Color.mobileTeaAccentLight.opacity(0.38))
+                }
+            }
+        }
+        .overlay {
+            LinearGradient(
+                colors: [.clear, Color.mobileTeaBackground.opacity(0.24)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
     }
 }
 
@@ -280,16 +337,55 @@ private struct MobileRatingBadge: View {
     }
 }
 
-struct MobilePrimaryButtonStyle: ButtonStyle {
+enum MobileDetailButtonKind: Equatable {
+    case prominent
+    case standard
+    case destructive
+}
+
+struct MobileDetailButtonStyle: ButtonStyle {
+    let kind: MobileDetailButtonKind
+
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.headline.weight(.bold))
-            .foregroundStyle(Color.mobileTeaBackground)
+            .foregroundStyle(foregroundColor)
+            .padding(.horizontal, 16)
             .frame(maxWidth: .infinity)
-            .frame(height: 50)
-            .background(Color.mobileTeaAccent, in: RoundedRectangle(cornerRadius: 15))
+            .frame(height: 52)
+            .background(backgroundColor, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(borderColor, lineWidth: 1)
+            }
             .opacity(configuration.isPressed ? 0.82 : 1)
             .scaleEffect(configuration.isPressed ? 0.985 : 1)
             .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+    }
+
+    private var foregroundColor: Color {
+        switch kind {
+        case .prominent:
+            return Color.mobileTeaBackground
+        case .standard:
+            return Color.mobileTeaCream
+        case .destructive:
+            return Color.mobileTeaAmber
+        }
+    }
+
+    private var backgroundColor: Color {
+        switch kind {
+        case .prominent:
+            return Color.mobileTeaAccent
+        case .standard:
+            return Color.mobileTeaPanelElevated
+        case .destructive:
+            return Color.mobileTeaBackground.opacity(0.7)
+        }
+    }
+
+    private var borderColor: Color {
+        kind == .destructive ? Color.mobileTeaAmber.opacity(0.42) : Color.mobileTeaCream.opacity(0.12)
     }
 }

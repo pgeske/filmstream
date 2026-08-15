@@ -66,7 +66,7 @@ private struct MacLibraryView: View {
             MacTeaBackground()
 
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 42) {
+                LazyVStack(alignment: .leading, spacing: 38) {
                     header
                     continueWatchingSection
                     ForEach(model.discoverySections) { section in
@@ -118,11 +118,8 @@ private struct MacLibraryView: View {
 
     @ViewBuilder
     private var continueWatchingSection: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            sectionHeader(
-                title: "Continue Watching",
-                subtitle: "Settle in and pick up where you left off"
-            )
+        VStack(alignment: .leading, spacing: 14) {
+            sectionHeader("Continue Watching")
 
             if model.isLoading && model.continueWatching.isEmpty {
                 HStack(spacing: 12) {
@@ -136,18 +133,13 @@ private struct MacLibraryView: View {
                 emptyContinueWatching
             } else {
                 ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(alignment: .top, spacing: 24) {
+                    LazyHStack(alignment: .top, spacing: 18) {
                         ForEach(model.continueWatching) { entry in
                             MacMovieCard(movie: entry.movie, progress: entry.progress)
-                                .contextMenu {
-                                    Button("Remove from Continue Watching", role: .destructive) {
-                                        Task { await removeFromContinueWatching(entry) }
-                                    }
-                                }
                         }
                     }
                     .padding(.horizontal, 3)
-                    .padding(.vertical, 12)
+                    .padding(.vertical, 10)
                 }
             }
         }
@@ -156,40 +148,26 @@ private struct MacLibraryView: View {
     @ViewBuilder
     private func discoverySection(_ section: DiscoverySection) -> some View {
         if !section.items.isEmpty {
-            VStack(alignment: .leading, spacing: 18) {
-                sectionHeader(title: section.title, subtitle: section.subtitle)
+            VStack(alignment: .leading, spacing: 14) {
+                sectionHeader(section.title)
 
                 ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(alignment: .top, spacing: 24) {
+                    LazyHStack(alignment: .top, spacing: 18) {
                         ForEach(section.items) { movie in
                             MacMovieCard(movie: movie)
                         }
                     }
                     .padding(.horizontal, 3)
-                    .padding(.vertical, 12)
+                    .padding(.vertical, 10)
                 }
             }
         }
     }
 
-    private func sectionHeader(title: String, subtitle: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.system(size: 27, weight: .bold, design: .rounded))
-                .foregroundStyle(Color.macTeaCream)
-            Text(subtitle)
-                .font(.subheadline)
-                .foregroundStyle(Color.macTeaMuted)
-        }
-    }
-
-    private func removeFromContinueWatching(_ entry: WatchHistoryEntry) async {
-        do {
-            try await model.removeFromContinueWatching(entry)
-            model.errorMessage = nil
-        } catch {
-            model.errorMessage = error.localizedDescription
-        }
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title)
+            .font(.system(size: 27, weight: .bold, design: .rounded))
+            .foregroundStyle(Color.macTeaCream)
     }
 
     private var emptyContinueWatching: some View {

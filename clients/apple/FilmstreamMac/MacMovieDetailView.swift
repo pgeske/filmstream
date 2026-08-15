@@ -7,6 +7,7 @@ struct MacMovieDetailView: View {
 
     @State private var preparedPlayback: PreparedPlayback?
     @State private var isPreparing = false
+    @State private var isRemoving = false
     @State private var errorMessage: String?
 
     private var history: WatchHistoryEntry? {
@@ -18,121 +19,100 @@ struct MacMovieDetailView: View {
     }
 
     var body: some View {
-        ZStack {
-            MacTeaBackground()
-            ScrollView {
-                VStack(spacing: 0) {
-                    backdrop
-                    detailContent
-                        .padding(.horizontal, 42)
-                        .offset(y: -92)
-                        .padding(.bottom, -48)
-                }
-            }
-        }
-        .navigationTitle(movie.title)
-        .task(id: movie.id) {
-            await model.loadRatings(for: movie)
-        }
-        .sheet(item: $preparedPlayback, onDismiss: {
-            Task { await model.loadContinueWatching() }
-        }) { prepared in
-            MacPlayerView(movie: movie, prepared: prepared, api: model.api)
-                .frame(minWidth: 900, minHeight: 580)
-        }
-    }
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                MacTeaBackground()
 
-    private var backdrop: some View {
-        MacBackdropImage(movie: movie)
-            .frame(maxWidth: .infinity)
-            .frame(height: 390)
-            .clipped()
-            .overlay {
+                MacBackdropImage(movie: movie)
+                    .frame(width: geometry.size.width, height: geometry.size.height)
+                    .clipped()
+
                 LinearGradient(
                     stops: [
-                        .init(color: .clear, location: 0.2),
-                        .init(color: Color.macTeaBackground.opacity(0.72), location: 0.72),
+                        .init(color: Color.macTeaBackground.opacity(0.98), location: 0),
+                        .init(color: Color.macTeaBackground.opacity(0.86), location: 0.38),
+                        .init(color: Color.macTeaBackground.opacity(0.18), location: 0.78),
+                        .init(color: .clear, location: 1),
+                    ],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+
+                LinearGradient(
+                    stops: [
+                        .init(color: .clear, location: 0.5),
+                        .init(color: Color.macTeaBackground.opacity(0.7), location: 0.86),
                         .init(color: Color.macTeaBackground, location: 1),
                     ],
                     startPoint: .top,
                     endPoint: .bottom
                 )
-            }
-            .overlay {
-                LinearGradient(
-                    colors: [Color.macTeaBackground.opacity(0.72), .clear],
-                    startPoint: .leading,
-                    endPoint: .trailing
-                )
-            }
-    }
 
-    private var detailContent: some View {
-        HStack(alignment: .bottom, spacing: 34) {
-            MacPosterImage(movie: movie)
-                .frame(width: 230, height: 345)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(Color.macTeaAccentLight.opacity(0.24), lineWidth: 1)
-                }
-                .shadow(color: .black.opacity(0.48), radius: 24, y: 12)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 17) {
+                        Spacer(minLength: 70)
 
-            VStack(alignment: .leading, spacing: 16) {
-                Text(movie.title)
-                    .font(.system(size: 40, weight: .bold, design: .rounded))
-                    .foregroundStyle(Color.macTeaCream)
-                    .lineLimit(2)
+                        MacTeaStreamMark(size: 40)
 
-                metadataLine
+                        Text(movie.title)
+                            .font(.system(size: 46, weight: .black, design: .rounded))
+                            .foregroundStyle(Color.macTeaCream)
+                            .lineLimit(2)
+                            .frame(maxWidth: 720, alignment: .leading)
 
-                if let overview = movie.overview, !overview.isEmpty {
-                    Text(overview)
-                        .font(.body)
-                        .foregroundStyle(Color.macTeaCream.opacity(0.84))
-                        .lineSpacing(3)
-                        .frame(maxWidth: 720, alignment: .leading)
-                }
+                        metadataLine
 
-                if let errorMessage {
-                    Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
-                        .foregroundStyle(Color.macTeaAmber)
-                        .font(.headline)
-                }
-
-                Button {
-                    Task { await preparePlayback() }
-                } label: {
-                    HStack(spacing: 9) {
-                        if isPreparing {
-                            ProgressView()
-                                .controlSize(.small)
-                                .tint(Color.macTeaBackground)
-                        } else {
-                            Image(systemName: "play.fill")
+                        if let overview = movie.overview, !overview.isEmpty {
+                            Text(overview)
+                                .font(.body)
+                                .foregroundStyle(Color.macTeaCream.opacity(0.88))
+                                .lineSpacing(4)
+                                .frame(maxWidth: 680, alignment: .leading)
                         }
-                        Text(playButtonTitle)
-                    }
-                    .font(.headline.weight(.bold))
-                }
-                .buttonStyle(MacTeaActionButtonStyle(prominent: true))
-                .disabled(isPreparing)
-                .keyboardShortcut(.defaultAction)
-            }
-            .padding(.bottom, 12)
 
-            Spacer(minLength: 0)
+                        if let errorMessage {
+                            Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(Color.macTeaAmber)
+                                .font(.headline)
+                                .frame(maxWidth: 680, alignment: .leading)
+                        }
+
+                        actionButtons
+                    }
+                    .padding(.horizontal, 46)
+                    .padding(.vertical, 36)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(width: geometry.size.width, height: geometry.size.height)
+            }
         }
-        .frame(maxWidth: 1_080, alignment: .leading)
+        .background(Color.macTeaBackground)
+        .navigationTitle(movie.title)
+        .task(id: movie.id) {
+            await model.loadRatings(for: movie)
+        }
+        .sheet(
+            item: $preparedPlayback,
+            onDismiss: {
+                Task { await model.loadContinueWatching() }
+            }
+        ) { prepared in
+            MacPlayerView(movie: movie, prepared: prepared, api: model.api)
+                .frame(minWidth: 900, minHeight: 580)
+        }
     }
 
     @ViewBuilder
     private var metadataLine: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 11) {
+            Text("Movie")
             if let year = movie.year {
+                Text("•")
                 Text(String(year))
             }
             MacMovieRatingBadges(ratings: ratings, tmdbRating: movie.voteAverage)
             if let history, history.progress > 0 {
+                Text("•")
                 Text("\(Int(history.progress * 100))% watched")
                     .foregroundStyle(Color.macTeaAccentLight)
             }
@@ -141,22 +121,94 @@ struct MacMovieDetailView: View {
         .foregroundStyle(Color.macTeaMuted)
     }
 
-    private var playButtonTitle: String {
+    private var actionButtons: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                Task { await preparePlayback(startSeconds: history?.positionSeconds ?? 0) }
+            } label: {
+                actionLabel(
+                    title: primaryButtonTitle,
+                    systemImage: "play.fill",
+                    showsProgress: isPreparing
+                )
+            }
+            .buttonStyle(MacDetailButtonStyle(kind: .prominent))
+            .disabled(isPreparing || isRemoving)
+            .keyboardShortcut(.defaultAction)
+
+            if history != nil {
+                Button {
+                    Task { await preparePlayback(startSeconds: 0) }
+                } label: {
+                    actionLabel(title: "Play from Beginning", systemImage: "arrow.counterclockwise")
+                }
+                .buttonStyle(MacDetailButtonStyle(kind: .standard))
+                .disabled(isPreparing || isRemoving)
+
+                Button(role: .destructive) {
+                    Task { await removeFromContinueWatching() }
+                } label: {
+                    actionLabel(
+                        title: isRemoving ? "Removing…" : "Remove from Continue Watching",
+                        systemImage: "xmark",
+                        showsProgress: isRemoving
+                    )
+                }
+                .buttonStyle(MacDetailButtonStyle(kind: .destructive))
+                .disabled(isPreparing || isRemoving)
+            }
+        }
+        .padding(.top, 3)
+    }
+
+    private var primaryButtonTitle: String {
         if isPreparing {
             return "Preparing Stream…"
         }
         return history == nil ? "Play" : "Resume"
     }
 
-    private func preparePlayback() async {
+    private func actionLabel(
+        title: String,
+        systemImage: String,
+        showsProgress: Bool = false
+    ) -> some View {
+        HStack(spacing: 11) {
+            if showsProgress {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Image(systemName: systemImage)
+                    .frame(width: 20)
+            }
+            Text(title)
+                .lineLimit(1)
+            Spacer()
+        }
+        .frame(width: 420)
+    }
+
+    private func preparePlayback(startSeconds: Double) async {
         isPreparing = true
         defer { isPreparing = false }
         do {
             let playback = try await model.api.createPlayback(for: movie)
             preparedPlayback = try await model.api.prepareNativePlayback(
                 playback,
-                startSeconds: history?.positionSeconds ?? 0
+                startSeconds: startSeconds
             )
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func removeFromContinueWatching() async {
+        guard let history else { return }
+        isRemoving = true
+        defer { isRemoving = false }
+        do {
+            try await model.removeFromContinueWatching(history)
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription

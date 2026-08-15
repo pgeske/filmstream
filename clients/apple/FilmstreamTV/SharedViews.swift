@@ -134,84 +134,68 @@ private struct TeaActionButtonBody: View {
     }
 }
 
-struct ContinueWatchingOptionsDialog: View {
-    let isRemoving: Bool
-    let onCancel: () -> Void
-    let onRemove: () -> Void
+enum TeaDetailButtonKind: Equatable {
+    case prominent
+    case standard
+    case destructive
+}
 
-    private enum FocusedAction: Hashable {
-        case cancel
-        case remove
+struct TeaDetailActionButtonStyle: ButtonStyle {
+    let kind: TeaDetailButtonKind
+
+    func makeBody(configuration: Configuration) -> some View {
+        TeaDetailActionButtonBody(configuration: configuration, kind: kind)
+    }
+}
+
+private struct TeaDetailActionButtonBody: View {
+    let configuration: ButtonStyle.Configuration
+    let kind: TeaDetailButtonKind
+
+    @Environment(\.isFocused) private var isFocused
+
+    private var foregroundColor: Color {
+        if isFocused || kind == .prominent {
+            return Color.teaBackground
+        }
+        return kind == .destructive ? Color.teaCream.opacity(0.9) : Color.teaCream
     }
 
-    @FocusState private var focusedAction: FocusedAction?
+    private var backgroundColor: Color {
+        if isFocused {
+            return kind == .destructive ? Color.teaAmber : Color.teaAccentLight
+        }
+        switch kind {
+        case .prominent:
+            return Color.teaAccent
+        case .standard:
+            return Color.teaPanelElevated.opacity(0.9)
+        case .destructive:
+            return Color.teaBackground.opacity(0.72)
+        }
+    }
 
     var body: some View {
-        ZStack {
-            Color.black.opacity(0.66)
-                .ignoresSafeArea()
-
-            VStack(spacing: 26) {
-                Text("Movie Options")
-                    .font(.system(size: 34, weight: .bold, design: .rounded))
-                    .foregroundStyle(Color.teaCream)
-
-                Button {
-                    onRemove()
-                } label: {
-                    VStack(spacing: 3) {
-                        if isRemoving {
-                            ProgressView()
-                                .tint(Color.teaCream)
-                        }
-                        Text(isRemoving ? "Removing…" : "Remove from Row")
-                            .font(.headline.weight(.semibold))
-                            .lineLimit(1)
-                        Text("Clears saved progress")
-                            .font(.caption)
-                            .opacity(0.68)
-                    }
-                    .frame(width: 400)
-                }
-                .buttonStyle(TeaActionButtonStyle())
-                .focusEffectDisabled()
-                .focused($focusedAction, equals: .remove)
-                .disabled(isRemoving)
-
-                Button("Done") {
-                    onCancel()
-                }
-                .font(.headline.weight(.semibold))
-                .buttonStyle(TeaActionButtonStyle())
-                .focusEffectDisabled()
-                .focused($focusedAction, equals: .cancel)
-                .disabled(isRemoving)
-            }
-            .padding(40)
-            .frame(width: 620)
-            .background(
-                LinearGradient(
-                    colors: [Color.teaPanelElevated, Color.teaPanel],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                ),
-                in: RoundedRectangle(cornerRadius: 28, style: .continuous)
-            )
+        configuration.label
+            .foregroundStyle(foregroundColor)
+            .padding(.horizontal, 22)
+            .padding(.vertical, 15)
+            .background(backgroundColor, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 28, style: .continuous)
-                    .stroke(Color.teaAccentLight.opacity(0.18), lineWidth: 1.5)
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .stroke(
+                        kind == .destructive ? Color.teaAmber.opacity(isFocused ? 0.8 : 0.42) : Color.teaCream.opacity(isFocused ? 0.52 : 0.14),
+                        lineWidth: isFocused ? 2 : 1
+                    )
             }
-            .shadow(color: .black.opacity(0.52), radius: 52, y: 24)
-        }
-        .transition(.opacity.combined(with: .scale(scale: 0.97)))
-        .task {
-            focusedAction = .cancel
-        }
-        .onExitCommand {
-            if !isRemoving {
-                onCancel()
-            }
-        }
+            .shadow(
+                color: isFocused ? Color.teaAccent.opacity(0.32) : .black.opacity(0.25),
+                radius: isFocused ? 22 : 10,
+                y: isFocused ? 10 : 5
+            )
+            .scaleEffect(configuration.isPressed ? 0.985 : isFocused ? 1.025 : 1, anchor: .leading)
+            .animation(.snappy(duration: 0.18), value: isFocused)
+            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
     }
 }
 
@@ -326,6 +310,200 @@ private struct TomatoMark: View {
     }
 }
 
+struct NetflixShelfItem: Identifiable {
+    let movie: Movie
+    var progress: Double? = nil
+
+    var id: String { movie.id }
+}
+
+struct NetflixMovieShelf: View {
+    let title: String
+    let items: [NetflixShelfItem]
+    var requestsInitialFocus = false
+
+    @State private var expandedMovieID: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title)
+                .font(.system(size: 38, weight: .bold, design: .rounded))
+                .foregroundStyle(Color.teaCream)
+
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 24) {
+                        ForEach(items) { item in
+                            NetflixShelfCard(
+                                item: item,
+                                isExpanded: expandedMovieID == item.id,
+                                requestsInitialFocus: requestsInitialFocus && item.id == items.first?.id
+                            ) { isFocused in
+                                if isFocused {
+                                    expandedMovieID = item.id
+                                    Task { @MainActor in
+                                        try? await Task.sleep(for: .milliseconds(80))
+                                        guard expandedMovieID == item.id else { return }
+                                        withAnimation(.snappy(duration: 0.26)) {
+                                            proxy.scrollTo(item.id, anchor: .leading)
+                                        }
+                                    }
+                                } else if expandedMovieID == item.id {
+                                    expandedMovieID = nil
+                                }
+                            }
+                            .id(item.id)
+                        }
+                    }
+                    .padding(.top, 12)
+                    .padding(.bottom, 18)
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .focusSection()
+    }
+}
+
+private struct NetflixShelfCard: View {
+    let item: NetflixShelfItem
+    let isExpanded: Bool
+    let requestsInitialFocus: Bool
+    let onFocusChange: (Bool) -> Void
+
+    @FocusState private var isFocused: Bool
+
+    private let artworkHeight: CGFloat = 334
+    private var cardWidth: CGFloat { isExpanded ? 632 : 223 }
+
+    var body: some View {
+        NavigationLink(value: item.movie) {
+            VStack(alignment: .leading, spacing: 12) {
+                artwork
+                    .frame(width: cardWidth, height: artworkHeight)
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .stroke(
+                                isExpanded ? Color.teaAccentLight.opacity(0.9) : Color.teaCream.opacity(0.1),
+                                lineWidth: isExpanded ? 3 : 1
+                            )
+                    }
+                    .overlay(alignment: .bottom) {
+                        if let progress = item.progress, progress > 0 {
+                            ProgressView(value: progress)
+                                .tint(Color.teaAccent)
+                                .padding(.horizontal, 12)
+                                .padding(.bottom, 10)
+                        }
+                    }
+                    .shadow(
+                        color: isExpanded ? Color.teaAccent.opacity(0.24) : .black.opacity(0.36),
+                        radius: isExpanded ? 26 : 12,
+                        y: isExpanded ? 13 : 7
+                    )
+
+                if isExpanded {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(item.movie.title)
+                            .font(.title2.weight(.bold))
+                            .foregroundStyle(Color.teaCream)
+                            .lineLimit(2)
+
+                        HStack(spacing: 8) {
+                            Text("Movie")
+                            if let year = item.movie.year {
+                                Text("•")
+                                Text(String(year))
+                            }
+                            if let progress = item.progress, progress > 0 {
+                                Text("•")
+                                Text("\(Int(progress * 100))% watched")
+                                    .foregroundStyle(Color.teaAccentLight)
+                            }
+                        }
+                        .font(.headline)
+                        .foregroundStyle(Color.teaMuted)
+
+                        if let overview = item.movie.overview, !overview.isEmpty {
+                            Text(overview)
+                                .font(.headline)
+                                .foregroundStyle(Color.teaCream.opacity(0.82))
+                                .lineLimit(2)
+                                .frame(maxWidth: cardWidth, alignment: .leading)
+                        }
+                    }
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+            }
+            .frame(width: cardWidth, alignment: .leading)
+            .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        }
+        .buttonStyle(MovieCardButtonStyle())
+        .focusEffectDisabled()
+        .focused($isFocused)
+        .zIndex(isExpanded ? 1 : 0)
+        .animation(.snappy(duration: 0.24), value: isExpanded)
+        .onChange(of: isFocused) { _, focused in
+            onFocusChange(focused)
+        }
+        .task {
+            if requestsInitialFocus {
+                isFocused = true
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var artwork: some View {
+        if isExpanded {
+            NetflixShelfArtwork(movie: item.movie, landscape: true)
+        } else {
+            PosterImage(movie: item.movie)
+        }
+    }
+}
+
+private struct NetflixShelfArtwork: View {
+    let movie: Movie
+    let landscape: Bool
+
+    var body: some View {
+        AsyncImage(url: landscape ? (movie.backdropURL ?? movie.posterURL) : (movie.posterURL ?? movie.backdropURL)) { phase in
+            switch phase {
+            case let .success(image):
+                image
+                    .resizable()
+                    .scaledToFill()
+            case .empty:
+                ZStack {
+                    Color.teaPanel
+                    ProgressView()
+                        .tint(Color.teaAccent)
+                }
+            default:
+                LinearGradient(
+                    colors: [Color.teaPanelElevated, Color.teaBackground],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .overlay {
+                    Image(systemName: "film.stack")
+                        .font(.system(size: 52))
+                        .foregroundStyle(Color.teaAccentLight.opacity(0.38))
+                }
+            }
+        }
+        .overlay {
+            LinearGradient(
+                colors: [.clear, Color.teaBackground.opacity(0.2)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+}
+
 private struct MovieCardButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -338,7 +516,6 @@ private struct MovieCardButtonStyle: ButtonStyle {
 struct MovieNavigationCard: View {
     let movie: Movie
     var progress: Double? = nil
-    var showsOptionsIndicator = false
     var requestsInitialFocus = false
     var action: (() -> Void)? = nil
     @FocusState private var isFocused: Bool
@@ -389,7 +566,7 @@ struct MovieNavigationCard: View {
                 }
                 .overlay(alignment: .topTrailing) {
                     if isFocused {
-                        Image(systemName: showsOptionsIndicator ? "ellipsis" : "play.fill")
+                        Image(systemName: "play.fill")
                             .font(.system(size: 17, weight: .bold))
                             .foregroundStyle(Color.teaCream)
                             .frame(width: 42, height: 42)

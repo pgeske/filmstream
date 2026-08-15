@@ -7,6 +7,7 @@ struct IOSMovieDetailView: View {
 
     @State private var preparedPlayback: PreparedPlayback?
     @State private var isPreparing = false
+    @State private var isRemoving = false
     @State private var errorMessage: String?
 
     private var history: WatchHistoryEntry? {
@@ -18,17 +19,20 @@ struct IOSMovieDetailView: View {
     }
 
     var body: some View {
-        ZStack {
-            MobileTeaBackground()
+        GeometryReader { geometry in
+            ZStack {
+                MobileTeaBackground()
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
-                    backdrop
-                    content
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        backdrop(width: geometry.size.width)
+                        content
+                    }
+                    .padding(.bottom, 36)
                 }
-                .padding(.bottom, 36)
+                .frame(width: geometry.size.width, height: geometry.size.height)
+                .ignoresSafeArea(edges: .top)
             }
-            .ignoresSafeArea(edges: .top)
         }
         .navigationTitle(movie.title)
         .navigationBarTitleDisplayMode(.inline)
@@ -46,16 +50,15 @@ struct IOSMovieDetailView: View {
         }
     }
 
-    private var backdrop: some View {
+    private func backdrop(width: CGFloat) -> some View {
         MobileBackdropImage(movie: movie)
-            .frame(maxWidth: .infinity)
-            .frame(height: 285)
+            .frame(width: width, height: 360)
             .clipped()
             .overlay {
                 LinearGradient(
                     stops: [
-                        .init(color: .clear, location: 0.18),
-                        .init(color: Color.mobileTeaBackground.opacity(0.68), location: 0.68),
+                        .init(color: .clear, location: 0.2),
+                        .init(color: Color.mobileTeaBackground.opacity(0.52), location: 0.64),
                         .init(color: Color.mobileTeaBackground, location: 1),
                     ],
                     startPoint: .top,
@@ -64,53 +67,44 @@ struct IOSMovieDetailView: View {
             }
             .overlay {
                 LinearGradient(
-                    colors: [Color.mobileTeaBackground.opacity(0.48), .clear],
+                    colors: [Color.mobileTeaBackground.opacity(0.46), .clear],
                     startPoint: .leading,
                     endPoint: .trailing
                 )
             }
+            .overlay(alignment: .bottomLeading) {
+                Text(movie.title)
+                    .font(.system(size: 32, weight: .black, design: .rounded))
+                    .foregroundStyle(Color.mobileTeaCream)
+                    .lineLimit(3)
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, 22)
+            }
     }
 
     private var content: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            HStack(alignment: .bottom, spacing: 16) {
-                MobilePosterImage(movie: movie)
-                    .frame(width: 116, height: 174)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .stroke(Color.mobileTeaAccentLight.opacity(0.22), lineWidth: 1)
-                    }
-                    .shadow(color: .black.opacity(0.42), radius: 16, y: 8)
-
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(movie.title)
-                        .font(.system(size: 27, weight: .bold, design: .rounded))
-                        .foregroundStyle(Color.mobileTeaCream)
-                        .lineLimit(3)
-
-                    HStack(spacing: 10) {
-                        if let year = movie.year {
-                            Text(String(year))
-                        }
-                        if let history, history.progress > 0 {
-                            Text("\(Int(history.progress * 100))% watched")
-                                .foregroundStyle(Color.mobileTeaAccentLight)
-                        }
-                    }
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(Color.mobileTeaMuted)
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 9) {
+                Text("Movie")
+                if let year = movie.year {
+                    Text("•")
+                    Text(String(year))
                 }
-                .padding(.bottom, 8)
+                if let history, history.progress > 0 {
+                    Text("•")
+                    Text("\(Int(history.progress * 100))% watched")
+                        .foregroundStyle(Color.mobileTeaAccentLight)
+                }
             }
-            .offset(y: -58)
-            .padding(.bottom, -50)
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(Color.mobileTeaMuted)
 
             MobileRatingBadges(ratings: ratings, tmdbRating: movie.voteAverage)
 
             if let overview = movie.overview, !overview.isEmpty {
                 Text(overview)
                     .font(.body)
-                    .foregroundStyle(Color.mobileTeaCream.opacity(0.86))
+                    .foregroundStyle(Color.mobileTeaCream.opacity(0.88))
                     .lineSpacing(3)
             }
 
@@ -120,21 +114,7 @@ struct IOSMovieDetailView: View {
                     .foregroundStyle(Color.mobileTeaAmber)
             }
 
-            Button {
-                Task { await preparePlayback() }
-            } label: {
-                HStack(spacing: 9) {
-                    if isPreparing {
-                        ProgressView()
-                            .tint(Color.mobileTeaBackground)
-                    } else {
-                        Image(systemName: "play.fill")
-                    }
-                    Text(playButtonTitle)
-                }
-            }
-            .buttonStyle(MobilePrimaryButtonStyle())
-            .disabled(isPreparing)
+            actionButtons
 
             if let history, history.progress > 0 {
                 ProgressView(value: history.progress)
@@ -146,22 +126,92 @@ struct IOSMovieDetailView: View {
         .padding(.horizontal, 18)
     }
 
-    private var playButtonTitle: String {
+    private var actionButtons: some View {
+        VStack(spacing: 10) {
+            Button {
+                Task { await preparePlayback(startSeconds: history?.positionSeconds ?? 0) }
+            } label: {
+                actionLabel(
+                    title: primaryButtonTitle,
+                    systemImage: "play.fill",
+                    showsProgress: isPreparing
+                )
+            }
+            .buttonStyle(MobileDetailButtonStyle(kind: .prominent))
+            .disabled(isPreparing || isRemoving)
+
+            if history != nil {
+                Button {
+                    Task { await preparePlayback(startSeconds: 0) }
+                } label: {
+                    actionLabel(title: "Play from Beginning", systemImage: "arrow.counterclockwise")
+                }
+                .buttonStyle(MobileDetailButtonStyle(kind: .standard))
+                .disabled(isPreparing || isRemoving)
+
+                Button(role: .destructive) {
+                    Task { await removeFromContinueWatching() }
+                } label: {
+                    actionLabel(
+                        title: isRemoving ? "Removing…" : "Remove from Continue Watching",
+                        systemImage: "xmark",
+                        showsProgress: isRemoving
+                    )
+                }
+                .buttonStyle(MobileDetailButtonStyle(kind: .destructive))
+                .disabled(isPreparing || isRemoving)
+            }
+        }
+        .padding(.top, 2)
+    }
+
+    private var primaryButtonTitle: String {
         if isPreparing {
             return "Preparing Stream…"
         }
         return history == nil ? "Play" : "Resume"
     }
 
-    private func preparePlayback() async {
+    private func actionLabel(
+        title: String,
+        systemImage: String,
+        showsProgress: Bool = false
+    ) -> some View {
+        HStack(spacing: 11) {
+            if showsProgress {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Image(systemName: systemImage)
+                    .frame(width: 20)
+            }
+            Text(title)
+                .lineLimit(1)
+            Spacer()
+        }
+    }
+
+    private func preparePlayback(startSeconds: Double) async {
         isPreparing = true
         defer { isPreparing = false }
         do {
             let playback = try await model.api.createPlayback(for: movie)
             preparedPlayback = try await model.api.prepareNativePlayback(
                 playback,
-                startSeconds: history?.positionSeconds ?? 0
+                startSeconds: startSeconds
             )
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func removeFromContinueWatching() async {
+        guard let history else { return }
+        isRemoving = true
+        defer { isRemoving = false }
+        do {
+            try await model.removeFromContinueWatching(history)
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription

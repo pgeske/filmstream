@@ -8,7 +8,7 @@ struct MacSearchView: View {
     @State private var isSearching = false
     @State private var errorMessage: String?
 
-    private let columns = [GridItem(.adaptive(minimum: 176, maximum: 196), spacing: 24)]
+    private let columns = [GridItem(.adaptive(minimum: 304, maximum: 320), spacing: 24)]
 
     var body: some View {
         ZStack {

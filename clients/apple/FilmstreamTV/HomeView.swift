@@ -3,55 +3,37 @@ import SwiftUI
 
 struct HomeView: View {
     @Environment(AppModel.self) private var model
-    @State private var pendingRemoval: WatchHistoryEntry?
-    @State private var isRemovingFromContinueWatching = false
 
     var body: some View {
-        ZStack {
-            NavigationStack {
-                ZStack {
-                    TeaBackground()
+        NavigationStack {
+            ZStack {
+                TeaBackground()
 
-                    ScrollView(.vertical, showsIndicators: false) {
-                        VStack(alignment: .leading, spacing: 34) {
-                            header
-                            continueWatchingSection
-                            ForEach(model.discoverySections) { section in
-                                discoverySection(section)
-                            }
-                            if let errorMessage = model.errorMessage {
-                                Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
-                                    .foregroundStyle(Color.teaAmber)
-                                    .font(.headline)
-                            }
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 30) {
+                        header
+                        continueWatchingSection
+                        ForEach(model.discoverySections) { section in
+                            discoverySection(section)
                         }
-                        .padding(.horizontal, 88)
-                        .padding(.top, 64)
-                        .padding(.bottom, 110)
+                        if let errorMessage = model.errorMessage {
+                            Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(Color.teaAmber)
+                                .font(.headline)
+                        }
                     }
-                }
-                .navigationDestination(for: Movie.self) { movie in
-                    MovieDetailView(movie: movie)
-                }
-                .task {
-                    await model.loadHome()
+                    .padding(.horizontal, 72)
+                    .padding(.top, 54)
+                    .padding(.bottom, 110)
                 }
             }
-            .disabled(pendingRemoval != nil)
-
-            if let pendingRemoval {
-                ContinueWatchingOptionsDialog(
-                    isRemoving: isRemovingFromContinueWatching,
-                    onCancel: {
-                        self.pendingRemoval = nil
-                    },
-                    onRemove: {
-                        Task { await removeFromContinueWatching(pendingRemoval) }
-                    }
-                )
+            .navigationDestination(for: Movie.self) { movie in
+                MovieDetailView(movie: movie)
+            }
+            .task {
+                await model.loadHome()
             }
         }
-        .animation(.snappy(duration: 0.22), value: pendingRemoval != nil)
     }
 
     private var header: some View {
@@ -73,12 +55,9 @@ struct HomeView: View {
 
     @ViewBuilder
     private var continueWatchingSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Continue Watching")
-                .font(.system(size: 42, weight: .bold, design: .rounded))
-                .foregroundStyle(Color.teaCream)
-
-            if model.isLoading && model.continueWatching.isEmpty {
+        if model.isLoading && model.continueWatching.isEmpty {
+            VStack(alignment: .leading, spacing: 16) {
+                shelfTitle("Continue Watching")
                 HStack(spacing: 18) {
                     ProgressView()
                         .tint(Color.teaAccent)
@@ -86,70 +65,39 @@ struct HomeView: View {
                         .foregroundStyle(Color.teaMuted)
                 }
                 .frame(height: 360)
-            } else if model.continueWatching.isEmpty {
-                emptyContinueWatching
-            } else {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(alignment: .top, spacing: 48) {
-                        ForEach(model.continueWatching) { entry in
-                            MovieNavigationCard(
-                                movie: entry.movie,
-                                progress: entry.progress,
-                                showsOptionsIndicator: true,
-                                requestsInitialFocus: entry.id == model.continueWatching.first?.id
-                            )
-                            .highPriorityGesture(
-                                LongPressGesture(minimumDuration: 0.65)
-                                    .onEnded { _ in
-                                        pendingRemoval = entry
-                                    }
-                            )
-                            .accessibilityHint("Press and hold the center button for options")
-                        }
-                    }
-                    .padding(.top, 14)
-                    .padding(.bottom, 18)
-                }
             }
+            .padding(.horizontal, 16)
+        } else if model.continueWatching.isEmpty {
+            VStack(alignment: .leading, spacing: 16) {
+                shelfTitle("Continue Watching")
+                emptyContinueWatching
+            }
+            .padding(.horizontal, 16)
+        } else {
+            NetflixMovieShelf(
+                title: "Continue Watching",
+                items: model.continueWatching.map {
+                    NetflixShelfItem(movie: $0.movie, progress: $0.progress)
+                },
+                requestsInitialFocus: true
+            )
         }
-        .padding(.horizontal, 16)
-        .focusSection()
     }
 
     @ViewBuilder
     private func discoverySection(_ section: DiscoverySection) -> some View {
         if !section.items.isEmpty {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(section.title)
-                    .font(.system(size: 42, weight: .bold, design: .rounded))
-                    .foregroundStyle(Color.teaCream)
-
-                ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(alignment: .top, spacing: 48) {
-                        ForEach(section.items) { movie in
-                            MovieNavigationCard(movie: movie)
-                        }
-                    }
-                    .padding(.top, 14)
-                    .padding(.bottom, 18)
-                }
-            }
-            .padding(.horizontal, 16)
-            .focusSection()
+            NetflixMovieShelf(
+                title: section.title,
+                items: section.items.map { NetflixShelfItem(movie: $0) }
+            )
         }
     }
 
-    private func removeFromContinueWatching(_ entry: WatchHistoryEntry) async {
-        isRemovingFromContinueWatching = true
-        defer { isRemovingFromContinueWatching = false }
-        do {
-            try await model.removeFromContinueWatching(entry)
-            pendingRemoval = nil
-            model.errorMessage = nil
-        } catch {
-            pendingRemoval = nil
-            model.errorMessage = error.localizedDescription
-        }
+    private func shelfTitle(_ title: String) -> some View {
+        Text(title)
+            .font(.system(size: 38, weight: .bold, design: .rounded))
+            .foregroundStyle(Color.teaCream)
     }
 
     private var emptyContinueWatching: some View {

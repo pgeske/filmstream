@@ -112,6 +112,59 @@ struct MacTeaActionButtonStyle: ButtonStyle {
     }
 }
 
+enum MacDetailButtonKind: Equatable {
+    case prominent
+    case standard
+    case destructive
+}
+
+struct MacDetailButtonStyle: ButtonStyle {
+    let kind: MacDetailButtonKind
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.headline.weight(.bold))
+            .foregroundStyle(foregroundColor)
+            .padding(.horizontal, 16)
+            .frame(height: 44)
+            .background(backgroundColor, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .stroke(borderColor, lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.22), radius: 8, y: 4)
+            .opacity(configuration.isPressed ? 0.82 : 1)
+            .scaleEffect(configuration.isPressed ? 0.99 : 1, anchor: .leading)
+            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+    }
+
+    private var foregroundColor: Color {
+        switch kind {
+        case .prominent:
+            return Color.macTeaBackground
+        case .standard:
+            return Color.macTeaCream
+        case .destructive:
+            return Color.macTeaAmber
+        }
+    }
+
+    private var backgroundColor: Color {
+        switch kind {
+        case .prominent:
+            return Color.macTeaAccent
+        case .standard:
+            return Color.macTeaPanelElevated.opacity(0.94)
+        case .destructive:
+            return Color.macTeaBackground.opacity(0.72)
+        }
+    }
+
+    private var borderColor: Color {
+        kind == .destructive ? Color.macTeaAmber.opacity(0.42) : Color.macTeaCream.opacity(0.12)
+    }
+}
+
 struct MacMovieRatingBadges: View {
     let ratings: MovieRatings?
     let tmdbRating: Double?
@@ -180,14 +233,14 @@ private extension View {
 struct MacMovieCard: View {
     let movie: Movie
     var progress: Double? = nil
-    var width: CGFloat = 176
+    var width: CGFloat = 304
     @State private var isHovering = false
 
     var body: some View {
         NavigationLink(value: movie) {
-            VStack(alignment: .leading, spacing: 10) {
-                MacPosterImage(movie: movie)
-                    .frame(width: width, height: width * 1.5)
+            VStack(alignment: .leading, spacing: 9) {
+                MacShelfArtwork(movie: movie)
+                    .frame(width: width, height: width * 9 / 16)
                     .overlay {
                         RoundedRectangle(cornerRadius: 14, style: .continuous)
                             .stroke(
@@ -209,27 +262,83 @@ struct MacMovieCard: View {
                         y: isHovering ? 9 : 5
                     )
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(movie.title)
-                        .font(.headline.weight(.semibold))
-                        .foregroundStyle(Color.macTeaCream)
+                Text(movie.title)
+                    .font(.headline.weight(.bold))
+                    .foregroundStyle(Color.macTeaCream)
+                    .lineLimit(1)
+                    .frame(width: width, alignment: .leading)
+
+                HStack(spacing: 6) {
+                    Text("Movie")
+                    if let year = movie.year {
+                        Text("•")
+                        Text(String(year))
+                    }
+                    if let progress, progress > 0 {
+                        Text("•")
+                        Text("\(Int(progress * 100))% watched")
+                            .foregroundStyle(Color.macTeaAccentLight)
+                    }
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Color.macTeaMuted)
+
+                if let overview = movie.overview, !overview.isEmpty {
+                    Text(overview)
+                        .font(.caption)
+                        .foregroundStyle(Color.macTeaCream.opacity(0.7))
                         .lineLimit(2)
                         .frame(width: width, alignment: .leading)
-                    if let year = movie.year {
-                        Text(String(year))
-                            .font(.caption)
-                            .foregroundStyle(Color.macTeaMuted)
-                    }
                 }
             }
             .frame(width: width, alignment: .leading)
             .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .scaleEffect(isHovering ? 1.025 : 1)
+            .scaleEffect(isHovering ? 1.018 : 1)
             .offset(y: isHovering ? -3 : 0)
             .animation(.snappy(duration: 0.2), value: isHovering)
         }
         .buttonStyle(.plain)
         .onHover { isHovering = $0 }
+    }
+}
+
+private struct MacShelfArtwork: View {
+    let movie: Movie
+
+    var body: some View {
+        AsyncImage(url: movie.backdropURL ?? movie.posterURL) { phase in
+            switch phase {
+            case let .success(image):
+                image
+                    .resizable()
+                    .scaledToFill()
+            case .empty:
+                ZStack {
+                    Color.macTeaPanel
+                    ProgressView()
+                        .tint(Color.macTeaAccent)
+                }
+            default:
+                LinearGradient(
+                    colors: [Color.macTeaPanelElevated, Color.macTeaBackground],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .overlay {
+                    Image(systemName: "film.stack")
+                        .font(.system(size: 38))
+                        .foregroundStyle(Color.macTeaAccentLight.opacity(0.38))
+                }
+            }
+        }
+        .overlay {
+            LinearGradient(
+                colors: [.clear, Color.macTeaBackground.opacity(0.22)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 }
 

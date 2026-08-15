@@ -71,7 +71,7 @@ TeaStream defaults to `http://filmstream.home.alyoshukai.com`; each target conta
 
 ## Server capabilities
 
-The home screens pair Continue Watching with TMDB-powered Popular Now and Top Rated discovery rails. Discovery requires an existing digital, physical, or TV release, so upcoming and theater-only titles stay off the shelf. Search starts automatically after two title characters with a short debounce; selecting any movie opens its details and playback action. All clients use:
+The home screens pair Continue Watching with TMDB-powered Popular Now and Top Rated discovery rails. On tvOS, focused titles expand into cinematic landscape cards, move to the leading shelf position, and reveal their year and synopsis; iPhone and Mac use the same landscape-first visual language. Discovery requires an existing digital, physical, or TV release, so upcoming and theater-only titles stay off the shelf. Search starts automatically after two title characters with a short debounce; selecting any movie opens its details and playback actions. All clients use:
 
 - `GET /v1/catalog/search` for movie metadata and artwork;
 - `GET /v1/catalog/discover` for home-screen discovery sections;
@@ -91,6 +91,6 @@ The timeline always represents the full movie rather than the currently generate
 
 Configure the server's optional `metadata` provider with a TMDB API read token to enable posters, backdrops, release details, and descriptions. Set the server-only `OMDB_API_KEY` environment variable to add IMDb and Rotten Tomatoes scores. TeaStream requests external ratings only when movie details open, and the server resolves TMDB IDs to canonical IMDb IDs before querying OMDb. Neither credential is included in the app.
 
-On tvOS, hold the remote's center button on a Continue Watching card to open Movie Options. Removing a title clears its saved resume point; playing it again starts fresh and resumes normal progress tracking.
+A movie with saved progress presents explicit Resume, Play from Beginning, and Remove from Continue Watching actions on its detail screen. Removing a title clears its saved resume point; playing it again starts fresh and resumes normal progress tracking.
 
 Movie data and images are provided by TMDB. This product uses the TMDB API but is not endorsed or certified by TMDB. External rating data is provided by OMDb.
