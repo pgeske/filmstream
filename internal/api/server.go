@@ -195,6 +195,14 @@ func (s *Server) SetHistoryStore(store *history.Store) {
 
 func (s *Server) SetPlaybackCache(store *playbackcache.Store) {
 	s.playbackCache = store
+	failures, err := store.LoadUsenetFailures()
+	if err != nil {
+		s.logger.Warn("load Usenet failure cache", "error", err)
+		return
+	}
+	s.mu.Lock()
+	s.usenetFailures = failures
+	s.mu.Unlock()
 }
 
 func (s *Server) SetHLSManager(manager HLSStreamManager) {
@@ -964,13 +972,36 @@ func (s *Server) markUsenetCandidateFailed(candidate catalog.Candidate) {
 		s.usenetFailures = make(map[string]time.Time)
 	}
 	s.usenetFailures[usenetCandidateKey(candidate)] = time.Now().Add(usenetFailureTTL)
+	failures := copyUsenetFailures(s.usenetFailures)
+	store := s.playbackCache
 	s.mu.Unlock()
+	s.persistUsenetFailures(store, failures)
 }
 
 func (s *Server) clearUsenetCandidateFailure(candidate catalog.Candidate) {
 	s.mu.Lock()
 	delete(s.usenetFailures, usenetCandidateKey(candidate))
+	failures := copyUsenetFailures(s.usenetFailures)
+	store := s.playbackCache
 	s.mu.Unlock()
+	s.persistUsenetFailures(store, failures)
+}
+
+func (s *Server) persistUsenetFailures(store *playbackcache.Store, failures map[string]time.Time) {
+	if store == nil {
+		return
+	}
+	if err := store.SaveUsenetFailures(failures); err != nil {
+		s.logger.Warn("save Usenet failure cache", "error", err)
+	}
+}
+
+func copyUsenetFailures(failures map[string]time.Time) map[string]time.Time {
+	result := make(map[string]time.Time, len(failures))
+	for key, expiresAt := range failures {
+		result[key] = expiresAt
+	}
+	return result
 }
 
 func usenetCandidateKey(candidate catalog.Candidate) string {

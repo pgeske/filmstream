@@ -26,15 +26,17 @@ type Entry struct {
 }
 
 type Store struct {
-	path       string
-	torrentDir string
-	mu         sync.Mutex
+	path               string
+	torrentDir         string
+	usenetFailuresPath string
+	mu                 sync.Mutex
 }
 
 func New(stateDir string) *Store {
 	return &Store{
-		path:       filepath.Join(stateDir, "playback-cache.json"),
-		torrentDir: filepath.Join(stateDir, "playback-cache"),
+		path:               filepath.Join(stateDir, "playback-cache.json"),
+		torrentDir:         filepath.Join(stateDir, "playback-cache"),
+		usenetFailuresPath: filepath.Join(stateDir, "usenet-failures.json"),
 	}
 }
 
@@ -166,6 +168,69 @@ func (s *Store) Save(
 		return Entry{}, err
 	}
 	return entry, nil
+}
+
+func (s *Store) LoadUsenetFailures() (map[string]time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	contents, err := os.ReadFile(s.usenetFailuresPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return make(map[string]time.Time), nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read Usenet failure cache: %w", err)
+	}
+	var payload struct {
+		Version  int                  `json:"version"`
+		Failures map[string]time.Time `json:"failures"`
+	}
+	if err := json.Unmarshal(contents, &payload); err != nil {
+		return nil, fmt.Errorf("parse Usenet failure cache: %w", err)
+	}
+	if payload.Failures == nil {
+		payload.Failures = make(map[string]time.Time)
+	}
+	now := time.Now()
+	for key, expiresAt := range payload.Failures {
+		if !expiresAt.After(now) {
+			delete(payload.Failures, key)
+		}
+	}
+	return payload.Failures, nil
+}
+
+func (s *Store) SaveUsenetFailures(failures map[string]time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	active := make(map[string]time.Time, len(failures))
+	for key, expiresAt := range failures {
+		if expiresAt.After(now) {
+			active[key] = expiresAt
+		}
+	}
+	if len(active) == 0 {
+		if err := os.Remove(s.usenetFailuresPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove Usenet failure cache: %w", err)
+		}
+		return nil
+	}
+	payload := struct {
+		Version  int                  `json:"version"`
+		Failures map[string]time.Time `json:"failures"`
+	}{Version: 1, Failures: active}
+	contents, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	contents = append(contents, '\n')
+	if err := os.MkdirAll(filepath.Dir(s.usenetFailuresPath), 0o700); err != nil {
+		return fmt.Errorf("create state directory: %w", err)
+	}
+	if err := writePrivateFile(s.usenetFailuresPath, contents); err != nil {
+		return fmt.Errorf("replace Usenet failure cache: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) read() ([]Entry, error) {

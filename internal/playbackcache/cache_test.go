@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pgeske/filmstream/internal/catalog"
 )
@@ -55,6 +56,31 @@ func TestSaveAndLookupCachedPlayback(t *testing.T) {
 	}
 	if strings.Contains(string(cacheJSON), "magnet:?xt=private") || strings.Contains(string(cacheJSON), "apikey=secret") {
 		t.Fatal("playback cache JSON contains a private torrent source")
+	}
+}
+
+func TestSaveAndLoadUsenetFailures(t *testing.T) {
+	store := New(t.TempDir())
+	future := time.Now().Add(time.Hour).UTC()
+	if err := store.SaveUsenetFailures(map[string]time.Time{
+		"usenet:active":  future,
+		"usenet:expired": time.Now().Add(-time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	failures, err := store.LoadUsenetFailures()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(failures) != 1 || failures["usenet:active"] != future {
+		t.Fatalf("failures = %+v", failures)
+	}
+	info, err := os.Stat(store.usenetFailuresPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("failure cache mode = %o", info.Mode().Perm())
 	}
 }
 
