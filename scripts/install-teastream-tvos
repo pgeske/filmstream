@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+apple_dir="$repo_root/clients/apple"
+project="$apple_dir/FilmstreamApple.xcodeproj"
+derived_data=${TVOS_DERIVED_DATA_PATH:-$apple_dir/.derivedData/device}
+
+require_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf 'Missing required command: %s\n' "$1" >&2
+    exit 1
+  fi
+}
+
+require_command codesign
+require_command openssl
+require_command python3
+require_command security
+require_command xcodebuild
+require_command xcodegen
+require_command xcrun
+
+temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/teastream-install.XXXXXX")
+trap 'rm -rf "$temp_dir"' EXIT
+devices_json="$temp_dir/devices.json"
+
+xcrun devicectl list devices --json-output "$devices_json" >/dev/null
+device_selection=$(TVOS_DEVICE_ID=${TVOS_DEVICE_ID:-} python3 - "$devices_json" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as file:
+    devices = json.load(file).get("result", {}).get("devices", [])
+
+candidates = []
+for device in devices:
+    hardware = device.get("hardwareProperties", {})
+    connection = device.get("connectionProperties", {})
+    if (
+        hardware.get("platform") == "tvOS"
+        and hardware.get("reality") == "physical"
+        and connection.get("pairingState") == "paired"
+    ):
+        candidates.append(device)
+
+requested_id = os.environ.get("TVOS_DEVICE_ID", "")
+if requested_id:
+    candidates = [
+        device
+        for device in candidates
+        if requested_id
+        in (device.get("identifier"), device.get("hardwareProperties", {}).get("udid"))
+    ]
+
+if not candidates:
+    if requested_id:
+        print(f"No paired physical Apple TV matches TVOS_DEVICE_ID={requested_id}.", file=sys.stderr)
+    else:
+        print("No paired physical Apple TV is available.", file=sys.stderr)
+    print("Open Xcode's Devices window and pair the Apple TV, then retry.", file=sys.stderr)
+    raise SystemExit(1)
+
+if len(candidates) > 1:
+    print("More than one paired physical Apple TV is available:", file=sys.stderr)
+    for device in candidates:
+        name = device.get("deviceProperties", {}).get("name", "Apple TV")
+        udid = device.get("hardwareProperties", {}).get("udid", "unknown")
+        print(f"  {name}: {udid}", file=sys.stderr)
+    print("Retry with TVOS_DEVICE_ID set to the desired UDID.", file=sys.stderr)
+    raise SystemExit(1)
+
+device = candidates[0]
+name = device.get("deviceProperties", {}).get("name", "Apple TV")
+udid = device.get("hardwareProperties", {}).get("udid")
+if not udid:
+    print("The selected Apple TV did not report a UDID.", file=sys.stderr)
+    raise SystemExit(1)
+print(f"{udid}\t{name}")
+PY
+)
+device_id=${device_selection%%$'\t'*}
+device_name=${device_selection#*$'\t'}
+
+development_team=${TVOS_DEVELOPMENT_TEAM:-}
+if [[ -z $development_team ]]; then
+  certificate_subjects=$(security find-certificate -a -p -c 'Apple Development' 2>/dev/null \
+    | openssl crl2pkcs7 -nocrl -certfile /dev/stdin 2>/dev/null \
+    | openssl pkcs7 -print_certs -noout 2>/dev/null || true)
+  development_teams=$(printf '%s\n' "$certificate_subjects" \
+    | sed -nE '/^subject=/s/.*OU=([^,]+).*/\1/p' \
+    | sort -u)
+  development_team_count=$(printf '%s\n' "$development_teams" | awk 'NF { count++ } END { print count + 0 }')
+
+  if [[ $development_team_count -eq 1 ]]; then
+    development_team=$development_teams
+  elif [[ $development_team_count -eq 0 ]]; then
+    cat >&2 <<'EOF'
+No Apple Development signing team was found.
+Sign in under Xcode > Settings > Apple Accounts, or retry with:
+  make tvos-install TVOS_DEVELOPMENT_TEAM=<team-id>
+EOF
+    exit 1
+  else
+    printf 'More than one Apple Development team was found:\n%s\n' "$development_teams" >&2
+    printf 'Retry with TVOS_DEVELOPMENT_TEAM set to the desired team ID.\n' >&2
+    exit 1
+  fi
+fi
+
+printf 'Generating the Xcode project...\n'
+(
+  cd "$apple_dir"
+  xcodegen generate
+)
+
+printf 'Building TeaStream for %s with automatic signing...\n' "$device_name"
+xcodebuild -quiet \
+  -project "$project" \
+  -scheme FilmstreamTV \
+  -configuration Debug \
+  -destination "id=$device_id" \
+  -derivedDataPath "$derived_data" \
+  -allowProvisioningUpdates \
+  -allowProvisioningDeviceRegistration \
+  DEVELOPMENT_TEAM="$development_team" \
+  build
+
+app="$derived_data/Build/Products/Debug-appletvos/TeaStream.app"
+if [[ ! -d $app ]]; then
+  printf 'Signed app was not found at %s\n' "$app" >&2
+  exit 1
+fi
+codesign --verify --deep --strict "$app"
+bundle_id=$(python3 - "$app/Info.plist" <<'PY'
+import plistlib
+import sys
+
+with open(sys.argv[1], "rb") as file:
+    print(plistlib.load(file)["CFBundleIdentifier"])
+PY
+)
+
+printf 'Installing TeaStream on %s...\n' "$device_name"
+xcrun devicectl device install app --device "$device_id" "$app"
+
+printf 'Launching TeaStream on %s...\n' "$device_name"
+xcrun devicectl device process launch \
+  --device "$device_id" \
+  --terminate-existing \
+  "$bundle_id"
+
+printf 'TeaStream is installed and running on %s.\n' "$device_name"
