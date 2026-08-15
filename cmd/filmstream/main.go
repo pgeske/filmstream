@@ -149,9 +149,14 @@ func runServer(args []string) error {
 	if err != nil {
 		return err
 	}
+	ratingsProvider, err := metadata.RatingsFromEnvironment()
+	if err != nil {
+		return err
+	}
 	apiServer := api.New(registry, engine, defaults, logger)
 	apiServer.SetMovieResolver(movieResolver)
 	apiServer.SetMetadataProvider(metadataProvider)
+	apiServer.SetRatingsProvider(ratingsProvider)
 	apiServer.SetHistoryStore(history.New(cfg.StateDir))
 	apiServer.SetPlaybackCache(playbackcache.New(cfg.StateDir))
 	if hlsManager != nil {

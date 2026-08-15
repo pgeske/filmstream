@@ -10,7 +10,18 @@ import (
 	"github.com/pgeske/filmstream/internal/config"
 )
 
-const defaultTMDBBaseURL = "https://api.themoviedb.org/3"
+const (
+	defaultTMDBBaseURL = "https://api.themoviedb.org/3"
+	defaultOMDbBaseURL = "https://www.omdbapi.com/"
+)
+
+func RatingsFromEnvironment() (RatingsProvider, error) {
+	apiKey := strings.TrimSpace(os.Getenv("OMDB_API_KEY"))
+	if apiKey == "" {
+		return nil, nil
+	}
+	return NewOMDb(defaultOMDbBaseURL, apiKey, &http.Client{Timeout: 15 * time.Second})
+}
 
 func FromConfig(cfg config.Metadata) (Provider, error) {
 	if cfg.Provider == "" {

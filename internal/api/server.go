@@ -59,6 +59,7 @@ type catalogSection struct {
 }
 
 type HLSStreamManager interface {
+	ProbeSubtitles(context.Context, string) ([]hls.SubtitleTrack, error)
 	Start(context.Context, string, float64) (hls.Stream, error)
 	StartSubtitle(context.Context, string, int) error
 	AssetPath(string, string) (string, error)
@@ -83,6 +84,7 @@ type Server struct {
 	movieResolver     resolver.Resolver
 	metadataMu        sync.RWMutex
 	metadataProvider  metadata.Provider
+	ratingsProvider   metadata.RatingsProvider
 	historyStore      *history.Store
 	playbackCache     *playbackcache.Store
 	hlsMu             sync.RWMutex
@@ -136,6 +138,12 @@ func (s *Server) SetMetadataProvider(provider metadata.Provider) {
 	s.metadataMu.Unlock()
 }
 
+func (s *Server) SetRatingsProvider(provider metadata.RatingsProvider) {
+	s.metadataMu.Lock()
+	s.ratingsProvider = provider
+	s.metadataMu.Unlock()
+}
+
 func (s *Server) SetHistoryStore(store *history.Store) {
 	s.historyStore = store
 }
@@ -160,8 +168,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/resolve", s.resolveMovie)
 	mux.HandleFunc("GET /v1/catalog/search", s.searchCatalog)
 	mux.HandleFunc("GET /v1/catalog/discover", s.discoverCatalog)
+	mux.HandleFunc("GET /v1/catalog/ratings", s.catalogRatings)
 	mux.HandleFunc("GET /v1/watch-history", s.listWatchHistory)
 	mux.HandleFunc("PUT /v1/watch-history", s.updateWatchProgress)
+	mux.HandleFunc("DELETE /v1/watch-history/{id}", s.removeWatchHistory)
 	mux.HandleFunc("POST /v1/playbacks", s.createPlayback)
 	mux.HandleFunc("GET /v1/playbacks/{id}", s.playbackStatus)
 	mux.HandleFunc("GET /v1/playbacks/{id}/stream", s.streamPlayback)
@@ -227,6 +237,57 @@ func (s *Server) searchCatalog(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, struct {
 		Items []metadata.Movie `json:"items"`
 	}{Items: movies})
+}
+
+func (s *Server) catalogRatings(w http.ResponseWriter, r *http.Request) {
+	title := strings.TrimSpace(r.URL.Query().Get("title"))
+	if title == "" {
+		writeError(w, http.StatusBadRequest, "title cannot be empty")
+		return
+	}
+	year := 0
+	if value := strings.TrimSpace(r.URL.Query().Get("year")); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1888 || parsed > 2100 {
+			writeError(w, http.StatusBadRequest, "year must be a valid movie release year")
+			return
+		}
+		year = parsed
+	}
+	mediaID := strings.TrimSpace(r.URL.Query().Get("media_id"))
+	s.metadataMu.RLock()
+	ratingsProvider := s.ratingsProvider
+	movieMetadataProvider := s.metadataProvider
+	s.metadataMu.RUnlock()
+	if ratingsProvider == nil {
+		writeError(w, http.StatusServiceUnavailable, "external movie ratings are not configured")
+		return
+	}
+
+	if idProvider, ok := movieMetadataProvider.(metadata.IMDbIDProvider); ok && mediaID != "" {
+		if imdbRatingsProvider, ok := ratingsProvider.(metadata.IMDbRatingsProvider); ok {
+			imdbID, idErr := idProvider.IMDbID(r.Context(), mediaID)
+			if idErr == nil {
+				ratings, ratingsErr := imdbRatingsProvider.RatingsByIMDbID(r.Context(), imdbID)
+				if ratingsErr == nil {
+					writeJSON(w, http.StatusOK, ratings)
+					return
+				}
+				if s.logger != nil {
+					s.logger.Warn("load ratings by IMDb ID", "media_id", mediaID, "error", ratingsErr)
+				}
+			} else if s.logger != nil {
+				s.logger.Warn("resolve IMDb ID", "media_id", mediaID, "error", idErr)
+			}
+		}
+	}
+
+	ratings, err := ratingsProvider.Ratings(r.Context(), title, year)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, ratings)
 }
 
 func (s *Server) discoverCatalog(w http.ResponseWriter, r *http.Request) {
@@ -407,6 +468,23 @@ func (s *Server) enrichWatchHistory(ctx context.Context, entries []history.Entry
 	return entries
 }
 
+func (s *Server) removeWatchHistory(w http.ResponseWriter, r *http.Request) {
+	if s.historyStore == nil {
+		writeError(w, http.StatusServiceUnavailable, "watch history is not configured")
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "watch history ID cannot be empty")
+		return
+	}
+	if err := s.historyStore.Remove(id); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
 func (s *Server) updateWatchProgress(w http.ResponseWriter, r *http.Request) {
 	if s.historyStore == nil {
 		writeError(w, http.StatusServiceUnavailable, "watch history is not configured")
@@ -502,7 +580,7 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 	var selected *catalog.RankedCandidate
 	if request.Query != "" {
 		var err error
-		session, selected, err = s.createCachedPlayback(r.Context(), request)
+		session, selected, err = s.createCachedPlayback(r.Context(), request, preferences)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
@@ -519,7 +597,7 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusNotFound, "no matching torrent candidates found")
 				return
 			}
-			session, selected, err = s.createRankedPlayback(r.Context(), ranked, preferences.StreamingOptimized)
+			session, selected, err = s.createRankedPlayback(r.Context(), ranked, preferences)
 			if err != nil {
 				writeError(w, http.StatusBadGateway, err.Error())
 				return
@@ -570,6 +648,7 @@ type playbackOption struct {
 func (s *Server) createCachedPlayback(
 	ctx context.Context,
 	request CreatePlaybackRequest,
+	preferences catalog.Preferences,
 ) (*torrentstream.Session, *catalog.RankedCandidate, error) {
 	if s.playbackCache == nil {
 		return nil, nil, nil
@@ -607,6 +686,19 @@ func (s *Server) createCachedPlayback(
 		s.logger.Warn("cached playback swarm is unavailable; searching again",
 			"title", request.Query, "live_peers", options[0].peers)
 		return nil, nil, nil
+	}
+	if preferences.PreferTextSubtitles {
+		hasTextSubtitles, probeErr := s.playbackHasTextSubtitles(ctx, session.ID)
+		if probeErr != nil {
+			s.logger.Warn("probe cached playback subtitles", "title", request.Query, "error", probeErr)
+		} else if !hasTextSubtitles {
+			_ = s.engine.Drop(session.ID)
+			if removeErr := s.playbackCache.Remove(request.MediaID, request.Query, request.Year); removeErr != nil {
+				s.logger.Warn("remove cached playback without text subtitles", "title", request.Query, "error", removeErr)
+			}
+			s.logger.Info("cached playback lacks text subtitles; searching again", "title", request.Query)
+			return nil, nil, nil
+		}
 	}
 	s.logger.Info("reused cached playback selection", "id", session.ID,
 		"name", cached.Selected.Candidate.Name, "live_peers", options[strong].peers)
@@ -653,10 +745,10 @@ func (s *Server) invalidateCachedPlayback(id string) {
 func (s *Server) createRankedPlayback(
 	ctx context.Context,
 	ranked []catalog.RankedCandidate,
-	validateSwarm bool,
+	preferences catalog.Preferences,
 ) (*torrentstream.Session, *catalog.RankedCandidate, error) {
 	attempts := 1
-	if validateSwarm {
+	if preferences.StreamingOptimized {
 		attempts = min(maxLiveSwarmCandidates, len(ranked))
 	}
 	options := make([]playbackOption, 0, attempts)
@@ -684,7 +776,7 @@ func (s *Server) createRankedPlayback(
 			failures = append(failures, fmt.Sprintf("%s: %v", candidate.Candidate.Name, err))
 			continue
 		}
-		if !validateSwarm {
+		if !preferences.StreamingOptimized {
 			return session, &candidate, nil
 		}
 		options = append(options, playbackOption{session: session, candidate: candidate})
@@ -698,7 +790,7 @@ func (s *Server) createRankedPlayback(
 				s.dropPlaybackOptions(options)
 				return nil, nil, err
 			}
-			if strong >= 0 {
+			if strong >= 0 && !preferences.PreferTextSubtitles {
 				return s.choosePlaybackOption(options, strong, true)
 			}
 		}
@@ -715,6 +807,16 @@ func (s *Server) createRankedPlayback(
 		s.dropPlaybackOptions(options)
 		return nil, nil, err
 	}
+	if preferences.PreferTextSubtitles {
+		if subtitleOption := s.firstTextSubtitleOption(ctx, options); subtitleOption >= 0 {
+			return s.choosePlaybackOption(
+				options,
+				subtitleOption,
+				options[subtitleOption].peers >= strongLiveSwarmPeers,
+			)
+		}
+		s.logger.Warn("no live ranked playback option exposed text subtitles; using best available release")
+	}
 	if strong >= 0 {
 		return s.choosePlaybackOption(options, strong, true)
 	}
@@ -725,6 +827,40 @@ func (s *Server) createRankedPlayback(
 		}
 	}
 	return s.choosePlaybackOption(options, best, false)
+}
+
+func (s *Server) playbackHasTextSubtitles(ctx context.Context, playbackID string) (bool, error) {
+	s.hlsMu.RLock()
+	manager := s.hlsManager
+	s.hlsMu.RUnlock()
+	if manager == nil {
+		return false, errors.New("HLS playback is not configured")
+	}
+	tracks, err := manager.ProbeSubtitles(ctx, playbackID)
+	if err != nil {
+		return false, err
+	}
+	return len(tracks) > 0, nil
+}
+
+func (s *Server) firstTextSubtitleOption(ctx context.Context, options []playbackOption) int {
+	for index, option := range options {
+		if option.peers < minimumLivePeers {
+			continue
+		}
+		hasTextSubtitles, err := s.playbackHasTextSubtitles(ctx, option.session.ID)
+		if err != nil {
+			s.logger.Warn("probe playback subtitles", "id", option.session.ID,
+				"name", option.candidate.Candidate.Name, "error", err)
+			continue
+		}
+		if hasTextSubtitles {
+			s.logger.Info("preferred playback with text subtitles", "id", option.session.ID,
+				"name", option.candidate.Candidate.Name, "live_peers", option.peers)
+			return index
+		}
+	}
+	return -1
 }
 
 func (s *Server) observePlaybackOptions(

@@ -16,11 +16,12 @@ type SearchRequest struct {
 }
 
 type Preferences struct {
-	Resolution         string   `json:"resolution,omitempty"`
-	Codecs             []string `json:"codecs,omitempty"`
-	Languages          []string `json:"languages,omitempty"`
-	MaxSizeBytes       int64    `json:"max_size_bytes,omitempty"`
-	StreamingOptimized bool     `json:"streaming_optimized,omitempty"`
+	Resolution          string   `json:"resolution,omitempty"`
+	Codecs              []string `json:"codecs,omitempty"`
+	Languages           []string `json:"languages,omitempty"`
+	MaxSizeBytes        int64    `json:"max_size_bytes,omitempty"`
+	StreamingOptimized  bool     `json:"streaming_optimized,omitempty"`
+	PreferTextSubtitles bool     `json:"prefer_text_subtitles,omitempty"`
 }
 
 type Candidate struct {

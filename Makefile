@@ -3,6 +3,7 @@ PREFIX ?= $(HOME)/.local
 APPLE_DIR := clients/apple
 IOS_DESTINATION ?= platform=iOS Simulator,name=iPhone 17 Pro
 TVOS_DESTINATION ?= platform=tvOS Simulator,name=Apple TV 4K (3rd generation)
+MACOS_DESTINATION ?= platform=macOS,arch=arm64
 
 IOS_DEVICE_ID ?=
 IOS_DEVELOPMENT_TEAM ?=
@@ -11,7 +12,7 @@ TVOS_DEVICE_ID ?=
 TVOS_DEVELOPMENT_TEAM ?=
 TVOS_DERIVED_DATA_PATH ?=
 
-.PHONY: build install test fmt apple-project apple-test ios-build ios-install tvos-build tvos-install
+.PHONY: build install test fmt apple-project apple-test ios-build ios-install tvos-build tvos-install macos-build
 
 build:
 	go build -o bin/$(BINARY) ./cmd/filmstream
@@ -55,3 +56,9 @@ tvos-install:
 	TVOS_DEVELOPMENT_TEAM='$(TVOS_DEVELOPMENT_TEAM)' \
 	TVOS_DERIVED_DATA_PATH='$(TVOS_DERIVED_DATA_PATH)' \
 		./scripts/install-teastream-tvos
+
+macos-build: apple-project
+	xcodebuild -quiet -project $(APPLE_DIR)/FilmstreamApple.xcodeproj \
+		-scheme FilmstreamMac \
+		-destination '$(MACOS_DESTINATION)' \
+		CODE_SIGNING_ALLOWED=NO clean build

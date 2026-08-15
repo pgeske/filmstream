@@ -13,6 +13,8 @@ extension Color {
     static let teaCream = Color(red: 0.953, green: 0.922, blue: 0.867)
     static let teaMuted = Color(red: 0.682, green: 0.725, blue: 0.659)
     static let teaAmber = Color(red: 0.839, green: 0.631, blue: 0.373)
+    static let teaHoney = Color(red: 0.855, green: 0.694, blue: 0.365)
+    static let teaTomato = Color(red: 0.780, green: 0.302, blue: 0.251)
 }
 
 struct TeaBackground: View {
@@ -132,6 +134,198 @@ private struct TeaActionButtonBody: View {
     }
 }
 
+struct ContinueWatchingOptionsDialog: View {
+    let isRemoving: Bool
+    let onCancel: () -> Void
+    let onRemove: () -> Void
+
+    private enum FocusedAction: Hashable {
+        case cancel
+        case remove
+    }
+
+    @FocusState private var focusedAction: FocusedAction?
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.66)
+                .ignoresSafeArea()
+
+            VStack(spacing: 26) {
+                Text("Movie Options")
+                    .font(.system(size: 34, weight: .bold, design: .rounded))
+                    .foregroundStyle(Color.teaCream)
+
+                Button {
+                    onRemove()
+                } label: {
+                    VStack(spacing: 3) {
+                        if isRemoving {
+                            ProgressView()
+                                .tint(Color.teaCream)
+                        }
+                        Text(isRemoving ? "Removing…" : "Remove from Row")
+                            .font(.headline.weight(.semibold))
+                            .lineLimit(1)
+                        Text("Clears saved progress")
+                            .font(.caption)
+                            .opacity(0.68)
+                    }
+                    .frame(width: 400)
+                }
+                .buttonStyle(TeaActionButtonStyle())
+                .focusEffectDisabled()
+                .focused($focusedAction, equals: .remove)
+                .disabled(isRemoving)
+
+                Button("Done") {
+                    onCancel()
+                }
+                .font(.headline.weight(.semibold))
+                .buttonStyle(TeaActionButtonStyle())
+                .focusEffectDisabled()
+                .focused($focusedAction, equals: .cancel)
+                .disabled(isRemoving)
+            }
+            .padding(40)
+            .frame(width: 620)
+            .background(
+                LinearGradient(
+                    colors: [Color.teaPanelElevated, Color.teaPanel],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
+                in: RoundedRectangle(cornerRadius: 28, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 28, style: .continuous)
+                    .stroke(Color.teaAccentLight.opacity(0.18), lineWidth: 1.5)
+            }
+            .shadow(color: .black.opacity(0.52), radius: 52, y: 24)
+        }
+        .transition(.opacity.combined(with: .scale(scale: 0.97)))
+        .task {
+            focusedAction = .cancel
+        }
+        .onExitCommand {
+            if !isRemoving {
+                onCancel()
+            }
+        }
+    }
+}
+
+struct MovieRatingBadges: View {
+    let ratings: MovieRatings?
+    var tmdbRating: Double? = nil
+
+    var body: some View {
+        HStack(spacing: 10) {
+            if let tmdbRating, tmdbRating > 0 {
+                RatingBadge(source: .tmdb, value: String(format: "%.1f", tmdbRating))
+            }
+            if let imdb = ratings?.imdb {
+                RatingBadge(source: .imdb, value: String(format: "%.1f", imdb))
+            }
+            if let rottenTomatoes = ratings?.rottenTomatoes {
+                RatingBadge(source: .rottenTomatoes, value: "\(rottenTomatoes)%")
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private enum RatingSource {
+    case tmdb
+    case imdb
+    case rottenTomatoes
+
+    var accessibilityName: String {
+        switch self {
+        case .tmdb: "TMDB"
+        case .imdb: "IMDb"
+        case .rottenTomatoes: "Rotten Tomatoes"
+        }
+    }
+}
+
+private struct RatingBadge: View {
+    let source: RatingSource
+    let value: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            brandMark
+            Text(value)
+                .font(.system(size: 18, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(Color.teaCream.opacity(0.94))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            Color.teaPanel.opacity(0.82),
+            in: RoundedRectangle(cornerRadius: 11, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .stroke(Color.teaCream.opacity(0.12), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.16), radius: 7, y: 3)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(source.accessibilityName) \(value)")
+    }
+
+    @ViewBuilder
+    private var brandMark: some View {
+        switch source {
+        case .tmdb:
+            HStack(spacing: 3) {
+                Image(systemName: "film.fill")
+                Text("TMDB")
+            }
+            .font(.system(size: 13, weight: .bold, design: .rounded))
+            .foregroundStyle(Color.teaAccentLight)
+        case .imdb:
+            Text("IMDb")
+                .font(.system(size: 13, weight: .black, design: .rounded))
+                .foregroundStyle(Color.teaBackground)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 3)
+                .background(
+                    Color.teaHoney,
+                    in: RoundedRectangle(cornerRadius: 4, style: .continuous)
+                )
+        case .rottenTomatoes:
+            TomatoMark(size: 23)
+        }
+    }
+}
+
+private struct TomatoMark: View {
+    let size: CGFloat
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(Color.teaTomato)
+                .frame(width: size * 0.78, height: size * 0.78)
+                .offset(y: size * 0.08)
+            Circle()
+                .fill(Color.teaCream.opacity(0.26))
+                .frame(width: size * 0.16, height: size * 0.16)
+                .offset(x: -size * 0.16, y: -size * 0.02)
+            Image(systemName: "leaf.fill")
+                .font(.system(size: size * 0.48, weight: .bold))
+                .foregroundStyle(Color.teaAccent)
+                .rotationEffect(.degrees(-22))
+                .offset(y: -size * 0.27)
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+    }
+}
+
 private struct MovieCardButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -144,6 +338,7 @@ private struct MovieCardButtonStyle: ButtonStyle {
 struct MovieNavigationCard: View {
     let movie: Movie
     var progress: Double? = nil
+    var showsOptionsIndicator = false
     var requestsInitialFocus = false
     var action: (() -> Void)? = nil
     @FocusState private var isFocused: Bool
@@ -180,8 +375,8 @@ struct MovieNavigationCard: View {
                 .overlay {
                     RoundedRectangle(cornerRadius: 20, style: .continuous)
                         .stroke(
-                            isFocused ? Color.teaAccentLight : Color.teaCream.opacity(0.12),
-                            lineWidth: isFocused ? 3 : 1
+                            isFocused ? Color.teaAccentLight.opacity(0.82) : Color.teaCream.opacity(0.12),
+                            lineWidth: isFocused ? 2.5 : 1
                         )
                 }
                 .overlay(alignment: .bottom) {
@@ -192,27 +387,45 @@ struct MovieNavigationCard: View {
                             .padding(.bottom, 11)
                     }
                 }
+                .overlay(alignment: .topTrailing) {
+                    if isFocused {
+                        Image(systemName: showsOptionsIndicator ? "ellipsis" : "play.fill")
+                            .font(.system(size: 17, weight: .bold))
+                            .foregroundStyle(Color.teaCream)
+                            .frame(width: 42, height: 42)
+                            .background(Color.teaPanelElevated.opacity(0.94), in: Circle())
+                            .overlay {
+                                Circle()
+                                    .stroke(Color.teaCream.opacity(0.18), lineWidth: 1)
+                            }
+                            .shadow(color: .black.opacity(0.20), radius: 8, y: 4)
+                            .padding(14)
+                            .transition(.scale.combined(with: .opacity))
+                            .accessibilityHidden(true)
+                    }
+                }
                 .shadow(
-                    color: isFocused ? Color.teaAccent.opacity(0.25) : .black.opacity(0.35),
-                    radius: isFocused ? 28 : 12,
-                    y: isFocused ? 14 : 8
+                    color: isFocused ? Color.teaAccent.opacity(0.18) : .black.opacity(0.35),
+                    radius: isFocused ? 24 : 12,
+                    y: isFocused ? 12 : 8
                 )
 
-            Text(movie.title)
-                .font(.headline.weight(.semibold))
-                .foregroundStyle(Color.teaCream)
-                .lineLimit(2)
-                .frame(width: cardWidth, height: 58, alignment: .topLeading)
-            if let year = movie.year {
-                Text(String(year))
-                    .font(.subheadline)
-                    .foregroundStyle(Color.teaMuted)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(movie.title)
+                    .font(.headline.weight(.semibold))
+                    .foregroundStyle(isFocused ? Color.teaAccentLight : Color.teaCream)
+                    .lineLimit(1)
+                if let year = movie.year {
+                    Text(String(year))
+                        .font(.subheadline)
+                        .foregroundStyle(Color.teaMuted)
+                }
             }
+            .frame(width: cardWidth, alignment: .leading)
         }
         .frame(width: cardWidth, alignment: .leading)
         .contentShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .scaleEffect(isFocused ? 1.035 : 1)
-        .offset(y: isFocused ? -6 : 0)
+        .scaleEffect(isFocused ? 1.028 : 1, anchor: .topLeading)
         .animation(.snappy(duration: 0.22), value: isFocused)
     }
 }

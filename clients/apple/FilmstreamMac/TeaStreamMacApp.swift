@@ -3,21 +3,24 @@ import Observation
 import SwiftUI
 
 @main
-struct FilmstreamTVApp: App {
-    @State private var model = AppModel()
+struct TeaStreamMacApp: App {
+    @State private var model = MacAppModel()
 
     var body: some Scene {
         WindowGroup {
-            HomeView()
+            MacHomeView()
                 .environment(model)
                 .preferredColorScheme(.dark)
+                .frame(minWidth: 900, minHeight: 620)
         }
+        .defaultSize(width: 1_180, height: 780)
+        .windowToolbarStyle(.unifiedCompact)
     }
 }
 
 @MainActor
 @Observable
-final class AppModel {
+final class MacAppModel {
     let api: FilmstreamAPI
     var continueWatching: [WatchHistoryEntry] = []
     var discoverySections: [DiscoverySection] = []
@@ -26,7 +29,7 @@ final class AppModel {
     var isLoading = false
     var errorMessage: String?
 
-    init(api: FilmstreamAPI = FilmstreamAPI(baseURL: AppConfiguration.serverURL)) {
+    init(api: FilmstreamAPI = FilmstreamAPI(baseURL: MacAppConfiguration.serverURL)) {
         self.api = api
     }
 
@@ -93,7 +96,7 @@ final class AppModel {
     }
 }
 
-enum AppConfiguration {
+enum MacAppConfiguration {
     static let serverURL: URL = {
         if let value = Bundle.main.object(forInfoDictionaryKey: "FilmstreamServerURL") as? String,
            let url = URL(string: value) {

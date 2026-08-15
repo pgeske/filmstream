@@ -13,6 +13,10 @@ struct MovieDetailView: View {
         model.history(for: movie)
     }
 
+    private var ratings: MovieRatings? {
+        model.ratings(for: movie)
+    }
+
     var body: some View {
         ZStack(alignment: .bottomLeading) {
             BackdropImage(movie: movie)
@@ -36,7 +40,7 @@ struct MovieDetailView: View {
                     )
                 }
 
-            HStack(alignment: .bottom, spacing: 54) {
+            HStack(alignment: .center, spacing: 54) {
                 PosterImage(movie: movie)
                     .frame(width: 310, height: 465)
                     .overlay {
@@ -93,9 +97,15 @@ struct MovieDetailView: View {
             .padding(.bottom, 62)
         }
         .background(Color.teaBackground)
-        .fullScreenCover(item: $preparedPlayback, onDismiss: {
-            Task { await model.loadContinueWatching() }
-        }) { prepared in
+        .task(id: movie.id) {
+            await model.loadRatings(for: movie)
+        }
+        .fullScreenCover(
+            item: $preparedPlayback,
+            onDismiss: {
+                Task { await model.loadContinueWatching() }
+            }
+        ) { prepared in
             PlayerView(movie: movie, prepared: prepared, api: model.api)
         }
     }
@@ -106,10 +116,10 @@ struct MovieDetailView: View {
             if let year = movie.year {
                 Text(String(year))
             }
-            if let voteAverage = movie.voteAverage, voteAverage > 0 {
-                Label(String(format: "%.1f", voteAverage), systemImage: "star.fill")
-                    .foregroundStyle(Color.teaAmber)
-            }
+            MovieRatingBadges(
+                ratings: ratings,
+                tmdbRating: movie.voteAverage
+            )
             if let history, history.progress > 0 {
                 Text("\(Int(history.progress * 100))% watched")
                     .foregroundStyle(Color.teaAccentLight)

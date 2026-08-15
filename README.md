@@ -8,7 +8,7 @@ Use it only with media you are authorized to download and share.
 
 - Local backend bound to `127.0.0.1:8943`
 - Bubble Tea terminal UI with search, continue watching, progress, and history controls
-- TeaStream, cozy native iPhone and Apple TV clients with poster search, movie details, selectable subtitles, AVPlayer HLS playback, and shared progress
+- TeaStream, cozy native iPhone, Apple TV, and Mac clients with poster search, movie details, selectable subtitles, AVPlayer HLS playback, and shared progress
 - One-command CLI that starts the backend when needed and launches MPV
 - A small, trusted open-movie catalog plus an Internet Archive reference indexer
 - Standard Torznab indexers, including Prowlarr and Jackett endpoints
@@ -100,15 +100,16 @@ An automatically started server logs to `~/.cache/filmstream/server.log`.
 
 ## Apple clients
 
-TeaStream provides native SwiftUI apps for iPhone and Apple TV in `clients/apple`. Both targets reuse `FilmstreamCore` for API models, networking, metadata, HLS preparation, subtitles, and watch progress. `FilmstreamIOS` uses touch-first tabs and playback controls, while `FilmstreamTV` retains its remote-focused interface and existing bundle identifier.
+TeaStream provides native SwiftUI apps for iPhone, Apple TV, and Mac in `clients/apple`. All targets reuse `FilmstreamCore` for API models, networking, metadata, HLS preparation, subtitles, and watch progress. `FilmstreamIOS` uses touch-first tabs and playback controls, `FilmstreamTV` retains its remote-focused interface and existing bundle identifier, and `FilmstreamMac` provides a desktop sidebar and pointer-friendly shelves.
 
 ```bash
 make apple-test
 make ios-build
 make tvos-build
+make macos-build
 ```
 
-Install a signed development build on one paired iPhone with `make ios-install`. The apps use the server for catalog search, TMDB-powered Popular Now and Top Rated discovery rails, torrent preparation, and durable watch progress. Discovery excludes upcoming and theater-only titles by requiring an existing digital, physical, or TV release. See [`clients/apple/README.md`](clients/apple/README.md) for project generation, simulator, device installation, TMDB, and networking details.
+Install signed development builds with `make ios-install` or `make tvos-install`. The apps use the server for catalog search, TMDB-powered Popular Now and Top Rated discovery rails, optional IMDb and Rotten Tomatoes scores from OMDb, torrent preparation, and durable watch progress. Discovery excludes upcoming and theater-only titles by requiring an existing digital, physical, or TV release. See [`clients/apple/README.md`](clients/apple/README.md) for project generation, builds, device installation, metadata providers, and networking details.
 
 ## Configuration
 
@@ -165,7 +166,7 @@ The optional configuration file is `~/.config/filmstream/config.json`:
 }
 ```
 
-Set `FILMSTREAM_CONFIG` to use another path or `FILMSTREAM_SERVER` to use an already-running backend.
+Set `FILMSTREAM_CONFIG` to use another path or `FILMSTREAM_SERVER` to use an already-running backend. Set `OMDB_API_KEY` to enable the optional `GET /v1/catalog/ratings` endpoint. When a client opens movie details, the server resolves a supplied TMDB movie ID to its IMDb ID, queries OMDb, and caches successful results in memory. This avoids misses caused by localized or alternate titles, and the API key never leaves the server.
 
 Temporary torrent data is stored beneath `<data_dir>/torrents`, and temporary native-player segments are stored beneath `<hls_dir>`. Filmstream owns and clears both locations on clean startup and shutdown; do not place unrelated files there. Durable watch progress and private selected-torrent metadata are stored separately beneath `<state_dir>` with owner-only permissions.
 
@@ -264,8 +265,10 @@ A 1.0 ratio means one uploaded byte per downloaded byte. This is necessarily bes
 - `POST /v1/resolve`
 - `GET /v1/catalog/search?query=...`
 - `GET /v1/catalog/discover`
+- `GET /v1/catalog/ratings`
 - `GET /v1/watch-history?continue=true`
 - `PUT /v1/watch-history`
+- `DELETE /v1/watch-history/{id}`
 - `POST /v1/playbacks`
 - `GET /v1/playbacks/{id}`
 - `GET|HEAD /v1/playbacks/{id}/stream`

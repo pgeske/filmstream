@@ -3,6 +3,9 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,17 +18,25 @@ import (
 	"github.com/pgeske/filmstream/internal/hls"
 	"github.com/pgeske/filmstream/internal/metadata"
 	"github.com/pgeske/filmstream/internal/resolver"
+	"github.com/pgeske/filmstream/internal/torrentstream"
 )
 
 type fakeResolver struct{}
 
 type fakeMetadata struct{}
 
+type fakeRatings struct{}
+
 type fakeHLSManager struct {
 	dir              string
 	stopped          string
 	subtitlePlayback string
 	subtitleIndex    int
+	subtitleTracks   map[string][]hls.SubtitleTrack
+}
+
+func (f *fakeHLSManager) ProbeSubtitles(_ context.Context, id string) ([]hls.SubtitleTrack, error) {
+	return f.subtitleTracks[id], nil
 }
 
 func (f *fakeHLSManager) Start(_ context.Context, id string, start float64) (hls.Stream, error) {
@@ -46,8 +57,33 @@ func (f *fakeHLSManager) Stop(id string) {
 	f.stopped = id
 }
 
+func (fakeMetadata) IMDbID(_ context.Context, mediaID string) (string, error) {
+	if mediaID == "tmdb:1" {
+		return "tt1234567", nil
+	}
+	return "", errors.New("movie has no IMDb ID")
+}
+
 func (fakeMetadata) Search(_ context.Context, _ string) ([]metadata.Movie, error) {
 	return []metadata.Movie{{ID: "tmdb:1", Title: "The Movie", Year: 2001, PosterURL: "https://image.example/poster.jpg"}}, nil
+}
+
+func (fakeRatings) RatingsByIMDbID(_ context.Context, imdbID string) (metadata.MovieRatings, error) {
+	if imdbID != "tt1234567" {
+		return metadata.MovieRatings{}, errors.New("unexpected IMDb ID")
+	}
+	imdb := 9.1
+	rottenTomatoes := 95
+	return metadata.MovieRatings{IMDb: &imdb, RottenTomatoes: &rottenTomatoes}, nil
+}
+
+func (fakeRatings) Ratings(_ context.Context, title string, year int) (metadata.MovieRatings, error) {
+	if title != "The Movie" || year != 2001 {
+		return metadata.MovieRatings{}, nil
+	}
+	imdb := 8.4
+	rottenTomatoes := 91
+	return metadata.MovieRatings{IMDb: &imdb, RottenTomatoes: &rottenTomatoes}, nil
 }
 
 func (fakeMetadata) Discover(_ context.Context, collection metadata.Collection) ([]metadata.Movie, error) {
@@ -81,6 +117,36 @@ func TestSearchCatalogReturnsMetadata(t *testing.T) {
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "poster.jpg") {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestCatalogRatingsReturnsExternalScores(t *testing.T) {
+	server := &Server{ratingsProvider: fakeRatings{}}
+	request := httptest.NewRequest(http.MethodGet, "/v1/catalog/ratings?title=The+Movie&year=2001", nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"imdb":8.4`) || !strings.Contains(response.Body.String(), `"rotten_tomatoes":91`) {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestCatalogRatingsUsesTMDBMovieIDForReliableLookup(t *testing.T) {
+	server := &Server{metadataProvider: fakeMetadata{}, ratingsProvider: fakeRatings{}}
+	request := httptest.NewRequest(http.MethodGet, "/v1/catalog/ratings?title=Localized+Movie&year=2001&media_id=tmdb%3A1", nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"imdb":9.1`) || !strings.Contains(response.Body.String(), `"rotten_tomatoes":95`) {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestCatalogRatingsRequiresProvider(t *testing.T) {
+	server := &Server{}
+	request := httptest.NewRequest(http.MethodGet, "/v1/catalog/ratings?title=The+Movie&year=2001", nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
 }
@@ -137,6 +203,34 @@ func TestWatchHistoryProgressRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRemoveWatchHistoryClearsSavedProgress(t *testing.T) {
+	store := history.New(t.TempDir())
+	entry, err := store.RecordProgress(history.Entry{
+		MediaID:         "tmdb:1",
+		Title:           "The Movie",
+		Year:            2001,
+		PositionSeconds: 120,
+		DurationSeconds: 1000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{historyStore: store}
+	request := httptest.NewRequest(http.MethodDelete, "/v1/watch-history/"+entry.ID, nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	entries, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("entries after removal = %+v", entries)
+	}
+}
+
 func TestWatchHistoryAddsMissingMetadata(t *testing.T) {
 	store := history.New(t.TempDir())
 	entry, err := store.RecordProgress(history.Entry{
@@ -158,6 +252,23 @@ func TestWatchHistoryAddsMissingMetadata(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].MediaID != "tmdb:1" || entries[0].UpdatedAt != entry.UpdatedAt {
 		t.Fatalf("entries = %+v", entries)
+	}
+}
+
+func TestFirstTextSubtitleOptionPrefersLiveSupportedRelease(t *testing.T) {
+	manager := &fakeHLSManager{subtitleTracks: map[string][]hls.SubtitleTrack{
+		"with-subtitles": {{Index: 3, Language: "en"}},
+	}}
+	server := &Server{
+		hlsManager: manager,
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	options := []playbackOption{
+		{session: &torrentstream.Session{ID: "without-subtitles"}, peers: 12},
+		{session: &torrentstream.Session{ID: "with-subtitles"}, peers: 5},
+	}
+	if index := server.firstTextSubtitleOption(t.Context(), options); index != 1 {
+		t.Fatalf("subtitle option = %d, want 1", index)
 	}
 }
 

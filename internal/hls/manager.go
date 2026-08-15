@@ -155,6 +155,18 @@ func New(cfg Config) (*Manager, error) {
 	}, nil
 }
 
+func (m *Manager) ProbeSubtitles(ctx context.Context, playbackID string) ([]SubtitleTrack, error) {
+	if !validPlaybackID(playbackID) {
+		return nil, errors.New("invalid playback ID")
+	}
+	sourceURL := m.sourceBaseURL + "/v1/playbacks/" + playbackID + "/stream"
+	probe, err := m.probe(ctx, sourceURL)
+	if err != nil {
+		return nil, err
+	}
+	return supportedSubtitles(probe), nil
+}
+
 func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds float64) (Stream, error) {
 	if !validPlaybackID(playbackID) {
 		return Stream{}, errors.New("invalid playback ID")
@@ -240,6 +252,7 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 		return Stream{}, err
 	}
 	m.logger.Info("HLS stream ready", "playback_id", playbackID, "codec", codec,
+		"text_subtitle_tracks", len(subtitles),
 		"requested_start_seconds", startSeconds, "timeline_start_seconds", timelineStart)
 	return stream.info, nil
 }

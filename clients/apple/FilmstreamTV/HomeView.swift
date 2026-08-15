@@ -3,37 +3,55 @@ import SwiftUI
 
 struct HomeView: View {
     @Environment(AppModel.self) private var model
+    @State private var pendingRemoval: WatchHistoryEntry?
+    @State private var isRemovingFromContinueWatching = false
 
     var body: some View {
-        NavigationStack {
-            ZStack {
-                TeaBackground()
+        ZStack {
+            NavigationStack {
+                ZStack {
+                    TeaBackground()
 
-                ScrollView(.vertical, showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: 68) {
-                        header
-                        continueWatchingSection
-                        ForEach(model.discoverySections) { section in
-                            discoverySection(section)
+                    ScrollView(.vertical, showsIndicators: false) {
+                        VStack(alignment: .leading, spacing: 34) {
+                            header
+                            continueWatchingSection
+                            ForEach(model.discoverySections) { section in
+                                discoverySection(section)
+                            }
+                            if let errorMessage = model.errorMessage {
+                                Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(Color.teaAmber)
+                                    .font(.headline)
+                            }
                         }
-                        if let errorMessage = model.errorMessage {
-                            Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
-                                .foregroundStyle(Color.teaAmber)
-                                .font(.headline)
-                        }
+                        .padding(.horizontal, 88)
+                        .padding(.top, 64)
+                        .padding(.bottom, 110)
                     }
-                    .padding(.horizontal, 88)
-                    .padding(.top, 64)
-                    .padding(.bottom, 110)
+                }
+                .navigationDestination(for: Movie.self) { movie in
+                    MovieDetailView(movie: movie)
+                }
+                .task {
+                    await model.loadHome()
                 }
             }
-            .navigationDestination(for: Movie.self) { movie in
-                MovieDetailView(movie: movie)
-            }
-            .task {
-                await model.loadHome()
+            .disabled(pendingRemoval != nil)
+
+            if let pendingRemoval {
+                ContinueWatchingOptionsDialog(
+                    isRemoving: isRemovingFromContinueWatching,
+                    onCancel: {
+                        self.pendingRemoval = nil
+                    },
+                    onRemove: {
+                        Task { await removeFromContinueWatching(pendingRemoval) }
+                    }
+                )
             }
         }
+        .animation(.snappy(duration: 0.22), value: pendingRemoval != nil)
     }
 
     private var header: some View {
@@ -49,20 +67,16 @@ struct HomeView: View {
             .buttonStyle(TeaActionButtonStyle())
             .focusEffectDisabled()
         }
+        .padding(.horizontal, 16)
         .focusSection()
     }
 
     @ViewBuilder
     private var continueWatchingSection: some View {
-        VStack(alignment: .leading, spacing: 30) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Continue Watching")
-                    .font(.system(size: 42, weight: .bold, design: .rounded))
-                    .foregroundStyle(Color.teaCream)
-                Text("Settle in and pick up where you left off")
-                    .font(.title3)
-                    .foregroundStyle(Color.teaMuted)
-            }
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Continue Watching")
+                .font(.system(size: 42, weight: .bold, design: .rounded))
+                .foregroundStyle(Color.teaCream)
 
             if model.isLoading && model.continueWatching.isEmpty {
                 HStack(spacing: 18) {
@@ -81,31 +95,34 @@ struct HomeView: View {
                             MovieNavigationCard(
                                 movie: entry.movie,
                                 progress: entry.progress,
+                                showsOptionsIndicator: true,
                                 requestsInitialFocus: entry.id == model.continueWatching.first?.id
                             )
+                            .highPriorityGesture(
+                                LongPressGesture(minimumDuration: 0.65)
+                                    .onEnded { _ in
+                                        pendingRemoval = entry
+                                    }
+                            )
+                            .accessibilityHint("Press and hold the center button for options")
                         }
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 34)
-                    .padding(.bottom, 44)
+                    .padding(.top, 14)
+                    .padding(.bottom, 18)
                 }
             }
         }
+        .padding(.horizontal, 16)
         .focusSection()
     }
 
     @ViewBuilder
     private func discoverySection(_ section: DiscoverySection) -> some View {
         if !section.items.isEmpty {
-            VStack(alignment: .leading, spacing: 30) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(section.title)
-                        .font(.system(size: 42, weight: .bold, design: .rounded))
-                        .foregroundStyle(Color.teaCream)
-                    Text(section.subtitle)
-                        .font(.title3)
-                        .foregroundStyle(Color.teaMuted)
-                }
+            VStack(alignment: .leading, spacing: 8) {
+                Text(section.title)
+                    .font(.system(size: 42, weight: .bold, design: .rounded))
+                    .foregroundStyle(Color.teaCream)
 
                 ScrollView(.horizontal, showsIndicators: false) {
                     LazyHStack(alignment: .top, spacing: 48) {
@@ -113,12 +130,25 @@ struct HomeView: View {
                             MovieNavigationCard(movie: movie)
                         }
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 34)
-                    .padding(.bottom, 44)
+                    .padding(.top, 14)
+                    .padding(.bottom, 18)
                 }
             }
+            .padding(.horizontal, 16)
             .focusSection()
+        }
+    }
+
+    private func removeFromContinueWatching(_ entry: WatchHistoryEntry) async {
+        isRemovingFromContinueWatching = true
+        defer { isRemovingFromContinueWatching = false }
+        do {
+            try await model.removeFromContinueWatching(entry)
+            pendingRemoval = nil
+            model.errorMessage = nil
+        } catch {
+            pendingRemoval = nil
+            model.errorMessage = error.localizedDescription
         }
     }
 

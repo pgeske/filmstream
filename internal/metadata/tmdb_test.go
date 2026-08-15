@@ -39,6 +39,38 @@ func TestTMDBSearchReturnsMovieArtwork(t *testing.T) {
 	}
 }
 
+func TestTMDBReturnsCachedIMDbID(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/movie/671/external_ids" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Fatalf("authorization = %q", got)
+		}
+		_, _ = w.Write([]byte(`{"imdb_id":"tt0241527"}`))
+	}))
+	defer server.Close()
+
+	provider, err := NewTMDB(server.URL, "test-token", "en-US", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		imdbID, err := provider.IMDbID(t.Context(), "tmdb:671")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if imdbID != "tt0241527" {
+			t.Fatalf("IMDb ID = %q", imdbID)
+		}
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want cached single request", requests)
+	}
+}
+
 func TestTMDBDiscoveryReturnsHomeReleasedPopularAndTopRatedMovies(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {

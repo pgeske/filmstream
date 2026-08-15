@@ -99,6 +99,31 @@ while :; do sleep 1; done
 	}
 }
 
+func TestManagerProbesTextSubtitlesWithoutStartingPlayback(t *testing.T) {
+	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
+cat <<'JSON'
+{"streams":[{"index":2,"codec_name":"subrip","codec_type":"subtitle","tags":{"language":"eng","title":"SDH"}},{"index":3,"codec_name":"hdmv_pgs_subtitle","codec_type":"subtitle"}],"format":{"duration":"7200"}}
+JSON
+`)
+	ffmpeg := writeExecutable(t, "ffmpeg", "#!/bin/sh\nexit 1\n")
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	tracks, err := manager.ProbeSubtitles(t.Context(), "playback-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tracks) != 1 || tracks[0].Index != 2 || tracks[0].Language != "en" || tracks[0].Title != "SDH" {
+		t.Fatalf("tracks = %+v", tracks)
+	}
+}
+
 func TestManagerRejectsDolbyVision(t *testing.T) {
 	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
 cat <<'JSON'

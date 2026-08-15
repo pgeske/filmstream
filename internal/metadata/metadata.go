@@ -14,8 +14,25 @@ type Movie struct {
 	VoteAverage   float64 `json:"vote_average,omitempty"`
 }
 
+type MovieRatings struct {
+	IMDb           *float64 `json:"imdb,omitempty"`
+	RottenTomatoes *int     `json:"rotten_tomatoes,omitempty"`
+}
+
 type Provider interface {
 	Search(context.Context, string) ([]Movie, error)
+}
+
+type RatingsProvider interface {
+	Ratings(context.Context, string, int) (MovieRatings, error)
+}
+
+type IMDbRatingsProvider interface {
+	RatingsByIMDbID(context.Context, string) (MovieRatings, error)
+}
+
+type IMDbIDProvider interface {
+	IMDbID(context.Context, string) (string, error)
 }
 
 type Collection string

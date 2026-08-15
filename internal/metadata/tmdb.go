@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,6 +25,8 @@ type TMDB struct {
 	token    string
 	language string
 	client   *http.Client
+	mu       sync.RWMutex
+	imdbIDs  map[string]string
 }
 
 func NewTMDB(baseURL, token, language string, client *http.Client) (*TMDB, error) {
@@ -44,7 +47,13 @@ func NewTMDB(baseURL, token, language string, client *http.Client) (*TMDB, error
 	if language == "" {
 		language = "en-US"
 	}
-	return &TMDB{baseURL: baseURL, token: strings.TrimSpace(token), language: language, client: client}, nil
+	return &TMDB{
+		baseURL:  baseURL,
+		token:    strings.TrimSpace(token),
+		language: language,
+		client:   client,
+		imdbIDs:  make(map[string]string),
+	}, nil
 }
 
 func (t *TMDB) Search(ctx context.Context, query string) ([]Movie, error) {
@@ -58,6 +67,64 @@ func (t *TMDB) Search(ctx context.Context, query string) ([]Movie, error) {
 	values.Set("language", t.language)
 	values.Set("page", "1")
 	return t.fetchMovies(ctx, "search/movie", values)
+}
+
+func (t *TMDB) IMDbID(ctx context.Context, mediaID string) (string, error) {
+	id, ok := strings.CutPrefix(strings.TrimSpace(mediaID), "tmdb:")
+	if !ok {
+		return "", fmt.Errorf("unsupported TMDB media ID %q", mediaID)
+	}
+	if value, err := strconv.ParseInt(id, 10, 64); err != nil || value <= 0 {
+		return "", fmt.Errorf("invalid TMDB movie ID %q", mediaID)
+	}
+
+	t.mu.RLock()
+	cached, ok := t.imdbIDs[id]
+	t.mu.RUnlock()
+	if ok {
+		return cached, nil
+	}
+
+	endpoint, err := url.JoinPath(t.baseURL, "movie", id, "external_ids")
+	if err != nil {
+		return "", err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Authorization", "Bearer "+t.token)
+	response, err := t.client.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("request TMDB external IDs: %w", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxTMDBResponseBytes))
+	if err != nil {
+		return "", fmt.Errorf("read TMDB external IDs: %w", err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return "", fmt.Errorf("TMDB external IDs returned %s", response.Status)
+	}
+	var payload struct {
+		IMDbID string `json:"imdb_id"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", fmt.Errorf("decode TMDB external IDs: %w", err)
+	}
+	imdbID := strings.TrimSpace(payload.IMDbID)
+	if !strings.HasPrefix(imdbID, "tt") {
+		return "", fmt.Errorf("TMDB movie %s has no IMDb ID", id)
+	}
+	if _, err := strconv.ParseUint(strings.TrimPrefix(imdbID, "tt"), 10, 64); err != nil {
+		return "", fmt.Errorf("TMDB returned invalid IMDb ID %q", imdbID)
+	}
+
+	t.mu.Lock()
+	t.imdbIDs[id] = imdbID
+	t.mu.Unlock()
+	return imdbID, nil
 }
 
 func (t *TMDB) Discover(ctx context.Context, collection Collection) ([]Movie, error) {
