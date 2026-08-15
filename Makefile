@@ -3,7 +3,11 @@ PREFIX ?= $(HOME)/.local
 APPLE_DIR := clients/apple
 TVOS_DESTINATION ?= platform=tvOS Simulator,name=Apple TV 4K (3rd generation)
 
-.PHONY: build install test fmt apple-project apple-test tvos-build
+TVOS_DEVICE_ID ?=
+TVOS_DEVELOPMENT_TEAM ?=
+TVOS_DERIVED_DATA_PATH ?=
+
+.PHONY: build install test fmt apple-project apple-test tvos-build tvos-install
 
 build:
 	go build -o bin/$(BINARY) ./cmd/filmstream
@@ -29,3 +33,9 @@ tvos-build: apple-project
 		-scheme FilmstreamTV \
 		-destination '$(TVOS_DESTINATION)' \
 		CODE_SIGNING_ALLOWED=NO clean build
+
+tvos-install:
+	TVOS_DEVICE_ID='$(TVOS_DEVICE_ID)' \
+	TVOS_DEVELOPMENT_TEAM='$(TVOS_DEVELOPMENT_TEAM)' \
+	TVOS_DERIVED_DATA_PATH='$(TVOS_DERIVED_DATA_PATH)' \
+		./scripts/install-teastream-tvos

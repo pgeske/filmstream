@@ -16,6 +16,28 @@ xcodebuild -project FilmstreamApple.xcodeproj \
   build
 ```
 
+The corresponding repository shortcut is `make tvos-build`.
+
+## Install on a physical Apple TV
+
+Before the first installation, pair the Apple TV in Xcode and sign in under **Xcode > Settings > Apple Accounts**. The Apple TV and Mac must be able to reach each other on the local network. If TeaStream uses a tailnet-only backend, authenticate the Apple TV in Tailscale as well.
+
+From the repository root, build, sign, install, and launch TeaStream with:
+
+```bash
+make tvos-install
+```
+
+The command regenerates the Xcode project, discovers a paired physical Apple TV, detects a single Apple Development team from the login keychain, lets Xcode update automatic provisioning, and installs the signed app with `devicectl`. Use explicit values when more than one device or development team is available:
+
+```bash
+make tvos-install \
+  TVOS_DEVICE_ID=<apple-tv-udid> \
+  TVOS_DEVELOPMENT_TEAM=<team-id>
+```
+
+Set `TVOS_DERIVED_DATA_PATH` to override the default incremental build directory at `clients/apple/.derivedData/device`. Personal Team provisioning expires periodically, so rerun the command when tvOS reports that the app is no longer available.
+
 TeaStream defaults to `http://filmstream.home.alyoshukai.com`. `FilmstreamTV/Info.plist` contains a temporary App Transport Security exception for that private hostname. Replace it with HTTPS before distributing the app.
 
 ## Server capabilities
