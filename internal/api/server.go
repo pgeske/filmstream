@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/pgeske/filmstream/internal/catalog"
+	"github.com/pgeske/filmstream/internal/config"
 	"github.com/pgeske/filmstream/internal/history"
 	"github.com/pgeske/filmstream/internal/hls"
 	"github.com/pgeske/filmstream/internal/indexer"
@@ -35,7 +36,9 @@ type CreatePlaybackRequest struct {
 }
 
 const (
-	maxUsenetCandidates    = 3
+	maxUsenetCandidates    = 10
+	maxUsenetPreparation   = 30 * time.Second
+	usenetFailureTTL       = 30 * time.Minute
 	maxLiveSwarmCandidates = 3
 	minimumLivePeers       = 3
 	strongLiveSwarmPeers   = 20
@@ -93,13 +96,14 @@ type playbackCacheKey struct {
 }
 
 type Server struct {
-	indexers       *indexer.Registry
-	engine         *torrentstream.Engine
-	usenetEngine   usenetPlaybackEngine
-	defaults       catalog.Preferences
-	logger         *slog.Logger
-	reloadIndexers func() error
-	reloadResolver func() error
+	indexers           *indexer.Registry
+	engine             *torrentstream.Engine
+	usenetEngine       usenetPlaybackEngine
+	playbackSourceMode string
+	defaults           catalog.Preferences
+	logger             *slog.Logger
+	reloadIndexers     func() error
+	reloadResolver     func() error
 
 	resolverMu        sync.RWMutex
 	movieResolver     resolver.Resolver
@@ -113,21 +117,28 @@ type Server struct {
 	mu                sync.RWMutex
 	selected          map[string]catalog.RankedCandidate
 	playbackCacheKeys map[string]playbackCacheKey
+	usenetFailures    map[string]time.Time
 }
 
 func New(indexers *indexer.Registry, engine *torrentstream.Engine, defaults catalog.Preferences, logger *slog.Logger) *Server {
 	server := &Server{
-		indexers:          indexers,
-		engine:            engine,
-		defaults:          defaults,
-		logger:            logger,
-		selected:          make(map[string]catalog.RankedCandidate),
-		playbackCacheKeys: make(map[string]playbackCacheKey),
+		indexers:           indexers,
+		engine:             engine,
+		playbackSourceMode: config.PlaybackSourceHybrid,
+		defaults:           defaults,
+		logger:             logger,
+		selected:           make(map[string]catalog.RankedCandidate),
+		playbackCacheKeys:  make(map[string]playbackCacheKey),
+		usenetFailures:     make(map[string]time.Time),
 	}
 	engine.SetCleanupHandler(func(id, _ string) {
 		server.cleanupPlayback(id)
 	})
 	return server
+}
+
+func (s *Server) SetPlaybackSourceMode(mode string) {
+	s.playbackSourceMode = mode
 }
 
 func (s *Server) SetUsenetEngine(engine *usenetstream.Engine) {
@@ -614,21 +625,42 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 	var selected *catalog.RankedCandidate
 	if request.Query != "" {
 		search := catalog.SearchRequest{Query: request.Query, Year: request.Year, Preferences: preferences}
+		allowUsenet := s.playbackSourceMode != config.PlaybackSourceTorrentOnly
+		allowTorrent := s.playbackSourceMode != config.PlaybackSourceUsenetOnly
 		var ranked []catalog.RankedCandidate
 		var searchErr error
 		var usenetErr error
 
-		if s.usenetEngine != nil {
-			candidates, err := s.indexers.SearchFirstProtocol(r.Context(), search, catalog.ProtocolUsenet)
-			if err != nil {
-				searchErr = err
+		if allowUsenet {
+			if s.usenetEngine == nil {
+				if !allowTorrent {
+					writeError(w, http.StatusServiceUnavailable, "Usenet-only playback is configured but the Usenet engine is unavailable")
+					return
+				}
 			} else {
-				ranked = catalog.Rank(search, candidates)
-				session, selected, usenetErr = s.createRankedUsenetPlayback(r.Context(), ranked, preferences)
-				if session == nil {
-					ranked = nil
+				candidates, err := s.indexers.SearchFirstProtocol(r.Context(), search, catalog.ProtocolUsenet)
+				if err != nil {
+					searchErr = err
+				} else {
+					ranked = catalog.Rank(search, candidates)
+					session, selected, usenetErr = s.createRankedUsenetPlayback(r.Context(), ranked, preferences)
+					if session == nil {
+						ranked = nil
+					}
 				}
 			}
+		}
+
+		if session == nil && !allowTorrent {
+			switch {
+			case searchErr != nil:
+				writeError(w, http.StatusBadGateway, searchErr.Error())
+			case usenetErr != nil:
+				writeError(w, http.StatusBadGateway, "Usenet playback unavailable: "+usenetErr.Error())
+			default:
+				writeError(w, http.StatusNotFound, "no matching Usenet candidates found")
+			}
+			return
 		}
 
 		if session == nil {
@@ -835,6 +867,8 @@ func (s *Server) createRankedUsenetPlayback(
 	if s.usenetEngine == nil {
 		return nil, nil, nil
 	}
+	preparationContext, cancel := context.WithTimeout(ctx, maxUsenetPreparation)
+	defer cancel()
 	attempts := 0
 	var failures []string
 	var fallbackSession *usenetstream.Session
@@ -843,22 +877,27 @@ func (s *Server) createRankedUsenetPlayback(
 		if candidate.Candidate.Protocol != catalog.ProtocolUsenet && candidate.Candidate.NZBURL == "" {
 			continue
 		}
+		if s.usenetCandidateRecentlyFailed(candidate.Candidate) {
+			failures = append(failures, candidate.Candidate.Name+": recently failed validation")
+			continue
+		}
 		if attempts >= maxUsenetCandidates {
 			break
 		}
 		attempts++
-		resolved, err := s.indexers.Resolve(ctx, candidate.Candidate)
+		resolved, err := s.indexers.Resolve(preparationContext, candidate.Candidate)
 		if err == nil {
 			var session *usenetstream.Session
-			session, err = s.usenetEngine.Create(ctx, usenetstream.Source{
+			session, err = s.usenetEngine.Create(preparationContext, usenetstream.Source{
 				NZBURL: resolved.NZBURL, Name: candidate.Candidate.Name,
 			})
 			if err == nil {
+				s.clearUsenetCandidateFailure(candidate.Candidate)
 				if !preferences.PreferTextSubtitles {
 					s.logger.Info("selected Usenet playback", "id", session.ID, "name", candidate.Candidate.Name)
 					return wrapUsenetSession(session), &candidate, nil
 				}
-				hasTextSubtitles, probeErr := s.playbackHasTextSubtitles(ctx, session.ID)
+				hasTextSubtitles, probeErr := s.playbackHasTextSubtitles(preparationContext, session.ID)
 				if probeErr != nil {
 					s.logger.Warn("probe Usenet playback subtitles", "id", session.ID,
 						"name", candidate.Candidate.Name, "error", probeErr)
@@ -880,12 +919,19 @@ func (s *Server) createRankedUsenetPlayback(
 				continue
 			}
 		}
-		if ctx.Err() != nil {
-			if fallbackSession != nil {
-				_ = s.usenetEngine.Drop(fallbackSession.ID)
+		if preparationContext.Err() != nil {
+			if ctx.Err() != nil {
+				if fallbackSession != nil {
+					_ = s.usenetEngine.Drop(fallbackSession.ID)
+				}
+				return nil, nil, ctx.Err()
 			}
-			return nil, nil, ctx.Err()
+			if fallbackSession != nil {
+				break
+			}
+			return nil, nil, fmt.Errorf("Usenet preparation exceeded %s", maxUsenetPreparation)
 		}
+		s.markUsenetCandidateFailed(candidate.Candidate)
 		failures = append(failures, fmt.Sprintf("%s: %v", candidate.Candidate.Name, err))
 	}
 	if fallbackSession != nil {
@@ -897,6 +943,41 @@ func (s *Server) createRankedUsenetPlayback(
 		return nil, nil, errors.New(strings.Join(failures, "; "))
 	}
 	return nil, nil, nil
+}
+
+func (s *Server) usenetCandidateRecentlyFailed(candidate catalog.Candidate) bool {
+	key := usenetCandidateKey(candidate)
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	expiresAt, found := s.usenetFailures[key]
+	if found && now.After(expiresAt) {
+		delete(s.usenetFailures, key)
+		return false
+	}
+	return found
+}
+
+func (s *Server) markUsenetCandidateFailed(candidate catalog.Candidate) {
+	s.mu.Lock()
+	if s.usenetFailures == nil {
+		s.usenetFailures = make(map[string]time.Time)
+	}
+	s.usenetFailures[usenetCandidateKey(candidate)] = time.Now().Add(usenetFailureTTL)
+	s.mu.Unlock()
+}
+
+func (s *Server) clearUsenetCandidateFailure(candidate catalog.Candidate) {
+	s.mu.Lock()
+	delete(s.usenetFailures, usenetCandidateKey(candidate))
+	s.mu.Unlock()
+}
+
+func usenetCandidateKey(candidate catalog.Candidate) string {
+	if candidate.ID != "" {
+		return candidate.Indexer + ":" + candidate.ID
+	}
+	return candidate.Indexer + ":" + candidate.Name
 }
 
 func (s *Server) createRankedPlayback(

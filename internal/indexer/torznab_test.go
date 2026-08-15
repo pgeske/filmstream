@@ -60,6 +60,37 @@ func TestTorznabCapabilitiesSearchAndResolve(t *testing.T) {
 	}
 }
 
+func TestTorznabAugmentsSparseMovieResultsWithBasicSearch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("t") {
+		case "caps":
+			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><movie-search available="yes" supportedParams="q,year"/></searching></caps>`)
+		case "movie":
+			fmt.Fprint(w, `<?xml version="1.0"?><rss><channel><item><title>Movie.2001.1080p.x264-OLD</title><guid>old</guid><enclosure url="/old" length="1000" type="application/x-nzb"/></item></channel></rss>`)
+		case "search":
+			if r.URL.Query().Get("q") != "Movie 2001" {
+				t.Errorf("broad query = %q", r.URL.Query().Get("q"))
+			}
+			fmt.Fprint(w, `<?xml version="1.0"?><rss><channel><item><title>Movie.2001.1080p.x265-NEW</title><guid>new</guid><pubDate>Tue, 30 Sep 2025 12:00:00 +0000</pubDate><enclosure url="/new" length="1000" type="application/x-nzb"/></item></channel></rss>`)
+		default:
+			http.Error(w, "unsupported", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	configured, err := NewTorznab("test", server.URL+"/api", "", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := configured.Search(t.Context(), catalog.SearchRequest{Query: "Movie", Year: 2001})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 2 || candidates[0].ID != "old" || candidates[1].ID != "new" || candidates[1].PublishedUnix == 0 {
+		t.Fatalf("candidates = %+v", candidates)
+	}
+}
+
 func TestTorznabRecognizesUsenetEnclosure(t *testing.T) {
 	configured, err := NewTorznab("test", "https://indexer.example/6/api", "secret", http.DefaultClient)
 	if err != nil {

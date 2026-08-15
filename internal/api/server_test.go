@@ -261,6 +261,16 @@ func TestCreatePlaybackFallsBackToTorrent(t *testing.T) {
 	if payload.Source != catalog.ProtocolTorrent || payload.Selected == nil || payload.Selected.Candidate.Protocol != catalog.ProtocolTorrent {
 		t.Fatalf("payload = %+v", payload)
 	}
+
+	server.SetPlaybackSourceMode(config.PlaybackSourceUsenetOnly)
+	request = httptest.NewRequest(http.MethodPost, "/v1/playbacks", strings.NewReader(
+		`{"query":"Sintel","year":2010}`,
+	))
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "Usenet playback unavailable") {
+		t.Fatalf("Usenet-only status = %d, body = %s", response.Code, response.Body.String())
+	}
 }
 
 func createAPITestTorrent(t *testing.T, dataDir string) []byte {
@@ -442,6 +452,22 @@ func TestWatchHistoryAddsMissingMetadata(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].MediaID != "tmdb:1" || entries[0].UpdatedAt != entry.UpdatedAt {
 		t.Fatalf("entries = %+v", entries)
+	}
+}
+
+func TestUsenetCandidateFailuresAreTemporarilySkipped(t *testing.T) {
+	server := &Server{usenetFailures: make(map[string]time.Time)}
+	candidate := catalog.Candidate{ID: "release-1", Indexer: "usenet"}
+	if server.usenetCandidateRecentlyFailed(candidate) {
+		t.Fatal("new candidate was marked failed")
+	}
+	server.markUsenetCandidateFailed(candidate)
+	if !server.usenetCandidateRecentlyFailed(candidate) {
+		t.Fatal("failed candidate was not skipped")
+	}
+	server.clearUsenetCandidateFailure(candidate)
+	if server.usenetCandidateRecentlyFailed(candidate) {
+		t.Fatal("successful candidate remained marked failed")
 	}
 }
 

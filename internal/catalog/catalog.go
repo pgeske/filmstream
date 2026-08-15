@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -46,6 +47,7 @@ type Candidate struct {
 	UploadVolumeFactor   *float64 `json:"upload_volume_factor,omitempty"`
 	Trusted              bool     `json:"trusted,omitempty"`
 	Popularity           int64    `json:"popularity,omitempty"`
+	PublishedUnix        int64    `json:"published_unix,omitempty"`
 	MagnetURI            string   `json:"magnet_uri,omitempty"`
 	TorrentURL           string   `json:"torrent_url,omitempty"`
 	NZBURL               string   `json:"nzb_url,omitempty"`
@@ -89,6 +91,7 @@ func Enrich(candidate Candidate) Candidate {
 
 func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 	ranked := make([]RankedCandidate, 0, len(candidates))
+	now := time.Now()
 	for _, raw := range candidates {
 		candidate := Enrich(raw)
 		if candidate.Year == 0 {
@@ -151,6 +154,22 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 			if candidate.Protocol == ProtocolUsenet {
 				score += 500
 				reasons = append(reasons, "preferred Usenet source")
+				if candidate.PublishedUnix > 0 {
+					age := now.Sub(time.Unix(candidate.PublishedUnix, 0))
+					switch {
+					case age <= 2*365*24*time.Hour:
+						score += 90
+						reasons = append(reasons, "recent Usenet post")
+					case age <= 5*365*24*time.Hour:
+						score += 60
+						reasons = append(reasons, "recent Usenet post")
+					case age <= 10*365*24*time.Hour:
+						score += 20
+					default:
+						score -= 80
+						reasons = append(reasons, "old Usenet post")
+					}
+				}
 			}
 			words := wordSet(normalize(candidate.Name))
 			if candidate.SizeBytes > 0 {
@@ -230,17 +249,20 @@ func titleSimilarity(query, candidate string) float64 {
 			intersection++
 		}
 	}
-	union := len(queryWords) + len(candidateWords) - intersection
-	if union == 0 {
+	wordCount := len(queryWords) + len(candidateWords)
+	if wordCount == 0 {
 		return 0
 	}
-	return float64(intersection) / float64(union)
+	return float64(2*intersection) / float64(wordCount)
 }
 
 func normalize(value string) string {
 	var b strings.Builder
 	lastSpace := true
 	for _, r := range strings.ToLower(value) {
+		if r == '\'' || r == '’' {
+			continue
+		}
 		if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			b.WriteRune(r)
 			lastSpace = false

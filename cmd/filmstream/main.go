@@ -168,6 +168,7 @@ func runServer(args []string) error {
 		return err
 	}
 	apiServer := api.New(registry, engine, defaults, logger)
+	apiServer.SetPlaybackSourceMode(cfg.PlaybackSourceMode)
 	apiServer.SetUsenetEngine(usenetEngine)
 	apiServer.SetMovieResolver(movieResolver)
 	apiServer.SetMetadataProvider(metadataProvider)
@@ -216,6 +217,7 @@ func runServer(args []string) error {
 		"data", cfg.DataDir,
 		"torrent_listen_port", engine.ListenPort(),
 		"usenet_enabled", usenetEngine != nil,
+		"playback_source_mode", cfg.PlaybackSourceMode,
 	)
 	err = server.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {

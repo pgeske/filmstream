@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"strconv"
 	"strings"
@@ -115,18 +116,37 @@ func (t *Torznab) Search(ctx context.Context, request catalog.SearchRequest) ([]
 	if err != nil {
 		return nil, err
 	}
-	parameters := map[string]string{
-		"t":     "search",
-		"q":     request.Query,
-		"limit": "100",
+	basicParameters := map[string]string{
+		"t": "search", "q": request.Query, "limit": "100",
 	}
-	if capabilities.MovieSearchAvailable {
-		parameters["t"] = "movie"
-		if request.Year > 0 && capabilities.MovieSearchParams["year"] {
-			parameters["year"] = strconv.Itoa(request.Year)
-		}
+	if !capabilities.MovieSearchAvailable {
+		return t.search(ctx, basicParameters)
 	}
 
+	movieParameters := map[string]string{
+		"t": "movie", "q": request.Query, "limit": "100",
+	}
+	if request.Year > 0 && capabilities.MovieSearchParams["year"] {
+		movieParameters["year"] = strconv.Itoa(request.Year)
+	}
+	movieCandidates, movieErr := t.search(ctx, movieParameters)
+	if movieErr == nil && len(movieCandidates) >= 20 {
+		return movieCandidates, nil
+	}
+	fallbackParameters := map[string]string{
+		"t": "search", "q": broadMovieQuery(request.Query, request.Year), "limit": "100",
+	}
+	basicCandidates, basicErr := t.search(ctx, fallbackParameters)
+	if basicErr != nil {
+		if movieErr != nil {
+			return nil, errors.Join(movieErr, basicErr)
+		}
+		return movieCandidates, nil
+	}
+	return mergeCandidates(movieCandidates, basicCandidates), nil
+}
+
+func (t *Torznab) search(ctx context.Context, parameters map[string]string) ([]catalog.Candidate, error) {
 	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, t.requestURL(parameters), nil)
 	if err != nil {
 		return nil, err
@@ -159,6 +179,36 @@ func (t *Torznab) Search(ctx context.Context, request catalog.SearchRequest) ([]
 		}
 	}
 	return candidates, nil
+}
+
+func broadMovieQuery(title string, year int) string {
+	words := strings.Fields(title)
+	if len(words) > 3 {
+		words = words[:3]
+	}
+	if year > 0 {
+		words = append(words, strconv.Itoa(year))
+	}
+	return strings.Join(words, " ")
+}
+
+func mergeCandidates(groups ...[]catalog.Candidate) []catalog.Candidate {
+	seen := make(map[string]bool)
+	var merged []catalog.Candidate
+	for _, candidates := range groups {
+		for _, candidate := range candidates {
+			key := candidate.ID
+			if key == "" {
+				key = firstNonempty(candidate.NZBURL, candidate.TorrentURL, candidate.MagnetURI, candidate.Name)
+			}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			merged = append(merged, candidate)
+		}
+	}
+	return merged
 }
 
 func (t *Torznab) Resolve(_ context.Context, candidate catalog.Candidate) (Source, error) {
@@ -221,6 +271,9 @@ func (t *Torznab) candidate(item torznabItem) (catalog.Candidate, bool) {
 	if language := attributes["language"]; language != "" {
 		candidate.Languages = []string{language}
 	}
+	if published, err := mail.ParseDate(item.PublishDate); err == nil {
+		candidate.PublishedUnix = published.Unix()
+	}
 	return candidate, candidate.Name != ""
 }
 
@@ -244,10 +297,11 @@ type torznabFeed struct {
 }
 
 type torznabItem struct {
-	Title     string `xml:"title"`
-	GUID      string `xml:"guid"`
-	Link      string `xml:"link"`
-	Enclosure struct {
+	Title       string `xml:"title"`
+	GUID        string `xml:"guid"`
+	Link        string `xml:"link"`
+	PublishDate string `xml:"pubDate"`
+	Enclosure   struct {
 		URL    string `xml:"url,attr"`
 		Length string `xml:"length,attr"`
 		Type   string `xml:"type,attr"`

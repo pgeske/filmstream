@@ -13,7 +13,7 @@ Use it only with media you are authorized to access, download, or share.
 - A small, trusted open-movie catalog plus an Internet Archive reference indexer
 - Standard Torznab indexers, including Prowlarr and Jackett endpoints for both NZBs and torrents
 - On-demand Usenet streaming through InfiniDysk, including HTTP Range seeking and virtual RAR/7z access
-- Automatic torrent fallback when Usenet preparation or article retrieval fails
+- Configurable hybrid, Usenet-only, or torrent-only source selection
 - Optional natural-language movie resolution through OpenAI-compatible models
 - Release ranking by title, year, resolution, language, codec, size, seeders, and leechers
 - Direct magnet and `.torrent` playback
@@ -139,6 +139,7 @@ The optional configuration file is `~/.config/filmstream/config.json`:
   "idle_grace_seconds": 120,
   "preferred_resolution": "1080p",
   "preferred_languages": ["en", "english"],
+  "playback_source_mode": "hybrid",
   "player": "mpv",
   "resolver": {
     "provider": "openai-compatible",
@@ -161,7 +162,7 @@ The optional configuration file is `~/.config/filmstream/config.json`:
     "webdav_user": "filmstream",
     "webdav_password_file": "~/.config/filmstream/infinidysk-webdav-password",
     "category": "movies",
-    "startup_timeout_seconds": 180
+    "startup_timeout_seconds": 20
   },
   "indexers": [
     {
@@ -186,7 +187,9 @@ Temporary torrent data is stored beneath `<data_dir>/torrents`, and temporary na
 
 Filmstream delegates NNTP article retrieval, yEnc decoding, archive mapping, and provider failover to an internal InfiniDysk service. Filmstream downloads the selected NZB from its Torznab endpoint, submits it through the SABnzbd-compatible API, waits for the virtual media tree, selects the largest supported video, and proxies authenticated WebDAV range requests through the existing playback URL. FFprobe and FFmpeg therefore use the same seekable HTTP contract for either source.
 
-Streaming-optimized ranking gives compatible Usenet releases a strong preference. Filmstream tries several ranked NZBs before reusing a cached torrent or validating new torrent candidates. Missing articles, invalid archives, unsupported files, and Usenet timeouts fall through automatically to the torrent path.
+`playback_source_mode` controls automatic query playback. `hybrid` strongly prefers compatible Usenet releases and falls back to cached or newly ranked torrents. `usenet_only` tries only NZBs and deliberately bypasses cached torrent selections, including when resuming Continue Watching. `torrent_only` skips Usenet and retains the existing cached-torrent and live-swarm path. Explicit `--magnet` and `--torrent` inputs remain direct overrides.
+
+Filmstream tries ranked NZBs within one 30-second preparation budget, up to ten candidates when failures are detected quickly. Missing articles, invalid archives, unsupported files, and provider failures move to the next NZB; only `hybrid` continues to torrent fallback afterward.
 
 Usenet credentials belong only in InfiniDysk or an orchestrator secret. Filmstream stores only a private InfiniDysk API key and WebDAV credential; it never receives NNTP usernames or passwords. Idle Usenet sessions and their virtual mounts are removed automatically after `idle_grace_seconds`, and closing Filmstream removes any remaining managed sessions.
 

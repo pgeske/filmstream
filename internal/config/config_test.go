@@ -24,6 +24,9 @@ func TestDefaultsMatchLocalMVP(t *testing.T) {
 	if cfg.PreferredResolution != "1080p" {
 		t.Fatalf("resolution = %q", cfg.PreferredResolution)
 	}
+	if cfg.PlaybackSourceMode != PlaybackSourceHybrid {
+		t.Fatalf("playback source mode = %q", cfg.PlaybackSourceMode)
+	}
 	if cfg.HLSDir == "" || cfg.FFmpegPath != "ffmpeg" || cfg.FFprobePath != "ffprobe" ||
 		cfg.HLSBufferSeconds != 24 || cfg.HLSReadRate != 1.25 || cfg.HLSSegmentSeconds != 4 {
 		t.Fatalf("HLS defaults = dir %q, ffmpeg %q, ffprobe %q, startup buffer %d, read rate %.2f, segment %d",
@@ -63,6 +66,21 @@ func TestSaveUsesPrivatePermissions(t *testing.T) {
 	}
 	if got := loaded.Indexers[len(loaded.Indexers)-1].APIKey; got != "secret" {
 		t.Fatalf("API key = %q", got)
+	}
+}
+
+func TestPlaybackSourceModeValidation(t *testing.T) {
+	for _, mode := range []string{PlaybackSourceHybrid, PlaybackSourceUsenetOnly, PlaybackSourceTorrentOnly} {
+		cfg := Defaults()
+		cfg.PlaybackSourceMode = mode
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("mode %q: %v", mode, err)
+		}
+	}
+	cfg := Defaults()
+	cfg.PlaybackSourceMode = "invalid"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected unsupported playback source mode error")
 	}
 }
 

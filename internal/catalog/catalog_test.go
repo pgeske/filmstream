@@ -1,6 +1,9 @@
 package catalog
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestRankPrefersMatchingHealthySwarm(t *testing.T) {
 	seeders1, leechers1 := 12, 4
@@ -52,6 +55,23 @@ func TestRankStreamingOptimizedPrefersUsenet(t *testing.T) {
 	}
 	if got := ranked[0].Candidate.Protocol; got != ProtocolUsenet {
 		t.Fatalf("top protocol = %q, want Usenet", got)
+	}
+}
+
+func TestRankStreamingOptimizedPrefersRecentUsenetPost(t *testing.T) {
+	now := time.Now()
+	ranked := Rank(SearchRequest{
+		Query: "The Movie",
+		Year:  2001,
+		Preferences: Preferences{
+			Resolution: "1080p", Codecs: []string{"h264"}, StreamingOptimized: true,
+		},
+	}, []Candidate{
+		{Name: "The.Movie.2001.1080p.H264-OLD", Protocol: ProtocolUsenet, PublishedUnix: now.AddDate(-12, 0, 0).Unix()},
+		{Name: "The.Movie.2001.1080p.H264-NEW", Protocol: ProtocolUsenet, PublishedUnix: now.AddDate(0, -2, 0).Unix()},
+	})
+	if len(ranked) != 2 || ranked[0].Candidate.Name != "The.Movie.2001.1080p.H264-NEW" {
+		t.Fatalf("ranked = %+v", ranked)
 	}
 }
 
@@ -171,6 +191,12 @@ func TestRankRejectsOriginalMovieForRequestedSequel(t *testing.T) {
 	}
 	if got := ranked[0].Candidate.Name; got != "Paddington 2 2017 1080p BluRay x264" {
 		t.Fatalf("top candidate = %q", got)
+	}
+}
+
+func TestTitleSimilarityMatchesPossessiveReleaseNames(t *testing.T) {
+	if got := titleSimilarity("Harry Potter and the Philosopher's Stone", "Harry.Potter.and.the.Philosophers.Stone.2001.1080p.x265"); got != 1 {
+		t.Fatalf("title similarity = %v, want 1", got)
 	}
 }
 

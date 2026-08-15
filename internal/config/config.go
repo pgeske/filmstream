@@ -9,6 +9,10 @@ import (
 )
 
 const (
+	PlaybackSourceHybrid      = "hybrid"
+	PlaybackSourceUsenetOnly  = "usenet_only"
+	PlaybackSourceTorrentOnly = "torrent_only"
+
 	defaultListen            = "127.0.0.1:8943"
 	defaultMaxCandidateGiB   = 60
 	defaultReadaheadMiB      = 32
@@ -80,6 +84,7 @@ type Config struct {
 	IdleGraceSeconds    int       `json:"idle_grace_seconds"`
 	PreferredResolution string    `json:"preferred_resolution"`
 	PreferredLanguages  []string  `json:"preferred_languages"`
+	PlaybackSourceMode  string    `json:"playback_source_mode"`
 	Player              string    `json:"player"`
 	Resolver            Resolver  `json:"resolver,omitempty"`
 	Metadata            Metadata  `json:"metadata,omitempty"`
@@ -109,6 +114,7 @@ func Defaults() Config {
 		IdleGraceSeconds:    defaultIdleGraceSeconds,
 		PreferredResolution: "1080p",
 		PreferredLanguages:  []string{"en", "english"},
+		PlaybackSourceMode:  PlaybackSourceHybrid,
 		Player:              "mpv",
 		Indexers: []Indexer{
 			{
@@ -241,6 +247,11 @@ func (c Config) Validate() error {
 	}
 	if c.IdleGraceSeconds < 0 {
 		return errors.New("idle_grace_seconds cannot be negative")
+	}
+	switch c.PlaybackSourceMode {
+	case PlaybackSourceHybrid, PlaybackSourceUsenetOnly, PlaybackSourceTorrentOnly:
+	default:
+		return fmt.Errorf("unsupported playback_source_mode %q", c.PlaybackSourceMode)
 	}
 	if c.Resolver.Provider != "" {
 		if c.Resolver.Provider != "openai-compatible" {
