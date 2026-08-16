@@ -4,6 +4,7 @@ import SwiftUI
 struct HomeView: View {
     @Environment(AppModel.self) private var model
     @State private var activeShelfID: String?
+    @FocusState private var focusedShelfItem: NetflixShelfFocus?
 
     private let homeTopID = "home-top"
     private let continueShelfID = "continue-watching"
@@ -83,6 +84,7 @@ struct HomeView: View {
             .padding(.horizontal, 16)
         } else {
             NetflixMovieShelf(
+                shelfID: continueShelfID,
                 title: "Continue Watching",
                 items: model.continueWatching.map {
                     let movie = $0.movie
@@ -92,6 +94,7 @@ struct HomeView: View {
                         contentRating: model.ratings(for: movie)?.contentRating
                     )
                 },
+                focusBinding: $focusedShelfItem,
                 requestsInitialFocus: true,
                 onFocus: loadRatings,
                 onShelfFocusChange: {
@@ -113,6 +116,7 @@ struct HomeView: View {
     ) -> some View {
         if !section.items.isEmpty {
             NetflixMovieShelf(
+                shelfID: section.id,
                 title: section.title,
                 items: section.items.map {
                     NetflixShelfItem(
@@ -120,6 +124,7 @@ struct HomeView: View {
                         contentRating: model.ratings(for: $0)?.contentRating
                     )
                 },
+                focusBinding: $focusedShelfItem,
                 onFocus: loadRatings,
                 onShelfFocusChange: {
                     updateShelfFocus(
@@ -145,15 +150,9 @@ struct HomeView: View {
             return
         }
 
+        guard activeShelfID != shelfID else { return }
         activeShelfID = shelfID
-        Task { @MainActor in
-            await Task.yield()
-            alignShelf(shelfID, scrollProxy: scrollProxy)
-            // Re-align after the previous shelf finishes collapsing.
-            try? await Task.sleep(for: .milliseconds(360))
-            guard activeShelfID == shelfID else { return }
-            alignShelf(shelfID, scrollProxy: scrollProxy)
-        }
+        alignShelf(shelfID, scrollProxy: scrollProxy)
     }
 
     private func alignShelf(_ shelfID: String, scrollProxy: ScrollViewProxy) {
@@ -161,7 +160,7 @@ struct HomeView: View {
         let anchor = shelfID == continueShelfID
             ? UnitPoint.top
             : UnitPoint(x: 0.5, y: 0.07)
-        withAnimation(.easeInOut(duration: 0.3)) {
+        withAnimation(.easeInOut(duration: 0.24)) {
             scrollProxy.scrollTo(targetID, anchor: anchor)
         }
     }

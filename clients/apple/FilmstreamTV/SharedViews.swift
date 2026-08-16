@@ -308,20 +308,29 @@ struct NetflixShelfItem: Identifiable {
     var id: String { movie.id }
 }
 
+struct NetflixShelfFocus: Hashable {
+    let shelfID: String
+    let movieID: String
+}
+
 private enum NetflixShelfLayout {
     static let collapsedWidth: CGFloat = 223
     static let expandedWidth: CGFloat = 632
+    static let expandedExtraWidth = expandedWidth - collapsedWidth
     static let artworkHeight: CGFloat = 334
+    static let cardHeight: CGFloat = 500
     static let firstCardInset: CGFloat = 88
     static let viewportOverflow: CGFloat = 72
     static let trailingScrollSpace: CGFloat = 1240
     static let focusedAnchor = UnitPoint(x: 0.07, y: 0.5)
-    static let focusStepInterval: TimeInterval = 0.32
+    static let focusStepInterval: TimeInterval = 0.18
 }
 
 struct NetflixMovieShelf: View {
+    let shelfID: String
     let title: String
     let items: [NetflixShelfItem]
+    let focusBinding: FocusState<NetflixShelfFocus?>.Binding
     var requestsInitialFocus = false
     var onFocus: (Movie) -> Void = { _ in }
     var onShelfFocusChange: (Bool) -> Void = { _ in }
@@ -329,7 +338,6 @@ struct NetflixMovieShelf: View {
     @State private var expandedMovieID: String?
     @State private var acceptedFocusedMovieID: String?
     @State private var focusLockUntil: TimeInterval = 0
-    @FocusState private var focusedMovieID: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -341,33 +349,50 @@ struct NetflixMovieShelf: View {
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(alignment: .top, spacing: 24) {
+                        // Focus targets stay fixed-size; the trailing slot reserves expansion space.
                         ForEach(items) { item in
-                            NetflixShelfCard(
-                                item: item,
-                                isExpanded: expandedMovieID == item.id,
-                                focusBinding: $focusedMovieID
-                            )
-                            .id(item.id)
+                            let isExpanded = expandedMovieID == item.id
+                            let focus = NetflixShelfFocus(shelfID: shelfID, movieID: item.id)
+                            HStack(spacing: 0) {
+                                NetflixShelfCard(
+                                    item: item,
+                                    isExpanded: isExpanded,
+                                    focusValue: focus,
+                                    focusBinding: focusBinding
+                                )
+                                .id(item.id)
+
+                                Color.clear
+                                    .frame(
+                                        width: isExpanded ? NetflixShelfLayout.expandedExtraWidth : 0,
+                                        height: 1
+                                    )
+                                    .accessibilityHidden(true)
+                            }
                         }
 
                         Color.clear
                             .frame(width: NetflixShelfLayout.trailingScrollSpace, height: 1)
                             .accessibilityHidden(true)
                     }
+                    .frame(height: NetflixShelfLayout.cardHeight, alignment: .top)
                     .padding(.leading, NetflixShelfLayout.firstCardInset)
                     .padding(.top, 12)
                     .padding(.bottom, 18)
                 }
+                .scrollClipDisabled()
                 .padding(.horizontal, -NetflixShelfLayout.viewportOverflow)
-                .onChange(of: focusedMovieID) { oldID, requestedID in
-                    handleFocusChange(from: oldID, to: requestedID, proxy: proxy)
+                .onChange(of: focusBinding.wrappedValue) { oldFocus, newFocus in
+                    handleFocusChange(from: oldFocus, to: newFocus, proxy: proxy)
                 }
                 .task {
-                    if requestsInitialFocus,
-                       acceptedFocusedMovieID == nil,
-                       let firstMovieID = items.first?.id {
-                        focusedMovieID = firstMovieID
-                    }
+                    guard requestsInitialFocus, let firstMovieID = items.first?.id else { return }
+                    try? await Task.sleep(for: .milliseconds(120))
+                    guard focusBinding.wrappedValue == nil else { return }
+                    focusBinding.wrappedValue = NetflixShelfFocus(
+                        shelfID: shelfID,
+                        movieID: firstMovieID
+                    )
                 }
             }
         }
@@ -375,75 +400,67 @@ struct NetflixMovieShelf: View {
     }
 
     private func handleFocusChange(
-        from oldID: String?,
-        to requestedID: String?,
+        from oldFocus: NetflixShelfFocus?,
+        to newFocus: NetflixShelfFocus?,
         proxy: ScrollViewProxy
     ) {
-        guard let requestedID else {
+        let oldMovieID = oldFocus?.shelfID == shelfID ? oldFocus?.movieID : nil
+        guard newFocus?.shelfID == shelfID, let requestedMovieID = newFocus?.movieID else {
+            guard oldMovieID != nil else { return }
+            acceptedFocusedMovieID = nil
+            focusLockUntil = 0
             onShelfFocusChange(false)
-            guard let expandedMovieID else { return }
-            Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(80))
-                guard focusedMovieID == nil, self.expandedMovieID == expandedMovieID else { return }
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    self.expandedMovieID = nil
-                }
+            withAnimation(.easeInOut(duration: 0.18)) {
+                expandedMovieID = nil
             }
             return
         }
 
-        guard items.contains(where: { $0.id == requestedID }) else { return }
-
-        if oldID == nil, let firstMovieID = items.first?.id {
-            acceptedFocusedMovieID = firstMovieID
+        guard items.contains(where: { $0.id == requestedMovieID }) else { return }
+        if oldMovieID == nil {
+            acceptedFocusedMovieID = requestedMovieID
             focusLockUntil = 0
             onShelfFocusChange(true)
-            reveal(firstMovieID, proxy: proxy)
-            if requestedID != firstMovieID {
-                focusedMovieID = firstMovieID
-            }
+            reveal(requestedMovieID, proxy: proxy)
             return
         }
 
-        if requestedID == acceptedFocusedMovieID {
-            return
-        }
+        guard requestedMovieID != acceptedFocusedMovieID else { return }
 
-        var targetID = requestedID
+        var targetMovieID = requestedMovieID
         if let acceptedFocusedMovieID,
            let acceptedIndex = items.firstIndex(where: { $0.id == acceptedFocusedMovieID }),
-           let requestedIndex = items.firstIndex(where: { $0.id == requestedID }) {
-            // A forceful Siri Remote swipe can emit several focus updates. Accept one adjacent step.
+           let requestedIndex = items.firstIndex(where: { $0.id == requestedMovieID }) {
             let now = ProcessInfo.processInfo.systemUptime
             if now < focusLockUntil {
-                focusedMovieID = acceptedFocusedMovieID
+                focusBinding.wrappedValue = NetflixShelfFocus(
+                    shelfID: shelfID,
+                    movieID: acceptedFocusedMovieID
+                )
                 return
             }
 
             let direction = requestedIndex > acceptedIndex ? 1 : -1
-            targetID = items[acceptedIndex + direction].id
+            targetMovieID = items[acceptedIndex + direction].id
             focusLockUntil = now + NetflixShelfLayout.focusStepInterval
         }
 
-        acceptedFocusedMovieID = targetID
-        reveal(targetID, proxy: proxy)
-        if targetID != requestedID {
-            focusedMovieID = targetID
+        acceptedFocusedMovieID = targetMovieID
+        reveal(targetMovieID, proxy: proxy)
+        if targetMovieID != requestedMovieID {
+            focusBinding.wrappedValue = NetflixShelfFocus(
+                shelfID: shelfID,
+                movieID: targetMovieID
+            )
         }
     }
 
     private func reveal(_ movieID: String, proxy: ScrollViewProxy) {
         guard let item = items.first(where: { $0.id == movieID }) else { return }
         onFocus(item.movie)
-        withAnimation(.easeInOut(duration: 0.28)) {
+        withAnimation(.easeInOut(duration: 0.24)) {
             expandedMovieID = movieID
-        }
-        Task { @MainActor in
-            await Task.yield()
-            guard focusedMovieID == movieID else { return }
-            withAnimation(.easeInOut(duration: 0.32)) {
-                proxy.scrollTo(movieID, anchor: NetflixShelfLayout.focusedAnchor)
-            }
+            proxy.scrollTo(movieID, anchor: NetflixShelfLayout.focusedAnchor)
         }
     }
 }
@@ -451,7 +468,8 @@ struct NetflixMovieShelf: View {
 private struct NetflixShelfCard: View {
     let item: NetflixShelfItem
     let isExpanded: Bool
-    let focusBinding: FocusState<String?>.Binding
+    let focusValue: NetflixShelfFocus
+    let focusBinding: FocusState<NetflixShelfFocus?>.Binding
 
     private var cardWidth: CGFloat {
         isExpanded ? NetflixShelfLayout.expandedWidth : NetflixShelfLayout.collapsedWidth
@@ -523,14 +541,23 @@ private struct NetflixShelfCard: View {
                     .transition(.opacity)
                 }
             }
-            .frame(width: cardWidth, alignment: .leading)
+            .frame(
+                width: cardWidth,
+                height: NetflixShelfLayout.cardHeight,
+                alignment: .topLeading
+            )
             .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         }
         .buttonStyle(MovieCardButtonStyle())
+        .frame(
+            width: NetflixShelfLayout.collapsedWidth,
+            height: NetflixShelfLayout.cardHeight,
+            alignment: .topLeading
+        )
         .focusEffectDisabled()
-        .focused(focusBinding, equals: item.id)
+        .focused(focusBinding, equals: focusValue)
         .zIndex(isExpanded ? 1 : 0)
-        .animation(.easeInOut(duration: 0.28), value: isExpanded)
+        .animation(.easeInOut(duration: 0.24), value: isExpanded)
     }
 
     private var artwork: some View {
