@@ -23,6 +23,7 @@ struct TeaStreamMacApp: App {
 final class MacAppModel {
     let api: FilmstreamAPI
     var continueWatching: [WatchHistoryEntry] = []
+    var watchHistory: [WatchHistoryEntry] = []
     var discoverySections: [DiscoverySection] = []
     var activePlayback: MacPlaybackSession?
     private(set) var ratingsByMovieID: [String: MovieRatings] = [:]
@@ -38,11 +39,17 @@ final class MacAppModel {
         isLoading = true
         defer { isLoading = false }
 
-        async let historyRequest = api.continueWatching()
+        async let continueRequest = api.continueWatching()
+        async let historyRequest = api.watchHistory()
         async let discoveryRequest = api.discover()
         var errors: [String] = []
         do {
-            continueWatching = try await historyRequest
+            continueWatching = try await continueRequest
+        } catch {
+            errors.append(error.localizedDescription)
+        }
+        do {
+            watchHistory = try await historyRequest
         } catch {
             errors.append(error.localizedDescription)
         }
@@ -56,7 +63,10 @@ final class MacAppModel {
 
     func loadContinueWatching() async {
         do {
-            continueWatching = try await api.continueWatching()
+            async let continueRequest = api.continueWatching()
+            async let historyRequest = api.watchHistory()
+            continueWatching = try await continueRequest
+            watchHistory = try await historyRequest
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
@@ -66,7 +76,13 @@ final class MacAppModel {
     func removeFromContinueWatching(_ entry: WatchHistoryEntry) async throws {
         try await api.removeFromContinueWatching(entry)
         withAnimation(.snappy(duration: 0.25)) {
-            continueWatching.removeAll { $0.id == entry.id }
+            if let seriesID = entry.seriesID {
+                continueWatching.removeAll { $0.seriesID == seriesID }
+                watchHistory.removeAll { $0.seriesID == seriesID }
+            } else {
+                continueWatching.removeAll { $0.id == entry.id }
+                watchHistory.removeAll { $0.id == entry.id }
+            }
         }
     }
 
@@ -97,12 +113,20 @@ final class MacAppModel {
     }
 
     func history(for movie: Movie) -> WatchHistoryEntry? {
-        continueWatching.first {
+        if movie.isShow {
+            return histories(for: movie).first { !$0.completed && $0.positionSeconds >= 30 }
+        }
+        return watchHistory.first {
+            guard !$0.completed, $0.positionSeconds >= 30 else { return false }
             if let mediaID = $0.mediaID {
                 return mediaID == movie.id
             }
             return $0.title.caseInsensitiveCompare(movie.title) == .orderedSame && $0.year == movie.year
         }
+    }
+
+    func histories(for show: Movie) -> [WatchHistoryEntry] {
+        watchHistory.filter { $0.seriesID == show.id }
     }
 }
 

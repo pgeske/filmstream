@@ -19,10 +19,10 @@ struct SearchView: View {
                     HStack(spacing: 18) {
                         TeaStreamMark(size: 52)
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("Find Your Next Movie")
+                            Text("Find Your Next Story")
                                 .font(.system(size: 46, weight: .bold, design: .rounded))
                                 .foregroundStyle(Color.teaCream)
-                            Text("A cozy movie night starts here")
+                            Text("A cozy night starts here")
                                 .font(.headline)
                                 .foregroundStyle(Color.teaMuted)
                         }
@@ -35,7 +35,7 @@ struct SearchView: View {
                     content
 
                     if !results.isEmpty {
-                        Text("Movie data and images provided by TMDB.")
+                        Text("Media data and images provided by TMDB.")
                             .font(.footnote)
                             .foregroundStyle(Color.teaMuted)
                             .padding(.top, 24)
@@ -46,10 +46,14 @@ struct SearchView: View {
             }
         }
         .navigationTitle("Search")
-        .searchable(text: $query, prompt: "Movie title")
+        .searchable(text: $query, prompt: "Movie or show title")
         .tint(Color.teaAccent)
         .navigationDestination(item: $selectedMovie) { movie in
-            MovieDetailView(movie: movie)
+            if movie.isShow {
+                ShowDetailView(show: movie)
+            } else {
+                MovieDetailView(movie: movie)
+            }
         }
         .task(id: query) {
             await searchAfterTypingPause()
@@ -87,7 +91,7 @@ struct SearchView: View {
             ContentUnavailableView(
                 "Search by Title",
                 systemImage: "magnifyingglass",
-                description: Text("Type at least two letters of a movie title.")
+                description: Text("Type at least two letters of a movie or show title.")
             )
             .frame(minHeight: 340)
         } else {

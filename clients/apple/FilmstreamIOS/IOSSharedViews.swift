@@ -120,10 +120,12 @@ struct MobileMovieCard: View {
                 .frame(width: width, alignment: .leading)
 
             HStack(spacing: 6) {
-                Text(movie.primaryGenre ?? "Movie")
-                if let year = movie.year {
+                Text(movie.catalogMetadata)
+                    .lineLimit(1)
+                if let episodeLabel = movie.episodeLabel {
                     Text("•")
-                    Text(String(year))
+                    Text(episodeLabel)
+                        .foregroundStyle(Color.mobileTeaAccentLight)
                 }
                 if let contentRating {
                     Text("•")

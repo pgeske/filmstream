@@ -511,10 +511,11 @@ private struct NetflixShelfCard: View {
                             .lineLimit(2)
 
                         HStack(spacing: 7) {
-                            Text(item.movie.primaryGenre ?? "Movie")
-                            if let year = item.movie.year {
+                            Text(item.movie.catalogMetadata)
+                            if let episodeLabel = item.movie.episodeLabel {
                                 Text("•")
-                                Text(String(year))
+                                Text(episodeLabel)
+                                    .foregroundStyle(Color.teaAccentLight)
                             }
                             if let contentRating = item.contentRating {
                                 Text("•")
@@ -717,18 +718,9 @@ struct MovieNavigationCard: View {
                     .font(.headline.weight(.semibold))
                     .foregroundStyle(isFocused ? Color.teaAccentLight : Color.teaCream)
                     .lineLimit(1)
-                HStack(spacing: 6) {
-                    if let genre = movie.primaryGenre {
-                        Text(genre)
-                    }
-                    if movie.primaryGenre != nil, movie.year != nil {
-                        Text("•")
-                    }
-                    if let year = movie.year {
-                        Text(String(year))
-                    }
-                }
-                .font(.subheadline)
+                Text(movie.catalogMetadata)
+                    .font(.subheadline)
+                    .lineLimit(1)
                 .foregroundStyle(Color.teaMuted)
             }
             .frame(width: cardWidth, alignment: .leading)

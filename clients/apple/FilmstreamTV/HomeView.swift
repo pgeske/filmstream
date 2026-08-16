@@ -37,7 +37,11 @@ struct HomeView: View {
                 }
             }
             .navigationDestination(for: Movie.self) { movie in
-                MovieDetailView(movie: movie)
+                if movie.isShow {
+                    ShowDetailView(show: movie)
+                } else {
+                    MovieDetailView(movie: movie)
+                }
             }
             .task {
                 await model.loadHome()
@@ -70,7 +74,7 @@ struct HomeView: View {
                 HStack(spacing: 18) {
                     ProgressView()
                         .tint(Color.teaAccent)
-                    Text("Steeping your movie shelf…")
+                    Text("Steeping your next shelf…")
                         .foregroundStyle(Color.teaMuted)
                 }
                 .frame(height: 360)
@@ -181,10 +185,10 @@ struct HomeView: View {
         HStack(spacing: 30) {
             TeaStreamMark(size: 76)
             VStack(alignment: .leading, spacing: 8) {
-                Text("Your next movie starts here")
+                Text("Your next story starts here")
                     .font(.title2.weight(.semibold))
                     .foregroundStyle(Color.teaCream)
-                Text("Find a favorite and TeaStream will remember where you left off.")
+                Text("Find a movie or show and TeaStream will remember where you left off.")
                     .font(.title3)
                     .foregroundStyle(Color.teaMuted)
             }
@@ -192,7 +196,7 @@ struct HomeView: View {
             NavigationLink {
                 SearchView()
             } label: {
-                Label("Find a Movie", systemImage: "magnifyingglass")
+                Label("Find Something", systemImage: "magnifyingglass")
                     .font(.headline.weight(.semibold))
             }
             .buttonStyle(TeaActionButtonStyle())

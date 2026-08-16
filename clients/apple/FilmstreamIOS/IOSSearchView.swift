@@ -22,10 +22,10 @@ struct IOSSearchView: View {
                     HStack(spacing: 12) {
                         MobileTeaStreamMark(size: 42)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Find Your Next Movie")
+                            Text("Find Your Next Story")
                                 .font(.title2.weight(.bold))
                                 .foregroundStyle(Color.mobileTeaCream)
-                            Text("A cozy movie night starts here")
+                            Text("A cozy night starts here")
                                 .font(.subheadline)
                                 .foregroundStyle(Color.mobileTeaMuted)
                         }
@@ -34,7 +34,7 @@ struct IOSSearchView: View {
                     content
 
                     if !results.isEmpty {
-                        Text("Movie data and images provided by TMDB.")
+                        Text("Media data and images provided by TMDB.")
                             .font(.caption2)
                             .foregroundStyle(Color.mobileTeaMuted.opacity(0.75))
                     }
@@ -46,7 +46,7 @@ struct IOSSearchView: View {
         }
         .navigationTitle("Search")
         .navigationBarTitleDisplayMode(.inline)
-        .searchable(text: $query, prompt: "Movie title")
+        .searchable(text: $query, prompt: "Movie or show title")
         .tint(Color.mobileTeaAccent)
         .toolbarBackground(Color.mobileTeaBackground.opacity(0.94), for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
@@ -86,7 +86,7 @@ struct IOSSearchView: View {
             ContentUnavailableView(
                 "Search by Title",
                 systemImage: "magnifyingglass",
-                description: Text("Type at least two letters of a movie title.")
+                description: Text("Type at least two letters of a movie or show title.")
             )
             .foregroundStyle(Color.mobileTeaCream)
             .frame(maxWidth: .infinity, minHeight: 330)
@@ -151,18 +151,9 @@ private struct MobileGridMovieCard: View {
                 .foregroundStyle(Color.mobileTeaCream)
                 .lineLimit(3)
 
-            HStack(spacing: 5) {
-                if let genre = movie.primaryGenre {
-                    Text(genre)
-                }
-                if movie.primaryGenre != nil, movie.year != nil {
-                    Text("•")
-                }
-                if let year = movie.year {
-                    Text(String(year))
-                }
-            }
-            .font(.caption)
+            Text(movie.catalogMetadata)
+                .font(.caption)
+                .lineLimit(2)
             .foregroundStyle(Color.mobileTeaMuted)
         }
         .frame(maxWidth: .infinity, alignment: .leading)

@@ -9,7 +9,11 @@ struct IOSRootView: View {
             NavigationStack {
                 IOSHomeView()
                     .navigationDestination(for: Movie.self) { movie in
-                        IOSMovieDetailView(movie: movie)
+                        if movie.isShow {
+                            IOSShowDetailView(show: movie)
+                        } else {
+                            IOSMovieDetailView(movie: movie)
+                        }
                     }
             }
             .tabItem {
@@ -19,7 +23,11 @@ struct IOSRootView: View {
             NavigationStack {
                 IOSSearchView()
                     .navigationDestination(for: Movie.self) { movie in
-                        IOSMovieDetailView(movie: movie)
+                        if movie.isShow {
+                            IOSShowDetailView(show: movie)
+                        } else {
+                            IOSMovieDetailView(movie: movie)
+                        }
                     }
             }
             .tabItem {
@@ -53,7 +61,7 @@ struct IOSHomeView: View {
                             .foregroundStyle(Color.mobileTeaAmber)
                             .padding(.horizontal, 18)
                     }
-                    Text("Movie data and images provided by TMDB.")
+                    Text("Media data and images provided by TMDB.")
                         .font(.caption2)
                         .foregroundStyle(Color.mobileTeaMuted.opacity(0.75))
                         .padding(.horizontal, 18)
@@ -152,7 +160,7 @@ struct IOSHomeView: View {
         HStack(spacing: 12) {
             ProgressView()
                 .tint(Color.mobileTeaAccent)
-            Text("Steeping your movie shelf…")
+            Text("Steeping your next shelf…")
                 .font(.subheadline)
                 .foregroundStyle(Color.mobileTeaMuted)
         }
@@ -163,10 +171,10 @@ struct IOSHomeView: View {
         HStack(spacing: 15) {
             MobileTeaStreamMark(size: 50)
             VStack(alignment: .leading, spacing: 4) {
-                Text("Your next movie starts here")
+                Text("Your next story starts here")
                     .font(.headline)
                     .foregroundStyle(Color.mobileTeaCream)
-                Text("Find a favorite and TeaStream will remember your place.")
+                Text("Find a movie or show and TeaStream will remember your place.")
                     .font(.caption)
                     .foregroundStyle(Color.mobileTeaMuted)
             }

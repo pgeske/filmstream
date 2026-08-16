@@ -18,10 +18,10 @@ struct MacSearchView: View {
                     HStack(spacing: 15) {
                         MacTeaStreamMark(size: 44)
                         VStack(alignment: .leading, spacing: 3) {
-                            Text("Find Your Next Movie")
+                            Text("Find Your Next Story")
                                 .font(.system(size: 30, weight: .bold, design: .rounded))
                                 .foregroundStyle(Color.macTeaCream)
-                            Text("A cozy movie night starts here")
+                            Text("A cozy night starts here")
                                 .foregroundStyle(Color.macTeaMuted)
                         }
                         if isSearching, !results.isEmpty {
@@ -34,7 +34,7 @@ struct MacSearchView: View {
                     content
 
                     if !results.isEmpty {
-                        Text("Movie data and images provided by TMDB.")
+                        Text("Media data and images provided by TMDB.")
                             .font(.footnote)
                             .foregroundStyle(Color.macTeaMuted)
                     }
@@ -43,7 +43,7 @@ struct MacSearchView: View {
             }
         }
         .navigationTitle("Search")
-        .searchable(text: $query, placement: .toolbar, prompt: "Movie title")
+        .searchable(text: $query, placement: .toolbar, prompt: "Movie or show title")
         .tint(Color.macTeaAccent)
         .task(id: query) {
             await searchAfterTypingPause()
@@ -85,7 +85,7 @@ struct MacSearchView: View {
             ContentUnavailableView(
                 "Search by Title",
                 systemImage: "magnifyingglass",
-                description: Text("Type at least two letters of a movie title.")
+                description: Text("Type at least two letters of a movie or show title.")
             )
             .foregroundStyle(Color.macTeaCream)
             .frame(maxWidth: .infinity, minHeight: 320)

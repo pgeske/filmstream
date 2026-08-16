@@ -1,6 +1,6 @@
 # TeaStream for Apple platforms
 
-TeaStream is Filmstream's native SwiftUI experience for iPhone, Apple TV, and Mac. The iPhone target provides touch-first home and search tabs, compact movie details, and custom playback controls. Apple TV retains its existing bundle identifier and remote-focused interface, while Mac uses a desktop-native sidebar and pointer-friendly layouts. All three apps reuse `FilmstreamCore` for API models, networking, metadata, HLS playback, subtitles, and watch progress; none embeds VLC or retains server credentials.
+TeaStream is Filmstream's native SwiftUI experience for iPhone, Apple TV, and Mac. The iPhone target provides touch-first home and search tabs, compact movie and show details, season browsing, and custom playback controls. Apple TV retains its existing bundle identifier and remote-focused interface, while Mac uses a desktop-native sidebar and pointer-friendly layouts. All three apps reuse `FilmstreamCore` for API models, networking, metadata, HLS playback, subtitles, and watch progress; none embeds VLC or retains server credentials.
 
 ## Generate and build
 
@@ -71,26 +71,29 @@ TeaStream defaults to `http://filmstream.home.alyoshukai.com`; each target conta
 
 ## Server capabilities
 
-The home screens pair Continue Watching with TMDB-powered Popular Now and Top Rated discovery rails. On tvOS, focused titles expand into cinematic landscape cards, move to the leading shelf position, and reveal their genre, year, content rating, and synopsis; iPhone and Mac use the same landscape-first metadata. Discovery requires an existing digital, physical, or TV release, so upcoming and theater-only titles stay off the shelf. Search starts automatically after two title characters with a short debounce; selecting any movie opens its details and playback actions. All clients use:
+The home screens pair Continue Watching with mixed movie/show TMDB-powered Popular Now and Top Rated rails. Cards identify the media type, genre, year, and season count where applicable. On tvOS, focused titles expand into cinematic landscape cards and move to the leading shelf position; iPhone and Mac use touch- and pointer-appropriate versions of the same metadata. Movie discovery requires an existing digital, physical, or TV release, so upcoming and theater-only movies stay off the shelf. Search starts automatically after two title characters with a short debounce; selecting any result opens its adaptive details and playback actions. All clients use:
 
-- `GET /v1/catalog/search` for movie metadata and artwork;
-- `GET /v1/catalog/discover` for home-screen discovery sections;
+- `GET /v1/catalog/search` for mixed movie/show metadata and artwork;
+- `GET /v1/catalog/discover` for mixed home-screen discovery sections;
+- `GET /v1/catalog/shows/{id}` for show and season summaries;
+- `GET /v1/catalog/shows/{id}/seasons/{season}` for episode artwork and metadata;
 - `GET /v1/catalog/ratings` for optional IMDb, Rotten Tomatoes, and content ratings;
 - `POST /v1/playbacks` for streaming-optimized Usenet-or-torrent selection;
 - `POST /v1/playbacks/{id}/hls` for incremental AVPlayer-compatible HLS;
 - `DELETE /v1/playbacks/{id}/hls` to stop packaging and remove temporary segments;
-- `GET /v1/watch-history?continue=true` for the home screen;
-- `PUT /v1/watch-history` to sync playback progress; and
-- `DELETE /v1/watch-history/{id}` to clear a saved resume point.
+- `GET /v1/watch-history?continue=true` for movie and next-episode home progress;
+- `GET /v1/watch-history` for first-unwatched episode selection;
+- `PUT /v1/watch-history` to sync movie or episode progress; and
+- `DELETE /v1/watch-history/{id}` to clear a movie or series resume point.
 
 The HLS backend requires FFmpeg and FFprobe. It copies compatible H.264/H.265 video without re-encoding, converts the first audio track to AAC, and paces packaging close to playback speed. It prepares an initial media buffer before opening the player and preserves audio pre-roll when seeking so copied video and transcoded audio stay synchronized. Known Dolby Vision releases are skipped initially in favor of compatible SDR or HDR10 alternatives. Streaming selection strongly prefers healthy Usenet releases, then automatically falls back to cached or newly ranked torrents. Torrent fallback prioritizes popular releases regardless of size, penalizes remuxes, and checks candidates progressively so the first strong live swarm can start without unnecessary delay. The server privately caches successful NZBs and torrent metadata, reuses the known-good release without searching again, and falls back to a fresh search when a cached source becomes unavailable.
 
 During tvOS playback, Center or Play/Pause toggles playback and left/right seeks 30 seconds; iPhone and Mac provide equivalent native controls and timeline scrubbing. All clients expose embedded text subtitle tracks and remember the selected language across movies and seeks. Apple playback requests prefer a live release with a usable text track, falling back to the best available release when none is available. Filmstream converts only the selected SRT, ASS/SSA, WebVTT, or other text track into a growing WebVTT sidecar in a separate paced process, so subtitle-heavy releases do not delay video startup. Resume packaging aligns subtitles to the actual preceding video keyframe. Image-based PGS/VobSub tracks require OCR and are not offered.
 
-The timeline always represents the full movie rather than the currently generated HLS window. Seeking outside that window asks the server to resume HLS packaging at the target timestamp, which can briefly buffer while the new window starts.
+The timeline always represents the full movie or episode rather than the currently generated HLS window. Seeking outside that window asks the server to resume HLS packaging at the target timestamp, which can briefly buffer while the new window starts.
 
 Configure the server's optional `metadata` provider with a TMDB API read token to enable posters, backdrops, genres, release details, and descriptions. Set the server-only `OMDB_API_KEY` environment variable to add IMDb, Rotten Tomatoes, and content ratings. TeaStream requests external ratings as cards become visible or focused, and the server resolves TMDB IDs to canonical IMDb IDs before querying OMDb. Neither credential is included in the app.
 
-A movie with saved progress presents explicit Resume, Play from Beginning, and Remove from Continue Watching actions on its detail screen. Removing a title clears its saved resume point; playing it again starts fresh and resumes normal progress tracking.
+A movie with saved progress presents explicit Resume, Play from Beginning, and Remove from Continue Watching actions. A show resumes its active episode or selects the first unwatched episode, labels the primary action with `Sx Ex`, and adds Episodes & More. The episode browser uses a season sidebar on tvOS and platform-native touch or pointer layouts on iPhone and Mac. Removing a show clears progress for the series; playing it again starts fresh and resumes normal episode tracking.
 
-Movie data and images are provided by TMDB. This product uses the TMDB API but is not endorsed or certified by TMDB. External rating data is provided by OMDb.
+Media data and images are provided by TMDB. This product uses the TMDB API but is not endorsed or certified by TMDB. External rating data is provided by OMDb.

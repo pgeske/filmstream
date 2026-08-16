@@ -32,14 +32,22 @@ struct MacHomeView: View {
                             selection = .search
                         }
                         .navigationDestination(for: Movie.self) { movie in
-                            MacMovieDetailView(movie: movie)
+                            if movie.isShow {
+                                MacShowDetailView(show: movie)
+                            } else {
+                                MacMovieDetailView(movie: movie)
+                            }
                         }
                     }
                 case .search:
                     NavigationStack {
                         MacSearchView()
                             .navigationDestination(for: Movie.self) { movie in
-                                MacMovieDetailView(movie: movie)
+                                if movie.isShow {
+                                    MacShowDetailView(show: movie)
+                                } else {
+                                    MacMovieDetailView(movie: movie)
+                                }
                             }
                     }
                 }
@@ -140,7 +148,7 @@ private struct MacLibraryView: View {
                 HStack(spacing: 12) {
                     ProgressView()
                         .tint(Color.macTeaAccent)
-                    Text("Steeping your movie shelf…")
+                    Text("Steeping your next shelf…")
                         .foregroundStyle(Color.macTeaMuted)
                 }
                 .frame(height: 180)
@@ -203,15 +211,15 @@ private struct MacLibraryView: View {
         HStack(spacing: 20) {
             MacTeaStreamMark(size: 58)
             VStack(alignment: .leading, spacing: 5) {
-                Text("Your next movie starts here")
+                Text("Your next story starts here")
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(Color.macTeaCream)
-                Text("Find a favorite and TeaStream will remember where you left off.")
+                Text("Find a movie or show and TeaStream will remember where you left off.")
                     .foregroundStyle(Color.macTeaMuted)
             }
             Spacer()
             Button(action: showSearch) {
-                Label("Find a Movie", systemImage: "magnifyingglass")
+                Label("Find Something", systemImage: "magnifyingglass")
                     .font(.headline.weight(.semibold))
             }
             .buttonStyle(MacTeaActionButtonStyle())
