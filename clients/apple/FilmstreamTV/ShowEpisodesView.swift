@@ -23,9 +23,9 @@ struct ShowEpisodesView: View {
         ZStack {
             TeaBackground()
 
-            HStack(alignment: .top, spacing: 46) {
+            HStack(alignment: .top, spacing: 42) {
                 seasonSidebar
-                    .frame(width: 300)
+                    .frame(width: 400)
 
                 episodeList
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -67,49 +67,67 @@ struct ShowEpisodesView: View {
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(details.seasons) { season in
-                        Button {
-                            selectedSeasonNumber = season.number
-                        } label: {
-                            HStack(spacing: 12) {
-                                Image(systemName: selectedSeasonNumber == season.number ? "play.fill" : "circle.fill")
-                                    .font(.caption)
-                                    .foregroundStyle(
-                                        selectedSeasonNumber == season.number
-                                            ? Color.teaBackground
-                                            : Color.teaAccent.opacity(0.5)
-                                    )
-                                    .frame(width: 18)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(season.name)
-                                        .font(.headline.weight(.bold))
-                                    Text("\(season.episodeCount) episodes")
-                                        .font(.subheadline)
-                                        .opacity(0.75)
-                                }
-                                Spacer()
-                            }
-                            .foregroundStyle(
-                                focusedSeasonNumber == season.number
-                                    ? Color.teaBackground
-                                    : Color.teaCream.opacity(selectedSeasonNumber == season.number ? 1 : 0.72)
-                            )
-                            .padding(.horizontal, 17)
-                            .padding(.vertical, 13)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(
-                                focusedSeasonNumber == season.number
-                                    ? Color.teaCream
-                                    : Color.teaPanel.opacity(selectedSeasonNumber == season.number ? 0.96 : 0.28),
-                                in: RoundedRectangle(cornerRadius: 13, style: .continuous)
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        .focusEffectDisabled()
-                        .focused($focusedSeasonNumber, equals: season.number)
+                        seasonButton(season)
                     }
                 }
             }
         }
+    }
+
+    private func seasonButton(_ season: SeasonSummary) -> some View {
+        let isSelected = selectedSeasonNumber == season.number
+        let isFocused = focusedSeasonNumber == season.number
+        return Button {
+            selectedSeasonNumber = season.number
+        } label: {
+            HStack(spacing: 14) {
+                RoundedRectangle(cornerRadius: 2, style: .continuous)
+                    .fill(isSelected ? Color.teaAccentLight : Color.teaCream.opacity(0.12))
+                    .frame(width: 4, height: 38)
+
+                Text(season.name)
+                    .font(.headline.weight(.bold))
+                    .lineLimit(1)
+                    .layoutPriority(1)
+
+                Spacer(minLength: 8)
+
+                Text("\(season.episodeCount) episodes")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(isFocused ? Color.teaCream.opacity(0.82) : Color.teaMuted)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+            .foregroundStyle(isFocused || isSelected ? Color.teaCream : Color.teaCream.opacity(0.7))
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(
+                        isFocused
+                            ? Color.teaPanelElevated
+                            : Color.teaPanel.opacity(isSelected ? 0.82 : 0.22)
+                    )
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(
+                        isFocused ? Color.teaAccentLight.opacity(0.78) : Color.teaCream.opacity(isSelected ? 0.12 : 0.04),
+                        lineWidth: isFocused ? 2 : 1
+                    )
+            }
+            .shadow(
+                color: isFocused ? Color.teaAccent.opacity(0.2) : .clear,
+                radius: 18,
+                y: 8
+            )
+            .scaleEffect(isFocused ? 1.025 : 1, anchor: .leading)
+            .animation(.snappy(duration: 0.2), value: isFocused)
+        }
+        .buttonStyle(EpisodeBrowserButtonStyle())
+        .focusEffectDisabled()
+        .focused($focusedSeasonNumber, equals: season.number)
     }
 
     @ViewBuilder
@@ -163,10 +181,15 @@ struct ShowEpisodesView: View {
                             }
                         } else if isFocused {
                             Image(systemName: "play.fill")
-                                .font(.system(size: 28, weight: .bold))
-                                .foregroundStyle(Color.teaBackground)
-                                .padding(19)
-                                .background(Color.teaCream, in: Circle())
+                                .font(.system(size: 27, weight: .bold))
+                                .foregroundStyle(Color.teaCream)
+                                .padding(18)
+                                .background(Color.teaBackground.opacity(0.88), in: Circle())
+                                .overlay {
+                                    Circle()
+                                        .stroke(Color.teaAccentLight.opacity(0.9), lineWidth: 2)
+                                }
+                                .shadow(color: .black.opacity(0.34), radius: 12, y: 6)
                         }
                     }
 
@@ -208,21 +231,26 @@ struct ShowEpisodesView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(14)
-            .background(
-                isFocused ? Color.teaPanelElevated : Color.teaPanel.opacity(0.56),
-                in: RoundedRectangle(cornerRadius: 21, style: .continuous)
-            )
+            .background {
+                RoundedRectangle(cornerRadius: 21, style: .continuous)
+                    .fill(isFocused ? Color.teaPanelElevated : Color.teaPanel.opacity(0.38))
+            }
             .overlay {
                 RoundedRectangle(cornerRadius: 21, style: .continuous)
                     .stroke(
-                        isFocused ? Color.teaAccentLight.opacity(0.72) : Color.teaCream.opacity(0.08),
+                        isFocused ? Color.teaAccentLight.opacity(0.78) : Color.teaCream.opacity(0.07),
                         lineWidth: isFocused ? 2 : 1
                     )
             }
-            .scaleEffect(isFocused ? 1.018 : 1)
+            .shadow(
+                color: isFocused ? Color.teaAccent.opacity(0.18) : .black.opacity(0.12),
+                radius: isFocused ? 20 : 8,
+                y: isFocused ? 9 : 4
+            )
+            .scaleEffect(isFocused ? 1.012 : 1)
             .animation(.snappy(duration: 0.2), value: isFocused)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(EpisodeBrowserButtonStyle())
         .focusEffectDisabled()
         .focused($focusedEpisodeID, equals: episode.id)
         .disabled(preparingEpisodeID != nil)
@@ -238,7 +266,6 @@ struct ShowEpisodesView: View {
         do {
             loadedSeason = try await model.api.season(selectedSeasonNumber, for: details.show.id)
             errorMessage = nil
-            focusedEpisodeID = loadedSeason?.episodes.first?.id
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -262,6 +289,15 @@ struct ShowEpisodesView: View {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+}
+
+private struct EpisodeBrowserButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.86 : 1)
+            .scaleEffect(configuration.isPressed ? 0.99 : 1)
+            .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
     }
 }
 

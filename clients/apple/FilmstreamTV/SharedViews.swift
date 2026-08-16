@@ -144,44 +144,34 @@ private struct TeaDetailActionButtonBody: View {
 
     @Environment(\.isFocused) private var isFocused
 
-    private var foregroundColor: Color {
-        if isFocused || kind == .prominent {
-            return Color.teaBackground
-        }
-        return kind == .destructive ? Color.teaCream.opacity(0.9) : Color.teaCream
-    }
-
-    private var backgroundColor: Color {
-        if isFocused {
-            return kind == .destructive ? Color.teaAmber : Color.teaAccentLight
-        }
-        switch kind {
-        case .prominent:
-            return Color.teaAccent
-        case .standard:
-            return Color.teaPanelElevated.opacity(0.9)
-        case .destructive:
-            return Color.teaBackground.opacity(0.72)
-        }
+    private var focusColor: Color {
+        kind == .destructive ? Color.teaAmber : Color.teaAccentLight
     }
 
     var body: some View {
         configuration.label
-            .foregroundStyle(foregroundColor)
+            .foregroundStyle(
+                isFocused
+                    ? Color.teaBackground
+                    : Color.teaCream.opacity(kind == .destructive ? 0.88 : 1)
+            )
             .padding(.horizontal, 22)
             .padding(.vertical, 15)
-            .background(backgroundColor, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+            .background(
+                isFocused ? focusColor : Color.clear,
+                in: RoundedRectangle(cornerRadius: 13, style: .continuous)
+            )
             .overlay {
                 RoundedRectangle(cornerRadius: 13, style: .continuous)
                     .stroke(
-                        kind == .destructive ? Color.teaAmber.opacity(isFocused ? 0.8 : 0.42) : Color.teaCream.opacity(isFocused ? 0.52 : 0.14),
-                        lineWidth: isFocused ? 2 : 1
+                        isFocused ? Color.teaCream.opacity(0.55) : Color.clear,
+                        lineWidth: 1.5
                     )
             }
             .shadow(
-                color: isFocused ? Color.teaAccent.opacity(0.32) : .black.opacity(0.25),
-                radius: isFocused ? 22 : 10,
-                y: isFocused ? 10 : 5
+                color: isFocused ? focusColor.opacity(0.3) : .clear,
+                radius: 22,
+                y: 10
             )
             .scaleEffect(configuration.isPressed ? 0.985 : isFocused ? 1.025 : 1, anchor: .leading)
             .animation(.snappy(duration: 0.18), value: isFocused)
@@ -323,7 +313,6 @@ private enum NetflixShelfLayout {
     static let viewportOverflow: CGFloat = 72
     static let trailingScrollSpace: CGFloat = 1240
     static let focusedAnchor = UnitPoint(x: 0.07, y: 0.5)
-    static let focusStepInterval: TimeInterval = 0.18
 }
 
 struct NetflixMovieShelf: View {
@@ -336,8 +325,6 @@ struct NetflixMovieShelf: View {
     var onShelfFocusChange: (Bool) -> Void = { _ in }
 
     @State private var expandedMovieID: String?
-    @State private var acceptedFocusedMovieID: String?
-    @State private var focusLockUntil: TimeInterval = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -405,10 +392,8 @@ struct NetflixMovieShelf: View {
         proxy: ScrollViewProxy
     ) {
         let oldMovieID = oldFocus?.shelfID == shelfID ? oldFocus?.movieID : nil
-        guard newFocus?.shelfID == shelfID, let requestedMovieID = newFocus?.movieID else {
+        guard newFocus?.shelfID == shelfID, let focusedMovieID = newFocus?.movieID else {
             guard oldMovieID != nil else { return }
-            acceptedFocusedMovieID = nil
-            focusLockUntil = 0
             onShelfFocusChange(false)
             withAnimation(.easeInOut(duration: 0.18)) {
                 expandedMovieID = nil
@@ -416,43 +401,12 @@ struct NetflixMovieShelf: View {
             return
         }
 
-        guard items.contains(where: { $0.id == requestedMovieID }) else { return }
+        guard items.contains(where: { $0.id == focusedMovieID }) else { return }
         if oldMovieID == nil {
-            acceptedFocusedMovieID = requestedMovieID
-            focusLockUntil = 0
             onShelfFocusChange(true)
-            reveal(requestedMovieID, proxy: proxy)
-            return
         }
-
-        guard requestedMovieID != acceptedFocusedMovieID else { return }
-
-        var targetMovieID = requestedMovieID
-        if let acceptedFocusedMovieID,
-           let acceptedIndex = items.firstIndex(where: { $0.id == acceptedFocusedMovieID }),
-           let requestedIndex = items.firstIndex(where: { $0.id == requestedMovieID }) {
-            let now = ProcessInfo.processInfo.systemUptime
-            if now < focusLockUntil {
-                focusBinding.wrappedValue = NetflixShelfFocus(
-                    shelfID: shelfID,
-                    movieID: acceptedFocusedMovieID
-                )
-                return
-            }
-
-            let direction = requestedIndex > acceptedIndex ? 1 : -1
-            targetMovieID = items[acceptedIndex + direction].id
-            focusLockUntil = now + NetflixShelfLayout.focusStepInterval
-        }
-
-        acceptedFocusedMovieID = targetMovieID
-        reveal(targetMovieID, proxy: proxy)
-        if targetMovieID != requestedMovieID {
-            focusBinding.wrappedValue = NetflixShelfFocus(
-                shelfID: shelfID,
-                movieID: targetMovieID
-            )
-        }
+        guard focusedMovieID != expandedMovieID else { return }
+        reveal(focusedMovieID, proxy: proxy)
     }
 
     private func reveal(_ movieID: String, proxy: ScrollViewProxy) {
