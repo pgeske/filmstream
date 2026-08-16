@@ -781,7 +781,9 @@ func TestCreatePlaybackFallsBackToTorrent(t *testing.T) {
 	))
 	response = httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "Usenet playback unavailable") {
+	if response.Code != http.StatusBadGateway ||
+		!strings.Contains(response.Body.String(), "Usenet playback unavailable") ||
+		strings.Contains(response.Body.String(), "articles unavailable") {
 		t.Fatalf("Usenet-only status = %d, body = %s", response.Code, response.Body.String())
 	}
 }

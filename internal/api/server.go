@@ -924,7 +924,10 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 			case searchErr != nil:
 				writeError(w, http.StatusBadGateway, searchErr.Error())
 			case usenetErr != nil:
-				writeError(w, http.StatusBadGateway, "Usenet playback unavailable: "+usenetErr.Error())
+				s.logger.Warn("Usenet playback unavailable", "title", request.Query,
+					"media_id", request.MediaID, "error", usenetErr)
+				writeError(w, http.StatusBadGateway,
+					"Usenet playback unavailable: no playable release passed validation. Please try again later.")
 			default:
 				writeError(w, http.StatusNotFound, "no matching Usenet candidates found")
 			}
