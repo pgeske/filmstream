@@ -60,15 +60,30 @@ func TestTorznabCapabilitiesSearchAndResolve(t *testing.T) {
 	}
 }
 
+func TestTorznabNormalizesPunctuationInSearchQueries(t *testing.T) {
+	if got := torznabQuery("The Good, the Bad and the Ugly"); got != "The Good the Bad and the Ugly" {
+		t.Fatalf("normalized query = %q", got)
+	}
+	if got := torznabQuery("Harry Potter and the Philosopher's Stone"); got != "Harry Potter and the Philosophers Stone" {
+		t.Fatalf("normalized possessive query = %q", got)
+	}
+	if got := broadMovieQuery("The Good, the Bad and the Ugly", 1966); got != "The Good the 1966" {
+		t.Fatalf("broad query = %q", got)
+	}
+}
+
 func TestTorznabAugmentsSparseMovieResultsWithBasicSearch(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Query().Get("t") {
 		case "caps":
 			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><movie-search available="yes" supportedParams="q,year"/></searching></caps>`)
 		case "movie":
+			if r.URL.Query().Get("q") != "Movie Part One" {
+				t.Errorf("movie query = %q", r.URL.Query().Get("q"))
+			}
 			fmt.Fprint(w, `<?xml version="1.0"?><rss><channel><item><title>Movie.2001.1080p.x264-OLD</title><guid>old</guid><enclosure url="/old" length="1000" type="application/x-nzb"/></item></channel></rss>`)
 		case "search":
-			if r.URL.Query().Get("q") != "Movie 2001" {
+			if r.URL.Query().Get("q") != "Movie Part One 2001" {
 				t.Errorf("broad query = %q", r.URL.Query().Get("q"))
 			}
 			fmt.Fprint(w, `<?xml version="1.0"?><rss><channel><item><title>Movie.2001.1080p.x265-NEW</title><guid>new</guid><pubDate>Tue, 30 Sep 2025 12:00:00 +0000</pubDate><enclosure url="/new" length="1000" type="application/x-nzb"/></item></channel></rss>`)
@@ -82,7 +97,7 @@ func TestTorznabAugmentsSparseMovieResultsWithBasicSearch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	candidates, err := configured.Search(t.Context(), catalog.SearchRequest{Query: "Movie", Year: 2001})
+	candidates, err := configured.Search(t.Context(), catalog.SearchRequest{Query: "Movie, Part One", Year: 2001})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/pgeske/filmstream/internal/catalog"
 )
@@ -117,14 +118,14 @@ func (t *Torznab) Search(ctx context.Context, request catalog.SearchRequest) ([]
 		return nil, err
 	}
 	basicParameters := map[string]string{
-		"t": "search", "q": request.Query, "limit": "100",
+		"t": "search", "q": torznabQuery(request.Query), "limit": "100",
 	}
 	if !capabilities.MovieSearchAvailable {
 		return t.search(ctx, basicParameters)
 	}
 
 	movieParameters := map[string]string{
-		"t": "movie", "q": request.Query, "limit": "100",
+		"t": "movie", "q": torznabQuery(request.Query), "limit": "100",
 	}
 	if request.Year > 0 && capabilities.MovieSearchParams["year"] {
 		movieParameters["year"] = strconv.Itoa(request.Year)
@@ -182,7 +183,7 @@ func (t *Torznab) search(ctx context.Context, parameters map[string]string) ([]c
 }
 
 func broadMovieQuery(title string, year int) string {
-	words := strings.Fields(title)
+	words := strings.Fields(torznabQuery(title))
 	if len(words) > 3 {
 		words = words[:3]
 	}
@@ -190,6 +191,29 @@ func broadMovieQuery(title string, year int) string {
 		words = append(words, strconv.Itoa(year))
 	}
 	return strings.Join(words, " ")
+}
+
+func torznabQuery(value string) string {
+	var result strings.Builder
+	spacePending := false
+	for _, character := range strings.TrimSpace(value) {
+		switch {
+		case unicode.IsLetter(character), unicode.IsDigit(character), unicode.IsMark(character):
+			if spacePending && result.Len() > 0 {
+				result.WriteByte(' ')
+			}
+			result.WriteRune(character)
+			spacePending = false
+		case character == '\'', character == '’':
+			// Indexer release names conventionally omit possessive apostrophes.
+		default:
+			spacePending = result.Len() > 0
+		}
+	}
+	if result.Len() == 0 {
+		return strings.TrimSpace(value)
+	}
+	return result.String()
 }
 
 func mergeCandidates(groups ...[]catalog.Candidate) []catalog.Candidate {
