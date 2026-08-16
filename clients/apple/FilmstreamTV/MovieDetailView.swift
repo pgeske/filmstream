@@ -7,6 +7,7 @@ struct MovieDetailView: View {
 
     @State private var preparedPlayback: PreparedPlayback?
     @State private var isPreparing = false
+    @State private var preparationStage: PlaybackPreparationStage?
     @State private var isRemoving = false
     @State private var errorMessage: String?
     @FocusState private var focusedAction: DetailAction?
@@ -93,7 +94,12 @@ struct MovieDetailView: View {
         .background(Color.teaBackground)
         .task(id: movie.id) {
             focusedAction = .play
-            await model.loadRatings(for: movie)
+            async let ratings: Void = model.loadRatings(for: movie)
+            async let prewarm: Void = model.prewarmPlayback(
+                for: movie,
+                startSeconds: history?.positionSeconds ?? 0
+            )
+            _ = await (ratings, prewarm)
         }
         .fullScreenCover(
             item: $preparedPlayback,
@@ -117,7 +123,7 @@ struct MovieDetailView: View {
                 Text("•")
                 Text(contentRating)
             }
-            MovieRatingBadges(ratings: ratings, tmdbRating: movie.voteAverage)
+            MovieRatingBadges(ratings: ratings)
             if let history, history.progress > 0 {
                 Text("•")
                 Text("\(Int(history.progress * 100))% watched")
@@ -175,10 +181,14 @@ struct MovieDetailView: View {
     }
 
     private var primaryButtonTitle: String {
-        if isPreparing {
-            return "Preparing Stream…"
+        switch preparationStage {
+        case .findingRelease:
+            return "Finding a Release…"
+        case .bufferingVideo:
+            return "Buffering Video…"
+        case nil:
+            return history == nil ? "Play" : "Resume"
         }
-        return history == nil ? "Play" : "Resume"
     }
 
     private func actionLabel(
@@ -205,11 +215,15 @@ struct MovieDetailView: View {
 
     private func preparePlayback(startSeconds: Double) async {
         isPreparing = true
-        defer { isPreparing = false }
+        defer {
+            isPreparing = false
+            preparationStage = nil
+        }
         do {
             preparedPlayback = try await model.preparePlayback(
                 for: movie,
-                startSeconds: startSeconds
+                startSeconds: startSeconds,
+                onStage: { preparationStage = $0 }
             )
             errorMessage = nil
         } catch {

@@ -205,6 +205,7 @@ func runServer(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	apiServer.StartPlaybackPrewarmer(ctx, sourceBaseURL)
 	go func() {
 		<-ctx.Done()
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)

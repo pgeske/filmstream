@@ -22,7 +22,7 @@ const (
 	defaultStartupBufferSeconds = 24
 	defaultReadRate             = 1.25
 	defaultSegmentSeconds       = 4
-	defaultParkedTTL            = 30 * time.Minute
+	defaultParkedTTL            = 2 * time.Hour
 )
 
 type Config struct {
@@ -66,11 +66,18 @@ type Manager struct {
 	parkedTTL      time.Duration
 	logger         *slog.Logger
 
-	ctx       context.Context
-	cancel    context.CancelFunc
-	mu        sync.RWMutex
-	streams   map[string]*runningStream
-	closeOnce sync.Once
+	ctx        context.Context
+	cancel     context.CancelFunc
+	mu         sync.RWMutex
+	streams    map[string]*runningStream
+	startMu    sync.Mutex
+	startLocks map[string]*playbackStartLock
+	closeOnce  sync.Once
+}
+
+type playbackStartLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 type runningStream struct {
@@ -177,7 +184,29 @@ func New(cfg Config) (*Manager, error) {
 		ctx:            ctx,
 		cancel:         cancel,
 		streams:        make(map[string]*runningStream),
+		startLocks:     make(map[string]*playbackStartLock),
 	}, nil
+}
+
+func (m *Manager) lockPlaybackStart(playbackID string) func() {
+	m.startMu.Lock()
+	lock := m.startLocks[playbackID]
+	if lock == nil {
+		lock = &playbackStartLock{}
+		m.startLocks[playbackID] = lock
+	}
+	lock.refs++
+	m.startMu.Unlock()
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		m.startMu.Lock()
+		lock.refs--
+		if lock.refs == 0 && m.startLocks[playbackID] == lock {
+			delete(m.startLocks, playbackID)
+		}
+		m.startMu.Unlock()
+	}
 }
 
 func (m *Manager) ProbeSubtitles(ctx context.Context, playbackID string) ([]SubtitleTrack, error) {
@@ -199,8 +228,10 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 	if startSeconds < 0 {
 		return Stream{}, errors.New("start_seconds cannot be negative")
 	}
-	if stream, ok := m.resumePreparedStream(playbackID, startSeconds, preferredLanguages); ok {
-		return stream, nil
+	unlockStart := m.lockPlaybackStart(playbackID)
+	defer unlockStart()
+	if stream, matched, err := m.resumePreparedStream(ctx, playbackID, startSeconds, preferredLanguages); matched {
+		return stream, err
 	}
 	m.Stop(playbackID)
 
@@ -295,35 +326,38 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 }
 
 func (m *Manager) resumePreparedStream(
+	ctx context.Context,
 	playbackID string,
 	startSeconds float64,
 	preferredLanguages []string,
-) (Stream, bool) {
+) (Stream, bool, error) {
 	m.mu.RLock()
 	stream := m.streams[playbackID]
 	m.mu.RUnlock()
 	if stream == nil || math.Abs(stream.requestedStart-startSeconds) > 0.5 ||
-		!equalStrings(stream.languages, preferredLanguages) || !playlistReady(stream.dir, m.bufferSeconds) {
-		return Stream{}, false
+		!equalStrings(stream.languages, preferredLanguages) {
+		return Stream{}, false, nil
 	}
 
 	stream.processMu.Lock()
-	defer stream.processMu.Unlock()
 	select {
 	case <-stream.done:
-		return Stream{}, false
+		stream.processMu.Unlock()
+		return Stream{}, false, nil
 	default:
 	}
 	m.mu.RLock()
 	isCurrent := m.streams[playbackID] == stream
 	m.mu.RUnlock()
 	if !isCurrent {
-		return Stream{}, false
+		stream.processMu.Unlock()
+		return Stream{}, false, nil
 	}
 	if stream.parked {
 		if err := stream.command.Process.Signal(syscall.SIGCONT); err != nil {
+			stream.processMu.Unlock()
 			m.logger.Warn("resume prepared HLS stream", "playback_id", playbackID, "error", err)
-			return Stream{}, false
+			return Stream{}, true, fmt.Errorf("resume prepared HLS stream: %w", err)
 		}
 		stream.parked = false
 		stream.parkedAt = time.Time{}
@@ -334,15 +368,48 @@ func (m *Manager) resumePreparedStream(
 		m.logger.Info("resumed prepared HLS stream", "playback_id", playbackID,
 			"start_seconds", stream.info.StartSeconds)
 	}
-	return stream.info, true
+	stream.processMu.Unlock()
+
+	startupContext, cancel := context.WithTimeout(ctx, m.startupTimeout)
+	defer cancel()
+	if err := m.waitUntilReady(startupContext, stream); err != nil {
+		m.Stop(playbackID)
+		return Stream{}, true, err
+	}
+	return stream.info, true, nil
 }
 
-func (m *Manager) Park(playbackID string) error {
+func (m *Manager) Prepared(playbackID string, startSeconds float64, preferredLanguages []string, minimumSeconds int) bool {
+	m.mu.RLock()
+	stream := m.streams[playbackID]
+	m.mu.RUnlock()
+	if stream == nil || math.Abs(stream.requestedStart-startSeconds) > 0.5 ||
+		!equalStrings(stream.languages, preferredLanguages) {
+		return false
+	}
+	select {
+	case <-stream.done:
+		return false
+	default:
+	}
+	if minimumSeconds <= 0 {
+		minimumSeconds = m.bufferSeconds
+	}
+	return playlistReady(stream.dir, minimumSeconds)
+}
+
+func (m *Manager) Park(ctx context.Context, playbackID string, minimumSeconds int) error {
 	m.mu.RLock()
 	stream := m.streams[playbackID]
 	m.mu.RUnlock()
 	if stream == nil {
 		return os.ErrNotExist
+	}
+	if minimumSeconds <= 0 {
+		minimumSeconds = m.bufferSeconds
+	}
+	if err := m.waitUntilBuffered(ctx, stream, minimumSeconds); err != nil {
+		return err
 	}
 
 	stream.processMu.Lock()
@@ -361,9 +428,6 @@ func (m *Manager) Park(playbackID string) error {
 	if stream.parked {
 		return nil
 	}
-	if !playlistReady(stream.dir, m.bufferSeconds) {
-		return errors.New("HLS startup buffer is not ready")
-	}
 	// Keep the same FFmpeg process and source connection so resuming preserves
 	// A/V timestamps while avoiding any additional download or packaging work.
 	if err := stream.command.Process.Signal(syscall.SIGSTOP); err != nil {
@@ -376,7 +440,7 @@ func (m *Manager) Park(playbackID string) error {
 		m.expireParkedStream(playbackID, stream, parkedAt)
 	})
 	m.logger.Info("parked prepared HLS stream", "playback_id", playbackID,
-		"expires_in", m.parkedTTL)
+		"buffer_seconds", minimumSeconds, "expires_in", m.parkedTTL)
 	return nil
 }
 
@@ -788,6 +852,29 @@ func (m *Manager) waitUntilReady(ctx context.Context, stream *runningStream) err
 				return fmt.Errorf("FFmpeg exited before HLS was ready: %v: %s", err, details)
 			}
 			return fmt.Errorf("FFmpeg exited before HLS was ready: %v", err)
+		case <-ticker.C:
+		}
+	}
+}
+
+func (m *Manager) waitUntilBuffered(ctx context.Context, stream *runningStream, minimumSeconds int) error {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if playlistReady(stream.dir, minimumSeconds) {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for HLS prewarm buffer: %w", ctx.Err())
+		case <-stream.done:
+			if playlistReady(stream.dir, minimumSeconds) {
+				return nil
+			}
+			stream.errMu.RLock()
+			err := stream.err
+			stream.errMu.RUnlock()
+			return fmt.Errorf("FFmpeg exited before HLS prewarm completed: %v", err)
 		case <-ticker.C:
 		}
 	}

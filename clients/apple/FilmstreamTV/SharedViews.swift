@@ -181,13 +181,9 @@ private struct TeaDetailActionButtonBody: View {
 
 struct MovieRatingBadges: View {
     let ratings: MovieRatings?
-    var tmdbRating: Double? = nil
 
     var body: some View {
         HStack(spacing: 10) {
-            if let tmdbRating, tmdbRating > 0 {
-                RatingBadge(source: .tmdb, value: String(format: "%.1f", tmdbRating))
-            }
             if let imdb = ratings?.imdb {
                 RatingBadge(source: .imdb, value: String(format: "%.1f", imdb))
             }
@@ -200,13 +196,11 @@ struct MovieRatingBadges: View {
 }
 
 private enum RatingSource {
-    case tmdb
     case imdb
     case rottenTomatoes
 
     var accessibilityName: String {
         switch self {
-        case .tmdb: "TMDB"
         case .imdb: "IMDb"
         case .rottenTomatoes: "Rotten Tomatoes"
         }
@@ -243,13 +237,6 @@ private struct RatingBadge: View {
     @ViewBuilder
     private var brandMark: some View {
         switch source {
-        case .tmdb:
-            HStack(spacing: 3) {
-                Image(systemName: "film.fill")
-                Text("TMDB")
-            }
-            .font(.system(size: 13, weight: .bold, design: .rounded))
-            .foregroundStyle(Color.teaAccentLight)
         case .imdb:
             Text("IMDb")
                 .font(.system(size: 13, weight: .black, design: .rounded))

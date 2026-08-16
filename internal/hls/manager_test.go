@@ -138,8 +138,11 @@ while :; do sleep 1; done
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.Park(first.PlaybackID); err != nil {
+	if err := manager.Park(t.Context(), first.PlaybackID, 4); err != nil {
 		t.Fatal(err)
+	}
+	if !manager.Prepared(first.PlaybackID, 0, []string{"en"}, 4) {
+		t.Fatal("parked stream was not reported as prepared")
 	}
 	second, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"})
 	if err != nil {
@@ -161,7 +164,7 @@ while :; do sleep 1; done
 		t.Fatalf("probe calls = %q, packager calls = %q", probeCalls, packagerCalls)
 	}
 
-	if err := manager.Park(first.PlaybackID); err != nil {
+	if err := manager.Park(t.Context(), first.PlaybackID, 4); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -174,6 +177,74 @@ while :; do sleep 1; done
 			t.Fatalf("parked stream did not expire: %v", err)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestManagerJoinsInProgressPreparedStream(t *testing.T) {
+	packagerCount := filepath.Join(t.TempDir(), "packager-count")
+	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
+cat <<'JSON'
+{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]}],"format":{"duration":"7200"}}
+JSON
+`)
+	ffmpeg := writeExecutable(t, "ffmpeg", fmt.Sprintf(`#!/bin/sh
+printf 'x\n' >> %q
+for last do :; done
+dir=$(dirname "$last")
+printf 'init' > "$dir/init.mp4"
+printf 'segment' > "$dir/segment-000000.m4s"
+cat > "$dir/index.m3u8" <<'PLAYLIST'
+#EXTM3U
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:2.0,
+segment-000000.m4s
+PLAYLIST
+sleep 0.2
+printf 'segment' > "$dir/segment-000001.m4s"
+cat >> "$dir/index.m3u8" <<'PLAYLIST'
+#EXTINF:2.0,
+segment-000001.m4s
+PLAYLIST
+while :; do sleep 1; done
+`, packagerCount))
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943", StartupTimeout: 5 * time.Second,
+		BufferSeconds: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	firstResult := make(chan error, 1)
+	go func() {
+		_, startErr := manager.Start(t.Context(), "playback-1", 60, []string{"en"})
+		firstResult <- startErr
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if contents, readErr := os.ReadFile(packagerCount); readErr == nil && len(contents) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("initial packager did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if _, err := manager.Start(t.Context(), "playback-1", 60, []string{"en"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-firstResult; err != nil {
+		t.Fatal(err)
+	}
+	packagerCalls, err := os.ReadFile(packagerCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(packagerCalls), "x") != 1 {
+		t.Fatalf("packager calls = %q", packagerCalls)
 	}
 }
 

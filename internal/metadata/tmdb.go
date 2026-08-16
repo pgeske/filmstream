@@ -158,9 +158,9 @@ func (t *TMDB) Discover(ctx context.Context, collection Collection) ([]Movie, er
 		tvValues.Set("sort_by", "popularity.desc")
 	case CollectionTopRated:
 		movieValues.Set("sort_by", "vote_average.desc")
-		movieValues.Set("vote_count.gte", "1000")
+		movieValues.Set("vote_count.gte", "5000")
 		tvValues.Set("sort_by", "vote_average.desc")
-		tvValues.Set("vote_count.gte", "500")
+		tvValues.Set("vote_count.gte", "2000")
 	default:
 		return nil, fmt.Errorf("unsupported media collection %q", collection)
 	}

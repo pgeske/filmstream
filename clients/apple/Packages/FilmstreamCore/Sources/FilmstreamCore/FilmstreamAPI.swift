@@ -145,23 +145,19 @@ public struct FilmstreamAPI: Sendable {
         let _: HealthResponse = try await send(request)
     }
 
-    public func createPlayback(for movie: Movie) async throws -> Playback {
+    public func createPlayback(for movie: Movie, startSeconds: Double = 0) async throws -> Playback {
         try await send(
             path: "v1/playbacks",
             method: "POST",
-            body: CreatePlaybackRequest(
-                mediaID: movie.id,
-                mediaType: movie.mediaType,
-                query: movie.seriesTitle ?? movie.title,
-                originalTitle: movie.originalTitle,
-                year: movie.year,
-                seriesID: movie.seriesID,
-                seriesTitle: movie.seriesTitle,
-                seasonNumber: movie.seasonNumber,
-                episodeNumber: movie.episodeNumber,
-                episodeTitle: movie.episodeTitle,
-                preferences: .appleTV
-            )
+            body: playbackRequest(for: movie, startSeconds: startSeconds)
+        )
+    }
+
+    public func prewarmPlayback(for movie: Movie, startSeconds: Double = 0) async throws {
+        let _: HealthResponse = try await send(
+            path: "v1/playbacks/prewarm",
+            method: "POST",
+            body: playbackRequest(for: movie, startSeconds: startSeconds)
         )
     }
 
@@ -175,15 +171,6 @@ public struct FilmstreamAPI: Sendable {
             body: HLSRequest(startSeconds: max(0, startSeconds))
         )
         return PreparedPlayback(playback: playback, hls: hls)
-    }
-
-    public func parkNativePlayback(_ playbackID: String) async throws {
-        var request = URLRequest(
-            url: baseURL.appendingPathComponent("v1/playbacks/\(playbackID)/hls/park")
-        )
-        request.httpMethod = "POST"
-        request.timeoutInterval = 15
-        let _: HealthResponse = try await send(request)
     }
 
     public func stopNativePlayback(_ playbackID: String) async throws {
@@ -248,6 +235,23 @@ public struct FilmstreamAPI: Sendable {
                 positionSeconds: positionSeconds,
                 durationSeconds: durationSeconds
             )
+        )
+    }
+
+    private func playbackRequest(for movie: Movie, startSeconds: Double) -> CreatePlaybackRequest {
+        CreatePlaybackRequest(
+            mediaID: movie.id,
+            mediaType: movie.mediaType,
+            query: movie.seriesTitle ?? movie.title,
+            originalTitle: movie.originalTitle,
+            year: movie.year,
+            seriesID: movie.seriesID,
+            seriesTitle: movie.seriesTitle,
+            seasonNumber: movie.seasonNumber,
+            episodeNumber: movie.episodeNumber,
+            episodeTitle: movie.episodeTitle,
+            startSeconds: max(0, startSeconds),
+            preferences: .appleTV
         )
     }
 
@@ -347,6 +351,7 @@ private struct CreatePlaybackRequest: Encodable {
     let seasonNumber: Int?
     let episodeNumber: Int?
     let episodeTitle: String?
+    let startSeconds: Double
     let preferences: PlaybackPreferences
 
     private enum CodingKeys: String, CodingKey {
@@ -360,6 +365,7 @@ private struct CreatePlaybackRequest: Encodable {
         case seasonNumber = "season_number"
         case episodeNumber = "episode_number"
         case episodeTitle = "episode_title"
+        case startSeconds = "start_seconds"
         case preferences
     }
 }

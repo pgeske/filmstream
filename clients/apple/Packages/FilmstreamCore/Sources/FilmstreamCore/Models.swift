@@ -392,6 +392,11 @@ public struct HLSPlayback: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
+public enum PlaybackPreparationStage: Hashable, Sendable {
+    case findingRelease
+    case bufferingVideo
+}
+
 public struct PreparedPlayback: Hashable, Identifiable, Sendable {
     public var id: String { playback.id }
     public let playback: Playback

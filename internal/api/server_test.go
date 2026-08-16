@@ -38,6 +38,8 @@ type fakeMetadata struct{}
 
 type fakeRatings struct{}
 
+type partialRatings struct{}
+
 type fakeUsenetPlaybackEngine struct {
 	createdSource usenetstream.Source
 	created       []usenetstream.Source
@@ -117,7 +119,11 @@ func (f *fakeHLSManager) AssetPath(_, name string) (string, error) {
 	return filepath.Join(f.dir, name), nil
 }
 
-func (f *fakeHLSManager) Park(id string) error {
+func (f *fakeHLSManager) Prepared(string, float64, []string, int) bool {
+	return false
+}
+
+func (f *fakeHLSManager) Park(_ context.Context, id string, _ int) error {
 	f.parked = id
 	return nil
 }
@@ -161,6 +167,16 @@ func (fakeRatings) Ratings(_ context.Context, title string, year int) (metadata.
 	rottenTomatoes := 91
 	contentRating := "PG"
 	return metadata.MovieRatings{IMDb: &imdb, RottenTomatoes: &rottenTomatoes, ContentRating: &contentRating}, nil
+}
+
+func (partialRatings) RatingsByIMDbID(_ context.Context, _ string) (metadata.MovieRatings, error) {
+	imdb := 8.4
+	return metadata.MovieRatings{IMDb: &imdb}, nil
+}
+
+func (partialRatings) Ratings(_ context.Context, _ string, _ int) (metadata.MovieRatings, error) {
+	rottenTomatoes := 91
+	return metadata.MovieRatings{RottenTomatoes: &rottenTomatoes}, nil
 }
 
 func (fakeMetadata) Discover(_ context.Context, collection metadata.Collection) ([]metadata.Movie, error) {
@@ -432,6 +448,112 @@ func TestParkHLSPlayback(t *testing.T) {
 	}
 }
 
+func TestCreatePlaybackJoinsInProgressPrewarm(t *testing.T) {
+	var createRequests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/playbacks":
+			createRequests.Add(1)
+			if r.Header.Get(prewarmRequestHeader) == "" {
+				t.Error("internal prewarm header is missing")
+			}
+			time.Sleep(50 * time.Millisecond)
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{"id":"warm-playback","name":"The Movie","file_name":"movie.mkv","file_size":1000,"source":"usenet","stream_url":"http://127.0.0.1/stream"}`)
+		case "/v1/playbacks/warm-playback/hls":
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case "/v1/playbacks/warm-playback/hls/park":
+			fmt.Fprint(w, `{"status":"parked"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	registry, err := indexer.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	torrentEngine, err := torrentstream.New(torrentstream.Config{
+		DataDir: t.TempDir(), MetadataTimeout: time.Second, CleanOnClose: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer torrentEngine.Close()
+	server := New(registry, torrentEngine, catalog.Preferences{}, slog.Default())
+	server.usenetEngine = &fakeUsenetPlaybackEngine{
+		session: &usenetstream.Session{ID: "warm-playback", Name: "The Movie", FileName: "movie.mkv"},
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	server.prewarmContext = ctx
+	server.prewarmBaseURL = upstream.URL
+	server.prewarmClient = upstream.Client()
+	server.queuePlaybackPrewarm(playbackPrewarmTarget{
+		request: CreatePlaybackRequest{MediaID: "tmdb:1", Query: "The Movie", Year: 2001, StartSeconds: 600},
+		source:  "hint", priority: true,
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/playbacks", strings.NewReader(
+		`{"media_id":"tmdb:1","query":"The Movie","year":2001,"start_seconds":600}`,
+	))
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusCreated || !strings.Contains(response.Body.String(), `"id":"warm-playback"`) {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if createRequests.Load() != 1 {
+		t.Fatalf("create requests = %d, want 1", createRequests.Load())
+	}
+}
+
+func TestClaimPrewarmedPlaybackCancelsPendingPark(t *testing.T) {
+	registry, err := indexer.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	torrentEngine, err := torrentstream.New(torrentstream.Config{
+		DataDir: t.TempDir(), MetadataTimeout: time.Second, CleanOnClose: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer torrentEngine.Close()
+	server := New(registry, torrentEngine, catalog.Preferences{}, slog.Default())
+	server.usenetEngine = &fakeUsenetPlaybackEngine{
+		session: &usenetstream.Session{ID: "warm-playback", Name: "The Movie", FileName: "movie.mkv"},
+	}
+	ready := make(chan struct{})
+	close(ready)
+	var parkCanceled atomic.Bool
+	request := CreatePlaybackRequest{MediaID: "tmdb:1", Query: "The Movie", StartSeconds: 600}
+	server.prewarmStates["tmdb:1"] = &playbackPrewarmState{
+		target: playbackPrewarmTarget{request: request}, playbackReady: ready,
+		response: CreatePlaybackResponse{ID: "warm-playback"},
+		cancel:   func() {}, parkCancel: func() { parkCanceled.Store(true) },
+	}
+
+	response, ok := server.claimPrewarmedPlayback(t.Context(), request)
+	if !ok || response.ID != "warm-playback" || !parkCanceled.Load() {
+		t.Fatalf("response = %+v, claimed = %v, park canceled = %v", response, ok, parkCanceled.Load())
+	}
+}
+
+func TestNextEpisodeIsIncludedInPrewarming(t *testing.T) {
+	server := &Server{metadataProvider: fakeMetadata{}}
+	next, ok := server.nextEpisodeForPrewarming(t.Context(), history.Entry{
+		MediaID: "tmdb-tv:3:s1:e1", MediaType: "show", Title: "Top Rated Show",
+		SeriesID: "tmdb-tv:3", SeriesTitle: "Top Rated Show", SeasonNumber: 1, EpisodeNumber: 1,
+	})
+	if !ok || next.MediaID != "tmdb-tv:3:s1:e2" || next.SeasonNumber != 1 || next.EpisodeNumber != 2 {
+		t.Fatalf("next episode = %+v, found = %v", next, ok)
+	}
+}
+
 func TestRankedUsenetPlaybackTriesPastTenIncompletePosts(t *testing.T) {
 	registry, err := indexer.NewRegistry([]config.Indexer{{
 		Name: "usenet", Type: "torznab", Endpoint: "https://indexer.example/api",
@@ -637,6 +759,16 @@ func TestCatalogRatingsUsesTMDBMovieIDForReliableLookup(t *testing.T) {
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"imdb":9.1`) || !strings.Contains(response.Body.String(), `"rotten_tomatoes":95`) || !strings.Contains(response.Body.String(), `"content_rating":"PG-13"`) {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestCatalogRatingsMergesIMDbAndTitleFallbacks(t *testing.T) {
+	server := &Server{metadataProvider: fakeMetadata{}, ratingsProvider: partialRatings{}}
+	request := httptest.NewRequest(http.MethodGet, "/v1/catalog/ratings?title=The+Movie&year=2001&media_id=tmdb%3A1", nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"imdb":8.4`) || !strings.Contains(response.Body.String(), `"rotten_tomatoes":91`) {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
 }

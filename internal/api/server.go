@@ -38,6 +38,7 @@ type CreatePlaybackRequest struct {
 	SeasonNumber  int                 `json:"season_number,omitempty"`
 	EpisodeNumber int                 `json:"episode_number,omitempty"`
 	EpisodeTitle  string              `json:"episode_title,omitempty"`
+	StartSeconds  float64             `json:"start_seconds,omitempty"`
 	Preferences   catalog.Preferences `json:"preferences,omitempty"`
 	MagnetURI     string              `json:"magnet_uri,omitempty"`
 	TorrentPath   string              `json:"torrent_path,omitempty"`
@@ -85,7 +86,8 @@ type HLSStreamManager interface {
 	Start(context.Context, string, float64, []string) (hls.Stream, error)
 	StartSubtitle(context.Context, string, int) error
 	AssetPath(string, string) (string, error)
-	Park(string) error
+	Prepared(string, float64, []string, int) bool
+	Park(context.Context, string, int) error
 	Stop(string)
 }
 
@@ -129,7 +131,17 @@ type Server struct {
 	selected          map[string]catalog.RankedCandidate
 	playbackCacheKeys map[string]playbackCacheKey
 	playbackLanguages map[string][]string
+	playbackRequests  map[string]CreatePlaybackRequest
+	playbackResponses map[string]CreatePlaybackResponse
 	usenetFailures    map[string]time.Time
+
+	prewarmMu      sync.Mutex
+	prewarmStates  map[string]*playbackPrewarmState
+	prewarmSlots   chan struct{}
+	prewarmTrigger chan struct{}
+	prewarmBaseURL string
+	prewarmClient  *http.Client
+	prewarmContext context.Context
 }
 
 func New(indexers *indexer.Registry, engine *torrentstream.Engine, defaults catalog.Preferences, logger *slog.Logger) *Server {
@@ -142,7 +154,12 @@ func New(indexers *indexer.Registry, engine *torrentstream.Engine, defaults cata
 		selected:           make(map[string]catalog.RankedCandidate),
 		playbackCacheKeys:  make(map[string]playbackCacheKey),
 		playbackLanguages:  make(map[string][]string),
+		playbackRequests:   make(map[string]CreatePlaybackRequest),
+		playbackResponses:  make(map[string]CreatePlaybackResponse),
 		usenetFailures:     make(map[string]time.Time),
+		prewarmStates:      make(map[string]*playbackPrewarmState),
+		prewarmSlots:       make(chan struct{}, 2),
+		prewarmTrigger:     make(chan struct{}, 1),
 	}
 	engine.SetCleanupHandler(func(id, _ string) {
 		server.cleanupPlayback(id)
@@ -168,6 +185,8 @@ func (s *Server) cleanupPlayback(id string) {
 	delete(s.selected, id)
 	delete(s.playbackCacheKeys, id)
 	delete(s.playbackLanguages, id)
+	delete(s.playbackRequests, id)
+	delete(s.playbackResponses, id)
 	s.mu.Unlock()
 	s.hlsMu.RLock()
 	manager := s.hlsManager
@@ -242,6 +261,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /v1/watch-history", s.updateWatchProgress)
 	mux.HandleFunc("DELETE /v1/watch-history/{id}", s.removeWatchHistory)
 	mux.HandleFunc("POST /v1/playbacks", s.createPlayback)
+	mux.HandleFunc("POST /v1/playbacks/prewarm", s.prewarmPlayback)
 	mux.HandleFunc("GET /v1/playbacks/{id}", s.playbackStatus)
 	mux.HandleFunc("GET /v1/playbacks/{id}/stream", s.streamPlayback)
 	mux.HandleFunc("HEAD /v1/playbacks/{id}/stream", s.streamPlayback)
@@ -334,16 +354,21 @@ func (s *Server) catalogRatings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var resolvedRatings metadata.MovieRatings
+	hasResolvedRatings := false
 	if idProvider, ok := movieMetadataProvider.(metadata.IMDbIDProvider); ok && mediaID != "" {
 		if imdbRatingsProvider, ok := ratingsProvider.(metadata.IMDbRatingsProvider); ok {
 			imdbID, idErr := idProvider.IMDbID(r.Context(), mediaID)
 			if idErr == nil {
 				ratings, ratingsErr := imdbRatingsProvider.RatingsByIMDbID(r.Context(), imdbID)
 				if ratingsErr == nil {
-					writeJSON(w, http.StatusOK, ratings)
-					return
-				}
-				if s.logger != nil {
+					resolvedRatings = ratings
+					hasResolvedRatings = true
+					if ratings.IMDb != nil && ratings.RottenTomatoes != nil {
+						writeJSON(w, http.StatusOK, ratings)
+						return
+					}
+				} else if s.logger != nil {
 					s.logger.Warn("load ratings by IMDb ID", "media_id", mediaID, "error", ratingsErr)
 				}
 			} else if s.logger != nil {
@@ -352,12 +377,16 @@ func (s *Server) catalogRatings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ratings, err := ratingsProvider.Ratings(r.Context(), title, year)
+	titleRatings, err := ratingsProvider.Ratings(r.Context(), title, year)
 	if err != nil {
+		if hasResolvedRatings {
+			writeJSON(w, http.StatusOK, resolvedRatings)
+			return
+		}
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, ratings)
+	writeJSON(w, http.StatusOK, mergeMovieRatings(resolvedRatings, titleRatings))
 }
 
 func (s *Server) discoverCatalog(w http.ResponseWriter, r *http.Request) {
@@ -711,6 +740,7 @@ func (s *Server) removeWatchHistory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.triggerPlaybackPrewarming()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -766,6 +796,9 @@ func (s *Server) updateWatchProgress(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if entry.SeriesID != "" {
+		go s.queueNextEpisodePrewarm(entry)
+	}
 	writeJSON(w, http.StatusOK, entry)
 }
 
@@ -809,6 +842,10 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 	request.SeriesID = strings.TrimSpace(request.SeriesID)
 	request.SeriesTitle = strings.TrimSpace(request.SeriesTitle)
 	request.EpisodeTitle = strings.TrimSpace(request.EpisodeTitle)
+	if request.StartSeconds < 0 {
+		writeError(w, http.StatusBadRequest, "start_seconds cannot be negative")
+		return
+	}
 	if request.SeasonNumber > 0 || request.EpisodeNumber > 0 {
 		if request.SeasonNumber <= 0 || request.EpisodeNumber <= 0 || request.SeriesID == "" {
 			writeError(w, http.StatusBadRequest, "episode playback requires series_id, season_number, and episode_number")
@@ -821,6 +858,7 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	preferences := mergePreferences(s.defaults, request.Preferences)
+	request.Preferences = preferences
 	sourceCount := 0
 	if request.Query != "" {
 		sourceCount++
@@ -834,6 +872,13 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 	if sourceCount != 1 {
 		writeError(w, http.StatusBadRequest, "provide exactly one of query, magnet_uri, or torrent_path")
 		return
+	}
+	if r.Header.Get(prewarmRequestHeader) == "" {
+		if response, ok := s.claimPrewarmedPlayback(r.Context(), request); ok {
+			response.StreamURL = fmt.Sprintf("%s://%s/v1/playbacks/%s/stream", requestScheme(r), r.Host, response.ID)
+			writeJSON(w, http.StatusCreated, response)
+			return
+		}
 	}
 
 	var session *playbackSession
@@ -958,8 +1003,7 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 	}
 
-	s.logger.Info("created playback", "id", session.ID, "source", session.Source, "name", session.Name, "file", session.FileName)
-	writeJSON(w, http.StatusCreated, CreatePlaybackResponse{
+	response := CreatePlaybackResponse{
 		ID:        session.ID,
 		Name:      session.Name,
 		FileName:  session.FileName,
@@ -967,7 +1011,13 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 		Source:    session.Source,
 		StreamURL: fmt.Sprintf("%s://%s/v1/playbacks/%s/stream", requestScheme(r), r.Host, session.ID),
 		Selected:  selected,
-	})
+	}
+	s.mu.Lock()
+	s.playbackRequests[session.ID] = request
+	s.playbackResponses[session.ID] = response
+	s.mu.Unlock()
+	s.logger.Info("created playback", "id", session.ID, "source", session.Source, "name", session.Name, "file", session.FileName)
+	writeJSON(w, http.StatusCreated, response)
 }
 
 func (s *Server) searchAndRank(
@@ -1726,7 +1776,21 @@ func (s *Server) parkHLSPlayback(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotImplemented, "HLS playback is not configured")
 		return
 	}
-	if err := manager.Park(r.PathValue("id")); err != nil {
+	defer r.Body.Close()
+	var request struct {
+		BufferSeconds int `json:"buffer_seconds,omitempty"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid request: "+err.Error())
+		return
+	}
+	if request.BufferSeconds < 0 || request.BufferSeconds > 120 {
+		writeError(w, http.StatusBadRequest, "buffer_seconds must be between 0 and 120")
+		return
+	}
+	if err := manager.Park(r.Context(), r.PathValue("id"), request.BufferSeconds); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			writeError(w, http.StatusNotFound, "HLS playback not found")
 			return
@@ -1741,8 +1805,12 @@ func (s *Server) stopHLSPlayback(w http.ResponseWriter, r *http.Request) {
 	s.hlsMu.RLock()
 	manager := s.hlsManager
 	s.hlsMu.RUnlock()
+	playbackID := r.PathValue("id")
 	if manager != nil {
-		manager.Stop(r.PathValue("id"))
+		manager.Stop(playbackID)
+	}
+	if !s.queuePlaybackHandoff(playbackID) {
+		s.triggerPlaybackPrewarming()
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -1793,6 +1861,19 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func mergeMovieRatings(primary, fallback metadata.MovieRatings) metadata.MovieRatings {
+	if primary.IMDb == nil {
+		primary.IMDb = fallback.IMDb
+	}
+	if primary.RottenTomatoes == nil {
+		primary.RottenTomatoes = fallback.RottenTomatoes
+	}
+	if primary.ContentRating == nil {
+		primary.ContentRating = fallback.ContentRating
+	}
+	return primary
 }
 
 func mergePreferences(defaults, requested catalog.Preferences) catalog.Preferences {

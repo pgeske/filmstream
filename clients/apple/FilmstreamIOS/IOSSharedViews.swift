@@ -252,13 +252,9 @@ struct MobileBackdropImage: View {
 
 struct MobileRatingBadges: View {
     let ratings: MovieRatings?
-    let tmdbRating: Double?
 
     var body: some View {
         HStack(spacing: 7) {
-            if let tmdbRating, tmdbRating > 0 {
-                MobileRatingBadge(source: .tmdb, value: String(format: "%.1f", tmdbRating))
-            }
             if let imdb = ratings?.imdb {
                 MobileRatingBadge(source: .imdb, value: String(format: "%.1f", imdb))
             }
@@ -271,13 +267,11 @@ struct MobileRatingBadges: View {
 }
 
 private enum MobileRatingSource {
-    case tmdb
     case imdb
     case rottenTomatoes
 
     var accessibilityName: String {
         switch self {
-        case .tmdb: "TMDB"
         case .imdb: "IMDb"
         case .rottenTomatoes: "Rotten Tomatoes"
         }
@@ -310,10 +304,6 @@ private struct MobileRatingBadge: View {
     @ViewBuilder
     private var mark: some View {
         switch source {
-        case .tmdb:
-            Text("TMDB")
-                .font(.system(size: 9, weight: .bold, design: .rounded))
-                .foregroundStyle(Color.mobileTeaAccentLight)
         case .imdb:
             Text("IMDb")
                 .font(.system(size: 9, weight: .black, design: .rounded))

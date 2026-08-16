@@ -1,0 +1,626 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/pgeske/filmstream/internal/catalog"
+	"github.com/pgeske/filmstream/internal/history"
+	"github.com/pgeske/filmstream/internal/metadata"
+)
+
+const (
+	prewarmRequestHeader = "X-Filmstream-Prewarm"
+	prewarmBufferSeconds = 60
+	prewarmRefresh       = 10 * time.Minute
+	prewarmMaxAge        = 20 * time.Minute
+	prewarmHintTTL       = 30 * time.Minute
+)
+
+type playbackPrewarmTarget struct {
+	request  CreatePlaybackRequest
+	source   string
+	priority bool
+	seed     *CreatePlaybackResponse
+}
+
+type playbackPrewarmState struct {
+	target        playbackPrewarmTarget
+	playbackReady chan struct{}
+	response      CreatePlaybackResponse
+	err           error
+	claimed       bool
+	bufferReady   bool
+	bufferedAt    time.Time
+	cancel        context.CancelFunc
+	parkCancel    context.CancelFunc
+}
+
+func (s *Server) StartPlaybackPrewarmer(ctx context.Context, baseURL string) {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" || s.historyStore == nil {
+		return
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConnsPerHost = 8
+	s.prewarmMu.Lock()
+	s.prewarmBaseURL = baseURL
+	s.prewarmClient = &http.Client{Transport: transport}
+	s.prewarmContext = ctx
+	s.prewarmMu.Unlock()
+
+	go func() {
+		initial := time.NewTimer(time.Second)
+		ticker := time.NewTicker(prewarmRefresh)
+		defer initial.Stop()
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				s.cancelPlaybackPrewarming()
+				return
+			case <-initial.C:
+				s.syncHistoryPrewarming(ctx)
+			case <-ticker.C:
+				s.syncHistoryPrewarming(ctx)
+			case <-s.prewarmTrigger:
+				s.syncHistoryPrewarming(ctx)
+			}
+		}
+	}()
+}
+
+func (s *Server) triggerPlaybackPrewarming() {
+	select {
+	case s.prewarmTrigger <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Server) prewarmPlayback(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	var request CreatePlaybackRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request: "+err.Error())
+		return
+	}
+	request.MediaID = strings.TrimSpace(request.MediaID)
+	request.Query = strings.TrimSpace(request.Query)
+	request.SeriesID = strings.TrimSpace(request.SeriesID)
+	request.SeriesTitle = strings.TrimSpace(request.SeriesTitle)
+	if request.MediaID == "" || request.Query == "" || request.StartSeconds < 0 {
+		writeError(w, http.StatusBadRequest, "media_id, query, and a non-negative start_seconds are required")
+		return
+	}
+	request.Preferences = mergePreferences(s.defaults, request.Preferences)
+	s.queuePlaybackPrewarm(playbackPrewarmTarget{request: request, source: "hint", priority: true})
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "prewarming"})
+}
+
+func (s *Server) claimPrewarmedPlayback(ctx context.Context, request CreatePlaybackRequest) (CreatePlaybackResponse, bool) {
+	key := playbackPrewarmKey(request)
+	if key == "" {
+		return CreatePlaybackResponse{}, false
+	}
+	s.prewarmMu.Lock()
+	state := s.prewarmStates[key]
+	if state == nil || !matchingPrewarmTarget(state.target.request, request) {
+		s.prewarmMu.Unlock()
+		return CreatePlaybackResponse{}, false
+	}
+	ready := state.playbackReady
+	s.prewarmMu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return CreatePlaybackResponse{}, false
+	case <-ready:
+	}
+
+	s.prewarmMu.Lock()
+	state = s.prewarmStates[key]
+	if state == nil || state.err != nil || state.response.ID == "" ||
+		!matchingPrewarmTarget(state.target.request, request) {
+		s.prewarmMu.Unlock()
+		return CreatePlaybackResponse{}, false
+	}
+	state.claimed = true
+	if state.parkCancel != nil {
+		state.parkCancel()
+	}
+	delete(s.prewarmStates, key)
+	response := state.response
+	s.prewarmMu.Unlock()
+
+	if !s.playbackExists(response.ID) {
+		return CreatePlaybackResponse{}, false
+	}
+	s.logger.Info("claimed prewarmed playback", "id", response.ID,
+		"media_id", request.MediaID, "start_seconds", request.StartSeconds)
+	return response, true
+}
+
+func (s *Server) queuePlaybackPrewarm(target playbackPrewarmTarget) {
+	target.request.MediaID = strings.TrimSpace(target.request.MediaID)
+	target.request.Query = strings.TrimSpace(target.request.Query)
+	target.request.Preferences = mergePreferences(s.defaults, target.request.Preferences)
+	key := playbackPrewarmKey(target.request)
+	if key == "" || target.request.Query == "" || target.request.StartSeconds < 0 {
+		return
+	}
+
+	s.prewarmMu.Lock()
+	if s.prewarmContext == nil || s.prewarmClient == nil || s.prewarmBaseURL == "" {
+		s.prewarmMu.Unlock()
+		return
+	}
+	if existing := s.prewarmStates[key]; existing != nil && matchingPrewarmTarget(existing.target.request, target.request) {
+		if existing.response.ID == "" || !existing.bufferReady {
+			s.prewarmMu.Unlock()
+			return
+		}
+		if time.Since(existing.bufferedAt) < prewarmMaxAge && s.prewarmedPlaybackAvailable(existing) {
+			s.prewarmMu.Unlock()
+			return
+		}
+	}
+	stalePlaybackID := ""
+	if existing := s.prewarmStates[key]; existing != nil {
+		stalePlaybackID = existing.response.ID
+		delete(s.prewarmStates, key)
+		existing.cancel()
+	}
+	stateContext, cancel := context.WithCancel(s.prewarmContext)
+	state := &playbackPrewarmState{
+		target: target, playbackReady: make(chan struct{}), cancel: cancel,
+	}
+	s.prewarmStates[key] = state
+	s.prewarmMu.Unlock()
+
+	if stalePlaybackID != "" {
+		s.stopPreparedPlayback(stalePlaybackID)
+	}
+	go s.runPlaybackPrewarm(stateContext, key, state)
+}
+
+func (s *Server) runPlaybackPrewarm(ctx context.Context, key string, state *playbackPrewarmState) {
+	operationContext, cancel := context.WithTimeout(ctx, 4*time.Minute)
+	defer cancel()
+	ctx = operationContext
+	if !state.target.priority {
+		select {
+		case s.prewarmSlots <- struct{}{}:
+			defer func() { <-s.prewarmSlots }()
+		case <-ctx.Done():
+			s.finishPlaybackPrewarm(key, state, CreatePlaybackResponse{}, ctx.Err())
+			return
+		}
+	}
+
+	response := CreatePlaybackResponse{}
+	if state.target.seed != nil && s.playbackExists(state.target.seed.ID) {
+		response = *state.target.seed
+	} else {
+		if err := s.prewarmJSON(ctx, http.MethodPost, "/v1/playbacks", state.target.request, &response, true); err != nil {
+			s.finishPlaybackPrewarm(key, state, CreatePlaybackResponse{}, err)
+			return
+		}
+	}
+	if !s.finishPlaybackPrewarm(key, state, response, nil) {
+		if response.ID != "" {
+			s.stopPreparedPlayback(response.ID)
+		}
+		return
+	}
+
+	s.prewarmMu.Lock()
+	claimed := state.claimed
+	s.prewarmMu.Unlock()
+	if claimed || ctx.Err() != nil {
+		return
+	}
+
+	var stream any
+	if err := s.prewarmJSON(
+		ctx,
+		http.MethodPost,
+		fmt.Sprintf("/v1/playbacks/%s/hls", response.ID),
+		map[string]float64{"start_seconds": state.target.request.StartSeconds},
+		&stream,
+		false,
+	); err != nil {
+		s.failReadyPlaybackPrewarm(key, state, err)
+		return
+	}
+
+	s.prewarmMu.Lock()
+	claimed = state.claimed
+	s.prewarmMu.Unlock()
+	if claimed || ctx.Err() != nil {
+		return
+	}
+	parkContext, parkCancel := context.WithCancel(ctx)
+	s.prewarmMu.Lock()
+	if state.claimed || s.prewarmStates[key] != state {
+		s.prewarmMu.Unlock()
+		parkCancel()
+		return
+	}
+	state.parkCancel = parkCancel
+	s.prewarmMu.Unlock()
+	var parked map[string]string
+	err := s.prewarmJSON(
+		parkContext,
+		http.MethodPost,
+		fmt.Sprintf("/v1/playbacks/%s/hls/park", response.ID),
+		map[string]int{"buffer_seconds": prewarmBufferSeconds},
+		&parked,
+		false,
+	)
+	parkCancel()
+	s.prewarmMu.Lock()
+	state.parkCancel = nil
+	claimed = state.claimed
+	if err == nil && s.prewarmStates[key] == state && !claimed {
+		state.bufferReady = true
+		state.bufferedAt = time.Now()
+	}
+	s.prewarmMu.Unlock()
+	if err != nil && !errors.Is(err, context.Canceled) {
+		s.failReadyPlaybackPrewarm(key, state, err)
+		return
+	}
+	if err == nil && state.target.source == "hint" {
+		time.AfterFunc(prewarmHintTTL, func() { s.expireHintPrewarm(key, state) })
+	}
+}
+
+func (s *Server) expireHintPrewarm(key string, state *playbackPrewarmState) {
+	s.prewarmMu.Lock()
+	if s.prewarmStates[key] != state || state.claimed || state.target.source != "hint" {
+		s.prewarmMu.Unlock()
+		return
+	}
+	delete(s.prewarmStates, key)
+	state.cancel()
+	playbackID := state.response.ID
+	s.prewarmMu.Unlock()
+	if playbackID != "" {
+		s.stopPreparedPlayback(playbackID)
+	}
+}
+
+func (s *Server) finishPlaybackPrewarm(
+	key string,
+	state *playbackPrewarmState,
+	response CreatePlaybackResponse,
+	err error,
+) bool {
+	s.prewarmMu.Lock()
+	if s.prewarmStates[key] != state {
+		state.cancel()
+		select {
+		case <-state.playbackReady:
+		default:
+			close(state.playbackReady)
+		}
+		s.prewarmMu.Unlock()
+		return false
+	}
+	state.response = response
+	state.err = err
+	select {
+	case <-state.playbackReady:
+	default:
+		close(state.playbackReady)
+	}
+	if err != nil {
+		delete(s.prewarmStates, key)
+		state.cancel()
+	}
+	s.prewarmMu.Unlock()
+	if err != nil && !errors.Is(err, context.Canceled) {
+		s.logger.Warn("prewarm playback", "media_id", state.target.request.MediaID, "error", err)
+	}
+	return err == nil
+}
+
+func (s *Server) failReadyPlaybackPrewarm(key string, state *playbackPrewarmState, err error) {
+	s.prewarmMu.Lock()
+	claimed := state.claimed
+	if s.prewarmStates[key] == state && !claimed {
+		delete(s.prewarmStates, key)
+		state.err = err
+		state.cancel()
+	}
+	s.prewarmMu.Unlock()
+	if claimed {
+		return
+	}
+	if state.response.ID != "" {
+		s.stopPreparedPlayback(state.response.ID)
+	}
+	if !errors.Is(err, context.Canceled) {
+		s.logger.Warn("prewarm playback buffer", "media_id", state.target.request.MediaID, "error", err)
+	}
+}
+
+func (s *Server) prewarmedPlaybackAvailable(state *playbackPrewarmState) bool {
+	if state.response.ID == "" || !s.playbackExists(state.response.ID) {
+		return false
+	}
+	s.hlsMu.RLock()
+	manager := s.hlsManager
+	s.hlsMu.RUnlock()
+	if manager == nil {
+		return false
+	}
+	languages := state.target.request.Preferences.Languages
+	return manager.Prepared(
+		state.response.ID,
+		state.target.request.StartSeconds,
+		languages,
+		prewarmBufferSeconds,
+	)
+}
+
+func (s *Server) prewarmJSON(
+	ctx context.Context,
+	method string,
+	path string,
+	input any,
+	output any,
+	internal bool,
+) error {
+	body, err := json.Marshal(input)
+	if err != nil {
+		return err
+	}
+	s.prewarmMu.Lock()
+	baseURL := s.prewarmBaseURL
+	client := s.prewarmClient
+	s.prewarmMu.Unlock()
+	request, err := http.NewRequestWithContext(ctx, method, baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	if internal {
+		request.Header.Set(prewarmRequestHeader, "1")
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	contents, err := io.ReadAll(io.LimitReader(response.Body, 2<<20))
+	if err != nil {
+		return err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		var payload struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(contents, &payload)
+		if payload.Error != "" {
+			return errors.New(payload.Error)
+		}
+		return fmt.Errorf("prewarm request returned %s", response.Status)
+	}
+	if output == nil || len(contents) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(contents, output); err != nil {
+		return fmt.Errorf("decode prewarm response: %w", err)
+	}
+	return nil
+}
+
+func (s *Server) syncHistoryPrewarming(ctx context.Context) {
+	if s.historyStore == nil {
+		return
+	}
+	entries, err := s.historyStore.List()
+	if err != nil {
+		s.logger.Warn("load history for playback prewarming", "error", err)
+		return
+	}
+	continueEntries := s.continueWatchHistory(ctx, entries)
+	targets := make(map[string]playbackPrewarmTarget)
+	for _, entry := range continueEntries {
+		target := s.prewarmTargetForHistory(entry)
+		if key := playbackPrewarmKey(target.request); key != "" {
+			targets[key] = target
+		}
+		if next, ok := s.nextEpisodeForPrewarming(ctx, entry); ok {
+			nextTarget := s.prewarmTargetForHistory(next)
+			if key := playbackPrewarmKey(nextTarget.request); key != "" {
+				targets[key] = nextTarget
+			}
+		}
+	}
+	for _, target := range targets {
+		s.queuePlaybackPrewarm(target)
+	}
+
+	var stalePlaybackIDs []string
+	s.prewarmMu.Lock()
+	for key, state := range s.prewarmStates {
+		_, wanted := targets[key]
+		if state.target.source != "history" || wanted {
+			continue
+		}
+		delete(s.prewarmStates, key)
+		state.cancel()
+		if state.response.ID != "" {
+			stalePlaybackIDs = append(stalePlaybackIDs, state.response.ID)
+		}
+	}
+	s.prewarmMu.Unlock()
+	for _, playbackID := range stalePlaybackIDs {
+		s.stopPreparedPlayback(playbackID)
+	}
+}
+
+func (s *Server) prewarmTargetForHistory(entry history.Entry) playbackPrewarmTarget {
+	query := entry.Title
+	if entry.SeriesTitle != "" {
+		query = entry.SeriesTitle
+	}
+	return playbackPrewarmTarget{
+		source: "history",
+		request: CreatePlaybackRequest{
+			MediaID: entry.MediaID, MediaType: entry.MediaType, Query: query, Year: entry.Year,
+			SeriesID: entry.SeriesID, SeriesTitle: entry.SeriesTitle,
+			SeasonNumber: entry.SeasonNumber, EpisodeNumber: entry.EpisodeNumber,
+			EpisodeTitle: entry.EpisodeTitle, StartSeconds: entry.ResumePosition(),
+			Preferences: catalog.Preferences{StreamingOptimized: true, PreferTextSubtitles: true},
+		},
+	}
+}
+
+func (s *Server) queueNextEpisodePrewarm(current history.Entry) {
+	s.prewarmMu.Lock()
+	ctx := s.prewarmContext
+	s.prewarmMu.Unlock()
+	if ctx == nil {
+		return
+	}
+	lookupContext, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if next, ok := s.nextEpisodeForPrewarming(lookupContext, current); ok {
+		s.queuePlaybackPrewarm(s.prewarmTargetForHistory(next))
+	}
+}
+
+func (s *Server) nextEpisodeForPrewarming(ctx context.Context, current history.Entry) (history.Entry, bool) {
+	if current.SeriesID == "" || current.SeasonNumber <= 0 || current.EpisodeNumber <= 0 {
+		return history.Entry{}, false
+	}
+	s.metadataMu.RLock()
+	provider, ok := s.metadataProvider.(metadata.ShowProvider)
+	s.metadataMu.RUnlock()
+	if !ok {
+		return history.Entry{}, false
+	}
+	show, err := provider.Show(ctx, current.SeriesID)
+	if err != nil {
+		return history.Entry{}, false
+	}
+	for _, summary := range show.Seasons {
+		if summary.Number < current.SeasonNumber {
+			continue
+		}
+		season, err := provider.Season(ctx, show.ID, summary.Number)
+		if err != nil {
+			continue
+		}
+		for _, episode := range season.Episodes {
+			if episode.SeasonNumber == current.SeasonNumber && episode.EpisodeNumber <= current.EpisodeNumber {
+				continue
+			}
+			return history.Entry{
+				MediaID: episode.ID, MediaType: string(metadata.MediaTypeShow),
+				Title: show.Title, Year: show.Year, SeriesID: show.ID, SeriesTitle: show.Title,
+				SeasonNumber: episode.SeasonNumber, EpisodeNumber: episode.EpisodeNumber,
+				EpisodeTitle: episode.Title,
+			}, true
+		}
+	}
+	return history.Entry{}, false
+}
+
+func (s *Server) queuePlaybackHandoff(playbackID string) bool {
+	s.mu.RLock()
+	request, hasRequest := s.playbackRequests[playbackID]
+	response, hasResponse := s.playbackResponses[playbackID]
+	s.mu.RUnlock()
+	if !hasRequest || !hasResponse || s.historyStore == nil {
+		return false
+	}
+	entries, err := s.historyStore.List()
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.MediaID != request.MediaID {
+			continue
+		}
+		request.StartSeconds = entry.ResumePosition()
+		target := playbackPrewarmTarget{
+			request: request, source: "history", priority: true, seed: &response,
+		}
+		s.queuePlaybackPrewarm(target)
+		return true
+	}
+	return false
+}
+
+func (s *Server) stopPreparedPlayback(playbackID string) {
+	s.hlsMu.RLock()
+	manager := s.hlsManager
+	s.hlsMu.RUnlock()
+	if manager != nil {
+		manager.Stop(playbackID)
+	}
+}
+
+func (s *Server) cancelPlaybackPrewarming() {
+	s.prewarmMu.Lock()
+	playbackIDs := make([]string, 0, len(s.prewarmStates))
+	for key, state := range s.prewarmStates {
+		delete(s.prewarmStates, key)
+		state.cancel()
+		if state.response.ID != "" {
+			playbackIDs = append(playbackIDs, state.response.ID)
+		}
+	}
+	s.prewarmMu.Unlock()
+	for _, playbackID := range playbackIDs {
+		s.stopPreparedPlayback(playbackID)
+	}
+}
+
+func playbackPrewarmKey(request CreatePlaybackRequest) string {
+	if mediaID := strings.TrimSpace(request.MediaID); mediaID != "" {
+		return mediaID
+	}
+	if title := strings.ToLower(strings.Join(strings.Fields(request.Query), " ")); title != "" {
+		return fmt.Sprintf("%s/%d/s%d/e%d", title, request.Year, request.SeasonNumber, request.EpisodeNumber)
+	}
+	return ""
+}
+
+func matchingPrewarmTarget(left, right CreatePlaybackRequest) bool {
+	return playbackPrewarmKey(left) == playbackPrewarmKey(right) &&
+		absFloat(left.StartSeconds-right.StartSeconds) <= 1 &&
+		equalStringLists(left.Preferences.Languages, right.Preferences.Languages)
+}
+
+func equalStringLists(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func absFloat(value float64) float64 {
+	if value < 0 {
+		return -value
+	}
+	return value
+}

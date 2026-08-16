@@ -181,7 +181,8 @@ struct IOSShowEpisodesView: View {
         do {
             let prepared = try await model.preparePlayback(
                 for: movie,
-                startSeconds: startSeconds
+                startSeconds: startSeconds,
+                onStage: { _ in }
             )
             activePlayback = IOSEpisodeBrowserPlaybackSession(movie: movie, prepared: prepared)
             errorMessage = nil

@@ -10,6 +10,7 @@ struct IOSShowDetailView: View {
     @State private var activePlayback: IOSEpisodePlaybackSession?
     @State private var isLoading = false
     @State private var isPreparing = false
+    @State private var preparationStage: PlaybackPreparationStage?
     @State private var isRemoving = false
     @State private var errorMessage: String?
 
@@ -83,7 +84,7 @@ struct IOSShowDetailView: View {
                 .foregroundStyle(Color.mobileTeaMuted)
 
             HStack(spacing: 10) {
-                MobileRatingBadges(ratings: ratings, tmdbRating: (details?.show ?? show).voteAverage)
+                MobileRatingBadges(ratings: ratings)
                 if let selection = playbackSelection {
                     Text(selection.episode.label)
                         .font(.subheadline.weight(.bold))
@@ -161,9 +162,15 @@ struct IOSShowDetailView: View {
     }
 
     private var primaryButtonTitle: String {
-        if isPreparing { return "Preparing Stream…" }
-        guard let playbackSelection else { return "Finding Your Episode…" }
-        return "\(playbackSelection.isResume ? "Resume" : "Play") \(playbackSelection.episode.label)"
+        switch preparationStage {
+        case .findingRelease:
+            return "Finding a Release…"
+        case .bufferingVideo:
+            return "Buffering Video…"
+        case nil:
+            guard let playbackSelection else { return "Finding Your Episode…" }
+            return "\(playbackSelection.isResume ? "Resume" : "Play") \(playbackSelection.episode.label)"
+        }
     }
 
     private func actionLabel(
@@ -196,6 +203,12 @@ struct IOSShowDetailView: View {
                 for: loadedDetails,
                 history: model.watchHistory
             )
+            if let playbackSelection {
+                await model.prewarmPlayback(
+                    for: playbackSelection.episode.playbackMovie(in: loadedDetails.show),
+                    startSeconds: playbackSelection.startSeconds
+                )
+            }
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
@@ -217,12 +230,16 @@ struct IOSShowDetailView: View {
     private func preparePlayback(startSeconds: Double) async {
         guard let details, let playbackSelection else { return }
         isPreparing = true
-        defer { isPreparing = false }
+        defer {
+            isPreparing = false
+            preparationStage = nil
+        }
         let movie = playbackSelection.episode.playbackMovie(in: details.show)
         do {
             let prepared = try await model.preparePlayback(
                 for: movie,
-                startSeconds: startSeconds
+                startSeconds: startSeconds,
+                onStage: { preparationStage = $0 }
             )
             activePlayback = IOSEpisodePlaybackSession(movie: movie, prepared: prepared)
             errorMessage = nil

@@ -25,7 +25,7 @@ struct ShowEpisodesView: View {
 
             HStack(alignment: .top, spacing: 42) {
                 seasonSidebar
-                    .frame(width: 400)
+                    .frame(width: 430)
 
                 episodeList
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -70,7 +70,10 @@ struct ShowEpisodesView: View {
                         seasonButton(season)
                     }
                 }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
             }
+            .scrollClipDisabled()
         }
     }
 
@@ -113,8 +116,8 @@ struct ShowEpisodesView: View {
             .overlay {
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
                     .stroke(
-                        isFocused ? Color.teaAccentLight.opacity(0.78) : Color.teaCream.opacity(isSelected ? 0.12 : 0.04),
-                        lineWidth: isFocused ? 2 : 1
+                        isFocused ? Color.teaAccentLight.opacity(0.78) : Color.clear,
+                        lineWidth: 2
                     )
             }
             .shadow(
@@ -281,7 +284,8 @@ struct ShowEpisodesView: View {
         do {
             let prepared = try await model.preparePlayback(
                 for: movie,
-                startSeconds: startSeconds
+                startSeconds: startSeconds,
+                onStage: { _ in }
             )
             activePlayback = TVEpisodeBrowserPlaybackSession(movie: movie, prepared: prepared)
             errorMessage = nil

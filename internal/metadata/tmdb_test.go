@@ -105,6 +105,9 @@ func TestTMDBDiscoveryReturnsMixedMoviesAndShows(t *testing.T) {
 			if query.Get("sort_by") == "popularity.desc" {
 				_, _ = w.Write([]byte(`{"results":[{"id":1,"title":"Popular Movie","release_date":"2026-07-01","popularity":80},{"id":2,"title":"Adult Movie","adult":true}]}`))
 			} else {
+				if query.Get("vote_count.gte") != "5000" {
+					t.Errorf("top-rated movie query = %v", query)
+				}
 				_, _ = w.Write([]byte(`{"results":[{"id":3,"title":"Top Rated Movie","release_date":"1972-03-14","vote_average":8.7,"vote_count":10000}]}`))
 			}
 		case "/discover/tv":
@@ -114,6 +117,9 @@ func TestTMDBDiscoveryReturnsMixedMoviesAndShows(t *testing.T) {
 			if r.URL.Query().Get("sort_by") == "popularity.desc" {
 				_, _ = w.Write([]byte(`{"results":[{"id":10,"name":"Popular Show","first_air_date":"2020-01-01","popularity":100}]}`))
 			} else {
+				if r.URL.Query().Get("vote_count.gte") != "2000" {
+					t.Errorf("top-rated TV query = %v", r.URL.Query())
+				}
 				_, _ = w.Write([]byte(`{"results":[{"id":11,"name":"Top Rated Show","first_air_date":"2019-01-01","vote_average":9.1,"vote_count":2000}]}`))
 			}
 		case "/tv/10":

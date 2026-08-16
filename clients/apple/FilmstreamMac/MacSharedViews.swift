@@ -157,14 +157,9 @@ struct MacDetailButtonStyle: ButtonStyle {
 
 struct MacMovieRatingBadges: View {
     let ratings: MovieRatings?
-    let tmdbRating: Double?
 
     var body: some View {
         HStack(spacing: 8) {
-            if let tmdbRating, tmdbRating > 0 {
-                badge(mark: "TMDB", value: String(format: "%.1f", tmdbRating), color: .macTeaAccentLight)
-                    .accessibilityLabel("TMDB \(String(format: "%.1f", tmdbRating))")
-            }
             if let imdb = ratings?.imdb {
                 badge(mark: "IMDb", value: String(format: "%.1f", imdb), color: .macTeaHoney)
                     .accessibilityLabel("IMDb \(String(format: "%.1f", imdb))")
