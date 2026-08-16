@@ -3,30 +3,37 @@ import SwiftUI
 
 struct HomeView: View {
     @Environment(AppModel.self) private var model
+    @State private var activeShelfID: String?
+
+    private let homeTopID = "home-top"
+    private let continueShelfID = "continue-watching"
 
     var body: some View {
         NavigationStack {
             ZStack {
                 TeaBackground()
 
-                ScrollView(.vertical, showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: 30) {
-                        header
-                        continueWatchingSection
-                        ForEach(model.discoverySections) { section in
-                            discoverySection(section)
+                ScrollViewReader { scrollProxy in
+                    ScrollView(.vertical, showsIndicators: false) {
+                        VStack(alignment: .leading, spacing: 30) {
+                            header
+                                .id(homeTopID)
+                            continueWatchingSection(scrollProxy: scrollProxy)
+                            ForEach(model.discoverySections) { section in
+                                discoverySection(section, scrollProxy: scrollProxy)
+                            }
+                            if let errorMessage = model.errorMessage {
+                                Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(Color.teaAmber)
+                                    .font(.headline)
+                            }
                         }
-                        if let errorMessage = model.errorMessage {
-                            Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
-                                .foregroundStyle(Color.teaAmber)
-                                .font(.headline)
-                        }
+                        .padding(.horizontal, 72)
+                        .padding(.top, 54)
+                        .padding(.bottom, 110)
                     }
-                    .padding(.horizontal, 72)
-                    .padding(.top, 54)
-                    .padding(.bottom, 110)
+                    .ignoresSafeArea(.container, edges: .horizontal)
                 }
-                .ignoresSafeArea(.container, edges: .horizontal)
             }
             .navigationDestination(for: Movie.self) { movie in
                 MovieDetailView(movie: movie)
@@ -55,7 +62,7 @@ struct HomeView: View {
     }
 
     @ViewBuilder
-    private var continueWatchingSection: some View {
+    private func continueWatchingSection(scrollProxy: ScrollViewProxy) -> some View {
         if model.isLoading && model.continueWatching.isEmpty {
             VStack(alignment: .leading, spacing: 16) {
                 shelfTitle("Continue Watching")
@@ -86,13 +93,24 @@ struct HomeView: View {
                     )
                 },
                 requestsInitialFocus: true,
-                onFocus: loadRatings
+                onFocus: loadRatings,
+                onShelfFocusChange: {
+                    updateShelfFocus(
+                        continueShelfID,
+                        isFocused: $0,
+                        scrollProxy: scrollProxy
+                    )
+                }
             )
+            .id(continueShelfID)
         }
     }
 
     @ViewBuilder
-    private func discoverySection(_ section: DiscoverySection) -> some View {
+    private func discoverySection(
+        _ section: DiscoverySection,
+        scrollProxy: ScrollViewProxy
+    ) -> some View {
         if !section.items.isEmpty {
             NetflixMovieShelf(
                 title: section.title,
@@ -102,8 +120,49 @@ struct HomeView: View {
                         contentRating: model.ratings(for: $0)?.contentRating
                     )
                 },
-                onFocus: loadRatings
+                onFocus: loadRatings,
+                onShelfFocusChange: {
+                    updateShelfFocus(
+                        section.id,
+                        isFocused: $0,
+                        scrollProxy: scrollProxy
+                    )
+                }
             )
+            .id(section.id)
+        }
+    }
+
+    private func updateShelfFocus(
+        _ shelfID: String,
+        isFocused: Bool,
+        scrollProxy: ScrollViewProxy
+    ) {
+        guard isFocused else {
+            if activeShelfID == shelfID {
+                activeShelfID = nil
+            }
+            return
+        }
+
+        activeShelfID = shelfID
+        Task { @MainActor in
+            await Task.yield()
+            alignShelf(shelfID, scrollProxy: scrollProxy)
+            // Re-align after the previous shelf finishes collapsing.
+            try? await Task.sleep(for: .milliseconds(360))
+            guard activeShelfID == shelfID else { return }
+            alignShelf(shelfID, scrollProxy: scrollProxy)
+        }
+    }
+
+    private func alignShelf(_ shelfID: String, scrollProxy: ScrollViewProxy) {
+        let targetID = shelfID == continueShelfID ? homeTopID : shelfID
+        let anchor = shelfID == continueShelfID
+            ? UnitPoint.top
+            : UnitPoint(x: 0.5, y: 0.07)
+        withAnimation(.easeInOut(duration: 0.3)) {
+            scrollProxy.scrollTo(targetID, anchor: anchor)
         }
     }
 

@@ -136,7 +136,8 @@ struct MovieDetailView: View {
                 actionLabel(
                     title: primaryButtonTitle,
                     systemImage: "play.fill",
-                    showsProgress: isPreparing
+                    showsProgress: isPreparing,
+                    progressTint: Color.teaBackground
                 )
             }
             .buttonStyle(TeaDetailActionButtonStyle(kind: .prominent))
@@ -183,12 +184,13 @@ struct MovieDetailView: View {
     private func actionLabel(
         title: String,
         systemImage: String,
-        showsProgress: Bool = false
+        showsProgress: Bool = false,
+        progressTint: Color = .teaCream
     ) -> some View {
         HStack(spacing: 14) {
             if showsProgress {
                 ProgressView()
-                    .tint(Color.teaCream)
+                    .tint(progressTint)
             } else {
                 Image(systemName: systemImage)
                     .frame(width: 26)
