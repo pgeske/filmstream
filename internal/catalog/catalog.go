@@ -29,8 +29,9 @@ type Preferences struct {
 }
 
 const (
-	ProtocolTorrent = "torrent"
-	ProtocolUsenet  = "usenet"
+	ProtocolTorrent        = "torrent"
+	ProtocolUsenet         = "usenet"
+	minimumTitleSimilarity = 0.7
 )
 
 type Candidate struct {
@@ -146,7 +147,7 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 		}
 
 		match := titleSimilarity(request.Query, candidate.Name)
-		if match < 0.25 {
+		if match < minimumTitleSimilarity {
 			continue
 		}
 		score := match * 500

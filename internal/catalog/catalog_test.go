@@ -224,6 +224,24 @@ func TestRankRejectsDifferentSeriesSharingOnlyStopWords(t *testing.T) {
 	}
 }
 
+func TestRankRejectsDifferentTitlesThatContainRequestedTitle(t *testing.T) {
+	tests := []struct {
+		query     string
+		candidate string
+	}{
+		{"Chernobyl", "Chernobyl.Inside.the.Meltdown.S01E01.1080p.WEB.H264"},
+		{"Paddington", "The.Adventures.of.Paddington.S01E01.1080p.WEB.H264"},
+	}
+	for _, test := range tests {
+		ranked := Rank(SearchRequest{
+			Query: test.query, MediaType: "show", SeasonNumber: 1, EpisodeNumber: 1,
+		}, []Candidate{{Name: test.candidate}})
+		if len(ranked) != 0 {
+			t.Fatalf("query %q ranked unrelated candidate %q", test.query, test.candidate)
+		}
+	}
+}
+
 func TestTitleSimilarityMatchesPossessiveReleaseNames(t *testing.T) {
 	if got := titleSimilarity("Harry Potter and the Philosopher's Stone", "Harry.Potter.and.the.Philosophers.Stone.2001.1080p.x265"); got != 1 {
 		t.Fatalf("title similarity = %v, want 1", got)
