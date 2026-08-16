@@ -431,89 +431,95 @@ private struct NetflixShelfCard: View {
 
     var body: some View {
         NavigationLink(value: item.movie) {
-            VStack(alignment: .leading, spacing: 12) {
-                artwork
-                    .frame(width: cardWidth, height: NetflixShelfLayout.artworkHeight)
-                    .clipped()
-                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .stroke(
-                                isExpanded ? Color.teaAccentLight.opacity(0.9) : Color.teaCream.opacity(0.1),
-                                lineWidth: isExpanded ? 3 : 1
-                            )
-                    }
-                    .overlay(alignment: .bottom) {
-                        if let progress = item.progress, progress > 0 {
-                            ProgressView(value: progress)
-                                .tint(Color.teaAccent)
-                                .padding(.horizontal, 12)
-                                .padding(.bottom, 10)
-                        }
-                    }
-                    .shadow(
-                        color: isExpanded ? Color.teaAccent.opacity(0.24) : .black.opacity(0.36),
-                        radius: isExpanded ? 26 : 12,
-                        y: isExpanded ? 13 : 7
-                    )
-
-                if isExpanded {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(item.movie.title)
-                            .font(.system(size: 28, weight: .bold, design: .rounded))
-                            .foregroundStyle(Color.teaCream)
-                            .lineLimit(2)
-
-                        Text(item.movie.catalogMetadata)
-                            .font(.system(size: 23, weight: .semibold))
-                            .foregroundStyle(Color.teaMuted)
-                            .lineLimit(2)
-
-                        HStack(spacing: 7) {
-                            if let episodeLabel = item.movie.episodeLabel {
-                                Text(episodeLabel)
-                                    .foregroundStyle(Color.teaAccentLight)
-                            }
-                            if let contentRating = item.contentRating {
-                                Text(contentRating)
-                            }
-                            if let progress = item.progress, progress > 0 {
-                                Text("\(Int(progress * 100))% watched")
-                                    .foregroundStyle(Color.teaAccentLight)
-                            }
-                        }
-                        .font(.system(size: 20, weight: .semibold))
-                        .foregroundStyle(Color.teaMuted)
-
-                        if let overview = item.movie.overview, !overview.isEmpty {
-                            Text(overview)
-                                .font(.system(size: 22, weight: .regular))
-                                .foregroundStyle(Color.teaCream.opacity(0.78))
-                                .lineSpacing(2)
-                                .lineLimit(2)
-                                .frame(maxWidth: cardWidth, alignment: .leading)
-                        }
-                    }
-                    .transition(.opacity)
+            Color.clear
+                .frame(
+                    width: NetflixShelfLayout.collapsedWidth,
+                    height: NetflixShelfLayout.cardHeight
+                )
+                .overlay(alignment: .topLeading) {
+                    cardContent
                 }
-            }
-            .frame(
-                width: cardWidth,
-                height: NetflixShelfLayout.cardHeight,
-                alignment: .topLeading
-            )
-            .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         }
         .buttonStyle(MovieCardButtonStyle())
-        .frame(
-            width: NetflixShelfLayout.collapsedWidth,
-            height: NetflixShelfLayout.cardHeight,
-            alignment: .topLeading
-        )
         .focusEffectDisabled()
         .focused(focusBinding, equals: focusValue)
         .zIndex(isExpanded ? 1 : 0)
         .animation(.easeInOut(duration: 0.24), value: isExpanded)
+    }
+
+    private var cardContent: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            artwork
+                .frame(width: cardWidth, height: NetflixShelfLayout.artworkHeight)
+                .clipped()
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(
+                            isExpanded ? Color.teaAccentLight.opacity(0.9) : Color.teaCream.opacity(0.1),
+                            lineWidth: isExpanded ? 3 : 1
+                        )
+                }
+                .overlay(alignment: .bottom) {
+                    if let progress = item.progress, progress > 0 {
+                        ProgressView(value: progress)
+                            .tint(Color.teaAccent)
+                            .padding(.horizontal, 12)
+                            .padding(.bottom, 10)
+                    }
+                }
+                .shadow(
+                    color: isExpanded ? Color.teaAccent.opacity(0.24) : .black.opacity(0.36),
+                    radius: isExpanded ? 26 : 12,
+                    y: isExpanded ? 13 : 7
+                )
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(item.movie.title)
+                        .font(.system(size: 28, weight: .bold, design: .rounded))
+                        .foregroundStyle(Color.teaCream)
+                        .lineLimit(2)
+
+                    Text(item.movie.catalogMetadata)
+                        .font(.system(size: 23, weight: .semibold))
+                        .foregroundStyle(Color.teaMuted)
+                        .lineLimit(2)
+
+                    HStack(spacing: 7) {
+                        if let episodeLabel = item.movie.episodeLabel {
+                            Text(episodeLabel)
+                                .foregroundStyle(Color.teaAccentLight)
+                        }
+                        if let contentRating = item.contentRating {
+                            Text(contentRating)
+                        }
+                        if let progress = item.progress, progress > 0 {
+                            Text("\(Int(progress * 100))% watched")
+                                .foregroundStyle(Color.teaAccentLight)
+                        }
+                    }
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(Color.teaMuted)
+
+                    if let overview = item.movie.overview, !overview.isEmpty {
+                        Text(overview)
+                            .font(.system(size: 22, weight: .regular))
+                            .foregroundStyle(Color.teaCream.opacity(0.78))
+                            .lineSpacing(2)
+                            .lineLimit(2)
+                            .frame(maxWidth: cardWidth, alignment: .leading)
+                    }
+                }
+                .transition(.opacity)
+            }
+        }
+        .frame(
+            width: cardWidth,
+            height: NetflixShelfLayout.cardHeight,
+            alignment: .topLeading
+        )
     }
 
     private var artwork: some View {
