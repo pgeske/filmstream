@@ -229,6 +229,34 @@ func TestMatchingWebDAVVideosSelectsRequestedEpisode(t *testing.T) {
 	}
 }
 
+func TestFindLargestVideoRejectsWrongSingleEpisode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusMultiStatus)
+		fmt.Fprint(w, `<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">
+			<d:response><d:href>/content/movies/Show</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+			<d:response><d:href>/content/movies/Show/Show.S01E01.mkv</d:href><d:propstat><d:prop><d:resourcetype/><d:getcontentlength>1024</d:getcontentlength></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+		</d:multistatus>`)
+	}))
+	defer server.Close()
+	engine, err := New(Config{
+		BaseURL: server.URL, APIKey: "key", WebDAVUser: "user", WebDAVPassword: "pass",
+		IdleGrace: time.Hour, CleanupInterval: time.Hour,
+		ControlClient: server.Client(), StreamClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close()
+
+	_, err = engine.findLargestVideo(
+		t.Context(), mountInfo{category: "movies", folder: "Show"}, "S09E03",
+	)
+	if err == nil || !strings.Contains(err.Error(), "no video matching S09E03") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestCreateReportsFailedPreparation(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {

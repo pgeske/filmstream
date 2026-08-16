@@ -718,7 +718,7 @@ func (e *Engine) findLargestVideo(ctx context.Context, mount mountInfo, fileHint
 	if len(videos) == 0 {
 		return videoInfo{}, errNoSupportedVideo
 	}
-	if strings.TrimSpace(fileHint) != "" && len(videos) > 1 {
+	if strings.TrimSpace(fileHint) != "" {
 		matching := matchingWebDAVVideos(videos, fileHint)
 		if len(matching) == 0 {
 			return videoInfo{}, fmt.Errorf("Usenet release contains no video matching %s", fileHint)
