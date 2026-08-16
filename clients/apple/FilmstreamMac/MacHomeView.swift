@@ -6,44 +6,59 @@ struct MacHomeView: View {
     @State private var selection: Destination? = .home
 
     var body: some View {
-        NavigationSplitView {
-            VStack(spacing: 0) {
-                MacBrandHeader(compact: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 18)
+        ZStack {
+            NavigationSplitView {
+                VStack(spacing: 0) {
+                    MacBrandHeader(compact: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 18)
 
-                List(selection: $selection) {
-                    Label("Home", systemImage: "house.fill")
-                        .tag(Destination.home)
-                    Label("Search", systemImage: "magnifyingglass")
-                        .tag(Destination.search)
-                }
-                .listStyle(.sidebar)
-            }
-            .background(Color.macTeaBackground.opacity(0.94))
-            .navigationSplitViewColumnWidth(min: 190, ideal: 220, max: 260)
-        } detail: {
-            switch selection ?? .home {
-            case .home:
-                NavigationStack {
-                    MacLibraryView {
-                        selection = .search
+                    List(selection: $selection) {
+                        Label("Home", systemImage: "house.fill")
+                            .tag(Destination.home)
+                        Label("Search", systemImage: "magnifyingglass")
+                            .tag(Destination.search)
                     }
-                    .navigationDestination(for: Movie.self) { movie in
-                        MacMovieDetailView(movie: movie)
-                    }
+                    .listStyle(.sidebar)
                 }
-            case .search:
-                NavigationStack {
-                    MacSearchView()
+                .background(Color.macTeaBackground.opacity(0.94))
+                .navigationSplitViewColumnWidth(min: 190, ideal: 220, max: 260)
+            } detail: {
+                switch selection ?? .home {
+                case .home:
+                    NavigationStack {
+                        MacLibraryView {
+                            selection = .search
+                        }
                         .navigationDestination(for: Movie.self) { movie in
                             MacMovieDetailView(movie: movie)
                         }
+                    }
+                case .search:
+                    NavigationStack {
+                        MacSearchView()
+                            .navigationDestination(for: Movie.self) { movie in
+                                MacMovieDetailView(movie: movie)
+                            }
+                    }
                 }
             }
+            .navigationSplitViewStyle(.balanced)
+
+            if let session = model.activePlayback {
+                MacPlayerView(
+                    movie: session.movie,
+                    prepared: session.prepared,
+                    api: model.api,
+                    onClose: model.dismissPlayback
+                )
+                .id(session.id)
+                .transition(.opacity)
+                .zIndex(1)
+            }
         }
-        .navigationSplitViewStyle(.balanced)
+        .toolbarVisibility(model.activePlayback == nil ? .automatic : .hidden, for: .windowToolbar)
         .task {
             await model.loadHome()
         }

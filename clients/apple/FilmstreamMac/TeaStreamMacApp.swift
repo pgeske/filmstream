@@ -24,6 +24,7 @@ final class MacAppModel {
     let api: FilmstreamAPI
     var continueWatching: [WatchHistoryEntry] = []
     var discoverySections: [DiscoverySection] = []
+    var activePlayback: MacPlaybackSession?
     private(set) var ratingsByMovieID: [String: MovieRatings] = [:]
     private var requestedRatingIDs: Set<String> = []
     var isLoading = false
@@ -69,6 +70,15 @@ final class MacAppModel {
         }
     }
 
+    func presentPlayback(movie: Movie, prepared: PreparedPlayback) {
+        activePlayback = MacPlaybackSession(movie: movie, prepared: prepared)
+    }
+
+    func dismissPlayback() {
+        activePlayback = nil
+        Task { await loadContinueWatching() }
+    }
+
     func ratings(for movie: Movie) -> MovieRatings? {
         ratingsByMovieID[movie.id]
     }
@@ -94,6 +104,13 @@ final class MacAppModel {
             return $0.title.caseInsensitiveCompare(movie.title) == .orderedSame && $0.year == movie.year
         }
     }
+}
+
+struct MacPlaybackSession: Identifiable {
+    let movie: Movie
+    let prepared: PreparedPlayback
+
+    var id: String { prepared.playback.id }
 }
 
 enum MacAppConfiguration {

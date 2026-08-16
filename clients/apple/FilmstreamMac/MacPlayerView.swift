@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import AVKit
 import Combine
@@ -6,20 +7,26 @@ import Foundation
 import SwiftUI
 
 struct MacPlayerView: View {
-    @Environment(\.dismiss) private var dismiss
-
     let movie: Movie
     let prepared: PreparedPlayback
     let api: FilmstreamAPI
+    let onClose: () -> Void
 
     @StateObject private var controller: MacPlaybackController
     @State private var didClose = false
     @State private var scrubPosition: Double?
+    @State private var isFullScreen = false
 
-    init(movie: Movie, prepared: PreparedPlayback, api: FilmstreamAPI) {
+    init(
+        movie: Movie,
+        prepared: PreparedPlayback,
+        api: FilmstreamAPI,
+        onClose: @escaping () -> Void
+    ) {
         self.movie = movie
         self.prepared = prepared
         self.api = api
+        self.onClose = onClose
         _controller = StateObject(
             wrappedValue: MacPlaybackController(prepared: prepared, api: api)
         )
@@ -29,7 +36,7 @@ struct MacPlayerView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            MacAVPlayerView(player: controller.player)
+            MacAVPlayerView(player: controller.player, onDoubleClick: toggleFullScreen)
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
@@ -78,14 +85,24 @@ struct MacPlayerView: View {
             }
         }
         .onAppear {
+            syncFullScreenState()
             controller.play()
         }
         .onDisappear {
             closePlayback()
         }
         .onExitCommand {
-            closePlayback()
-            dismiss()
+            if isFullScreen {
+                toggleFullScreen()
+            } else {
+                requestClose()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { _ in
+            isFullScreen = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in
+            isFullScreen = false
         }
         .task {
             while !Task.isCancelled {
@@ -140,10 +157,17 @@ struct MacPlayerView: View {
                 .fixedSize()
             }
 
-            Button {
-                closePlayback()
-                dismiss()
-            } label: {
+            Button(action: toggleFullScreen) {
+                Label(
+                    isFullScreen ? "Exit Full Screen" : "Full Screen",
+                    systemImage: "arrow.up.left.and.arrow.down.right"
+                )
+            }
+            .buttonStyle(.borderless)
+            .keyboardShortcut("f", modifiers: [.control, .command])
+            .help("Full Screen (double-click the video)")
+
+            Button(action: requestClose) {
                 Label("Close", systemImage: "xmark.circle.fill")
             }
             .buttonStyle(.borderless)
@@ -250,6 +274,26 @@ struct MacPlayerView: View {
         }
     }
 
+    private func requestClose() {
+        if isFullScreen {
+            toggleFullScreen()
+        }
+        closePlayback()
+        onClose()
+    }
+
+    private func toggleFullScreen() {
+        guard let window = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow else {
+            return
+        }
+        window.toggleFullScreen(nil)
+    }
+
+    private func syncFullScreenState() {
+        let window = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow
+        isFullScreen = window?.styleMask.contains(.fullScreen) == true
+    }
+
     private func closePlayback() {
         guard !didClose else { return }
         didClose = true
@@ -298,23 +342,39 @@ struct MacPlayerView: View {
 // TeaStream supplies movie controls because growing HLS playlists otherwise appear live to AVKit.
 private struct MacAVPlayerView: NSViewRepresentable {
     let player: AVPlayer
+    let onDoubleClick: () -> Void
 
-    func makeNSView(context: Context) -> AVPlayerView {
-        let playerView = AVPlayerView()
+    func makeNSView(context: Context) -> MacDoubleClickPlayerView {
+        let playerView = MacDoubleClickPlayerView()
         playerView.player = player
         playerView.controlsStyle = .none
         playerView.videoGravity = .resizeAspect
+        playerView.onDoubleClick = onDoubleClick
         return playerView
     }
 
-    func updateNSView(_ playerView: AVPlayerView, context: Context) {
+    func updateNSView(_ playerView: MacDoubleClickPlayerView, context: Context) {
         if playerView.player !== player {
             playerView.player = player
         }
+        playerView.onDoubleClick = onDoubleClick
     }
 
-    static func dismantleNSView(_ playerView: AVPlayerView, coordinator: Void) {
+    static func dismantleNSView(_ playerView: MacDoubleClickPlayerView, coordinator: Void) {
         playerView.player = nil
+        playerView.onDoubleClick = nil
+    }
+}
+
+private final class MacDoubleClickPlayerView: AVPlayerView {
+    var onDoubleClick: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2 {
+            onDoubleClick?()
+            return
+        }
+        super.mouseDown(with: event)
     }
 }
 

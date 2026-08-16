@@ -5,7 +5,6 @@ struct MacMovieDetailView: View {
     @Environment(MacAppModel.self) private var model
     let movie: Movie
 
-    @State private var preparedPlayback: PreparedPlayback?
     @State private var isPreparing = false
     @State private var isRemoving = false
     @State private var errorMessage: String?
@@ -90,15 +89,6 @@ struct MacMovieDetailView: View {
         .navigationTitle(movie.title)
         .task(id: movie.id) {
             await model.loadRatings(for: movie)
-        }
-        .sheet(
-            item: $preparedPlayback,
-            onDismiss: {
-                Task { await model.loadContinueWatching() }
-            }
-        ) { prepared in
-            MacPlayerView(movie: movie, prepared: prepared, api: model.api)
-                .frame(minWidth: 900, minHeight: 580)
         }
     }
 
@@ -193,10 +183,11 @@ struct MacMovieDetailView: View {
         defer { isPreparing = false }
         do {
             let playback = try await model.api.createPlayback(for: movie)
-            preparedPlayback = try await model.api.prepareNativePlayback(
+            let prepared = try await model.api.prepareNativePlayback(
                 playback,
                 startSeconds: startSeconds
             )
+            model.presentPlayback(movie: movie, prepared: prepared)
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
