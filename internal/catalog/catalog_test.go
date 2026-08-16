@@ -215,6 +215,15 @@ func TestRankSelectsExactEpisodeAndAllowsSeasonPackFallback(t *testing.T) {
 	}
 }
 
+func TestRankRejectsDifferentSeriesSharingOnlyStopWords(t *testing.T) {
+	ranked := Rank(SearchRequest{
+		Query: "House of the Dragon", MediaType: "show", SeasonNumber: 1, EpisodeNumber: 1,
+	}, []Candidate{{Name: "Game.of.Thrones.S01E01.1080p.HEVC.x265"}})
+	if len(ranked) != 0 {
+		t.Fatalf("ranked = %+v, want unrelated series rejected", ranked)
+	}
+}
+
 func TestTitleSimilarityMatchesPossessiveReleaseNames(t *testing.T) {
 	if got := titleSimilarity("Harry Potter and the Philosopher's Stone", "Harry.Potter.and.the.Philosophers.Stone.2001.1080p.x265"); got != 1 {
 		t.Fatalf("title similarity = %v, want 1", got)

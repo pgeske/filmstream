@@ -42,6 +42,7 @@ type fakeUsenetPlaybackEngine struct {
 	createdSource usenetstream.Source
 	created       []usenetstream.Source
 	createErr     error
+	createFunc    func(usenetstream.Source) (*usenetstream.Session, error)
 	session       *usenetstream.Session
 	nzb           []byte
 	cleanup       func(string, string)
@@ -54,6 +55,9 @@ func (f *fakeUsenetPlaybackEngine) SetCleanupHandler(handler func(string, string
 func (f *fakeUsenetPlaybackEngine) Create(_ context.Context, source usenetstream.Source) (*usenetstream.Session, error) {
 	f.createdSource = source
 	f.created = append(f.created, source)
+	if f.createFunc != nil {
+		return f.createFunc(source)
+	}
 	if f.createErr != nil {
 		return nil, f.createErr
 	}
@@ -403,6 +407,54 @@ func TestCreatePlaybackReusesCachedUsenetReleaseWithoutSearching(t *testing.T) {
 	}
 	if fakeUsenet.createdSource.NZBPath == "" || fakeUsenet.createdSource.NZBURL != "" {
 		t.Fatalf("cached source = %+v", fakeUsenet.createdSource)
+	}
+}
+
+func TestRankedUsenetPlaybackTriesPastTenIncompletePosts(t *testing.T) {
+	registry, err := indexer.NewRegistry([]config.Indexer{{
+		Name: "usenet", Type: "torznab", Endpoint: "https://indexer.example/api",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempts := 0
+	fakeUsenet := &fakeUsenetPlaybackEngine{
+		createFunc: func(source usenetstream.Source) (*usenetstream.Session, error) {
+			attempts++
+			if attempts <= 10 {
+				return nil, errors.New("articles unavailable")
+			}
+			return &usenetstream.Session{
+				ID: "healthy-release", Name: source.Name, FileName: "episode.mkv",
+			}, nil
+		},
+	}
+	server := &Server{
+		indexers:       registry,
+		usenetEngine:   fakeUsenet,
+		usenetFailures: make(map[string]time.Time),
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	var ranked []catalog.RankedCandidate
+	for i := 1; i <= 11; i++ {
+		ranked = append(ranked, catalog.RankedCandidate{Candidate: catalog.Candidate{
+			ID: fmt.Sprintf("release-%d", i), Indexer: "usenet",
+			Name: fmt.Sprintf("Show.S01E01.Release.%d", i), Protocol: catalog.ProtocolUsenet,
+			NZBURL: fmt.Sprintf("https://indexer.example/download/%d", i),
+		}})
+	}
+
+	session, selected, err := server.createRankedUsenetPlayback(
+		t.Context(), ranked, catalog.Preferences{}, "S01E01",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session == nil || selected == nil || selected.Candidate.ID != "release-11" {
+		t.Fatalf("session = %+v, selected = %+v", session, selected)
+	}
+	if attempts != 11 {
+		t.Fatalf("attempts = %d, want 11", attempts)
 	}
 }
 

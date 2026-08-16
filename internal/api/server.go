@@ -44,8 +44,8 @@ type CreatePlaybackRequest struct {
 }
 
 const (
-	maxUsenetCandidates    = 10
-	maxUsenetPreparation   = 30 * time.Second
+	maxUsenetCandidates    = 30
+	maxUsenetPreparation   = 90 * time.Second
 	usenetFailureTTL       = 30 * time.Minute
 	maxLiveSwarmCandidates = 3
 	minimumLivePeers       = 3

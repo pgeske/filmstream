@@ -76,6 +76,10 @@ var (
 		"webdl": true, "webrip": true, "x264": true, "x265": true,
 		"h264": true, "h265": true, "avc": true, "hevc": true,
 	}
+	titleStopWords = map[string]bool{
+		"a": true, "an": true, "and": true, "for": true, "in": true,
+		"of": true, "on": true, "the": true, "to": true,
+	}
 )
 
 func Enrich(candidate Candidate) Candidate {
@@ -271,8 +275,8 @@ func titleSimilarity(query, candidate string) float64 {
 		return 1
 	}
 
-	queryWords := wordSet(queryNormalized)
-	candidateWords := wordSet(candidateTitle)
+	queryWords := meaningfulTitleWords(queryNormalized)
+	candidateWords := meaningfulTitleWords(candidateTitle)
 	intersection := 0
 	for word := range queryWords {
 		if _, ok := candidateWords[word]; ok {
@@ -310,6 +314,20 @@ func wordSet(value string) map[string]struct{} {
 		result[word] = struct{}{}
 	}
 	return result
+}
+
+func meaningfulTitleWords(value string) map[string]struct{} {
+	all := wordSet(value)
+	meaningful := make(map[string]struct{}, len(all))
+	for word := range all {
+		if !titleStopWords[word] {
+			meaningful[word] = struct{}{}
+		}
+	}
+	if len(meaningful) == 0 {
+		return all
+	}
+	return meaningful
 }
 
 func inferReleaseYear(query, candidate string) int {
