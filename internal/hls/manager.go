@@ -177,7 +177,7 @@ func (m *Manager) ProbeSubtitles(ctx context.Context, playbackID string) ([]Subt
 	return supportedSubtitles(probe), nil
 }
 
-func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds float64) (Stream, error) {
+func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds float64, preferredLanguages []string) (Stream, error) {
 	if !validPlaybackID(playbackID) {
 		return Stream{}, errors.New("invalid playback ID")
 	}
@@ -194,6 +194,12 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 	codec, duration, err := compatibleVideo(probe)
 	if err != nil {
 		return Stream{}, err
+	}
+	audioIndex := -1
+	audioLanguage := ""
+	if audio, found := preferredAudioStream(probe, preferredLanguages); found {
+		audioIndex = audio.Index
+		audioLanguage = canonicalLanguage(audio.Tags.Language)
 	}
 	subtitles := supportedSubtitles(probe)
 	timelineStart := startSeconds
@@ -218,7 +224,7 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 	}
 
 	streamContext, cancel := context.WithCancel(m.ctx)
-	args := m.ffmpegArgs(sourceURL, dir, codec, startSeconds)
+	args := m.ffmpegArgs(sourceURL, dir, codec, startSeconds, audioIndex)
 	command := exec.CommandContext(streamContext, m.ffmpegPath, args...)
 	command.Stdout = logFile
 	command.Stderr = logFile
@@ -262,6 +268,7 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 		return Stream{}, err
 	}
 	m.logger.Info("HLS stream ready", "playback_id", playbackID, "codec", codec,
+		"audio_stream_index", audioIndex, "audio_language", audioLanguage,
 		"text_subtitle_tracks", len(subtitles),
 		"requested_start_seconds", startSeconds, "timeline_start_seconds", timelineStart)
 	return stream.info, nil
@@ -465,6 +472,32 @@ func compatibleVideo(probe mediaProbe) (string, float64, error) {
 	return "", 0, errors.New("playback has no video stream")
 }
 
+func preferredAudioStream(probe mediaProbe, preferredLanguages []string) (mediaStream, bool) {
+	var audioStreams []mediaStream
+	for _, stream := range probe.Streams {
+		if stream.CodecType == "audio" {
+			audioStreams = append(audioStreams, stream)
+		}
+	}
+	for _, preferred := range preferredLanguages {
+		preferred = canonicalLanguage(preferred)
+		for _, stream := range audioStreams {
+			if canonicalLanguage(stream.Tags.Language) == preferred || canonicalLanguage(stream.Tags.Title) == preferred {
+				return stream, true
+			}
+		}
+	}
+	for _, stream := range audioStreams {
+		if stream.Disposition.Default != 0 {
+			return stream, true
+		}
+	}
+	if len(audioStreams) > 0 {
+		return audioStreams[0], true
+	}
+	return mediaStream{}, false
+}
+
 func supportedSubtitles(probe mediaProbe) []SubtitleTrack {
 	var tracks []SubtitleTrack
 	for _, stream := range probe.Streams {
@@ -503,6 +536,9 @@ func isTextSubtitleCodec(codec string) bool {
 func canonicalLanguage(language string) string {
 	language = strings.ToLower(strings.TrimSpace(language))
 	aliases := map[string]string{
+		"english": "en", "french": "fr", "german": "de", "italian": "it",
+		"japanese": "ja", "korean": "ko", "portuguese": "pt", "russian": "ru",
+		"spanish": "es", "chinese": "zh",
 		"ara": "ar", "bul": "bg", "cat": "ca", "chi": "zh", "zho": "zh",
 		"hrv": "hr", "cze": "cs", "ces": "cs", "dan": "da", "dut": "nl", "nld": "nl",
 		"eng": "en", "est": "et", "fin": "fi", "fre": "fr", "fra": "fr",
@@ -520,7 +556,7 @@ func canonicalLanguage(language string) string {
 	return language
 }
 
-func (m *Manager) ffmpegArgs(sourceURL, dir, codec string, startSeconds float64) []string {
+func (m *Manager) ffmpegArgs(sourceURL, dir, codec string, startSeconds float64, audioStreamIndex int) []string {
 	// Allow one segment beyond the target buffer to be packaged without rate limiting.
 	// Stream-copied video can only cut on keyframes, so segment lengths may exceed the target.
 	initialBurstSeconds := m.bufferSeconds + m.segmentSeconds
@@ -534,9 +570,13 @@ func (m *Manager) ffmpegArgs(sourceURL, dir, codec string, startSeconds float64)
 		// prevents accurate input seeking from discarding audio before the first video keyframe.
 		args = append(args, "-noaccurate_seek", "-ss", strconv.FormatFloat(startSeconds, 'f', 3, 64))
 	}
+	audioMap := "0:a:0?"
+	if audioStreamIndex >= 0 {
+		audioMap = fmt.Sprintf("0:%d?", audioStreamIndex)
+	}
 	args = append(args,
 		"-i", sourceURL,
-		"-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
+		"-map", "0:v:0", "-map", audioMap, "-sn", "-dn",
 		"-c:v", "copy",
 	)
 	if codec == "hevc" {

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -77,13 +78,15 @@ type fakeHLSManager struct {
 	subtitlePlayback string
 	subtitleIndex    int
 	subtitleTracks   map[string][]hls.SubtitleTrack
+	languages        []string
 }
 
 func (f *fakeHLSManager) ProbeSubtitles(_ context.Context, id string) ([]hls.SubtitleTrack, error) {
 	return f.subtitleTracks[id], nil
 }
 
-func (f *fakeHLSManager) Start(_ context.Context, id string, start float64) (hls.Stream, error) {
+func (f *fakeHLSManager) Start(_ context.Context, id string, start float64, languages []string) (hls.Stream, error) {
+	f.languages = append([]string(nil), languages...)
 	return hls.Stream{PlaybackID: id, StartSeconds: start, VideoCodec: "h264"}, nil
 }
 
@@ -186,7 +189,7 @@ func TestCreatePlaybackPrefersUsenetCandidate(t *testing.T) {
 	}}
 
 	request := httptest.NewRequest(http.MethodPost, "/v1/playbacks", strings.NewReader(
-		`{"query":"Sintel","year":2010,"preferences":{"streaming_optimized":true,"prefer_text_subtitles":true,"codecs":["h264","h265"]}}`,
+		`{"query":"Sintel","year":2010,"preferences":{"streaming_optimized":true,"prefer_text_subtitles":true,"codecs":["h264","h265"],"languages":["en","english"]}}`,
 	))
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
@@ -205,6 +208,9 @@ func TestCreatePlaybackPrefersUsenetCandidate(t *testing.T) {
 	}
 	if payload.Selected == nil || payload.Selected.Candidate.Protocol != catalog.ProtocolUsenet || payload.Selected.Candidate.NZBURL != "" {
 		t.Fatalf("selected = %+v", payload.Selected)
+	}
+	if got := server.playbackLanguages[payload.ID]; !slices.Equal(got, []string{"en", "english"}) {
+		t.Fatalf("playback languages = %v", got)
 	}
 }
 

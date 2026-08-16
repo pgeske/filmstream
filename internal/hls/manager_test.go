@@ -58,7 +58,7 @@ while :; do sleep 1; done
 	}
 	defer manager.Close()
 
-	stream, err := manager.Start(context.Background(), "playback-1", 120)
+	stream, err := manager.Start(context.Background(), "playback-1", 120, []string{"en", "english"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,16 +139,16 @@ JSON
 		t.Fatal(err)
 	}
 	defer manager.Close()
-	if _, err := manager.Start(context.Background(), "playback-1", 0); err == nil || !strings.Contains(err.Error(), "Dolby Vision") {
+	if _, err := manager.Start(context.Background(), "playback-1", 0, nil); err == nil || !strings.Contains(err.Error(), "Dolby Vision") {
 		t.Fatalf("error = %v", err)
 	}
 }
 
 func TestFFmpegArgsPaceInputAndTagHEVC(t *testing.T) {
 	manager := &Manager{bufferSeconds: 16, readRate: 1.25, segmentSeconds: 4}
-	args := strings.Join(manager.ffmpegArgs("http://source", t.TempDir(), "hevc", 30), " ")
+	args := strings.Join(manager.ffmpegArgs("http://source", t.TempDir(), "hevc", 30, 2), " ")
 	for _, expected := range []string{
-		"-readrate 1.25", "-readrate_initial_burst 20", "-noaccurate_seek -ss 30.000", "-c:v copy", "-tag:v hvc1", "-c:a aac",
+		"-readrate 1.25", "-readrate_initial_burst 20", "-noaccurate_seek -ss 30.000", "-map 0:2?", "-c:v copy", "-tag:v hvc1", "-c:a aac",
 	} {
 		if !strings.Contains(args, expected) {
 			t.Fatalf("FFmpeg arguments do not contain %q: %s", expected, args)
@@ -175,6 +175,30 @@ func TestSubtitleArgsAlignToKeyframeTimeline(t *testing.T) {
 		if !strings.Contains(args, expected) {
 			t.Fatalf("subtitle arguments do not contain %q: %s", expected, args)
 		}
+	}
+}
+
+func TestPreferredAudioStreamUsesRequestedLanguageBeforeDefault(t *testing.T) {
+	probe := mediaProbe{Streams: []mediaStream{
+		{Index: 1, CodecType: "audio", Tags: struct {
+			Language string `json:"language"`
+			Title    string `json:"title"`
+		}{Language: "ita", Title: "Italian"}, Disposition: struct {
+			Default int `json:"default"`
+			Forced  int `json:"forced"`
+		}{Default: 1}},
+		{Index: 2, CodecType: "audio", Tags: struct {
+			Language string `json:"language"`
+			Title    string `json:"title"`
+		}{Language: "eng", Title: "English"}},
+	}}
+	selected, found := preferredAudioStream(probe, []string{"en", "english"})
+	if !found || selected.Index != 2 {
+		t.Fatalf("selected audio = %+v, found = %v", selected, found)
+	}
+	fallback, found := preferredAudioStream(probe, nil)
+	if !found || fallback.Index != 1 {
+		t.Fatalf("fallback audio = %+v, found = %v", fallback, found)
 	}
 }
 

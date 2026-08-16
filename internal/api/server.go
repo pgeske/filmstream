@@ -74,7 +74,7 @@ type catalogSection struct {
 
 type HLSStreamManager interface {
 	ProbeSubtitles(context.Context, string) ([]hls.SubtitleTrack, error)
-	Start(context.Context, string, float64) (hls.Stream, error)
+	Start(context.Context, string, float64, []string) (hls.Stream, error)
 	StartSubtitle(context.Context, string, int) error
 	AssetPath(string, string) (string, error)
 	Stop(string)
@@ -117,6 +117,7 @@ type Server struct {
 	mu                sync.RWMutex
 	selected          map[string]catalog.RankedCandidate
 	playbackCacheKeys map[string]playbackCacheKey
+	playbackLanguages map[string][]string
 	usenetFailures    map[string]time.Time
 }
 
@@ -129,6 +130,7 @@ func New(indexers *indexer.Registry, engine *torrentstream.Engine, defaults cata
 		logger:             logger,
 		selected:           make(map[string]catalog.RankedCandidate),
 		playbackCacheKeys:  make(map[string]playbackCacheKey),
+		playbackLanguages:  make(map[string][]string),
 		usenetFailures:     make(map[string]time.Time),
 	}
 	engine.SetCleanupHandler(func(id, _ string) {
@@ -154,6 +156,7 @@ func (s *Server) cleanupPlayback(id string) {
 	s.mu.Lock()
 	delete(s.selected, id)
 	delete(s.playbackCacheKeys, id)
+	delete(s.playbackLanguages, id)
 	s.mu.Unlock()
 	s.hlsMu.RLock()
 	manager := s.hlsManager
@@ -723,6 +726,12 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 		}
 		session = wrapTorrentSession(torrentSession)
 	}
+	s.mu.Lock()
+	if s.playbackLanguages == nil {
+		s.playbackLanguages = make(map[string][]string)
+	}
+	s.playbackLanguages[session.ID] = append([]string(nil), preferences.Languages...)
+	s.mu.Unlock()
 	if selected != nil {
 		public := publicRankedCandidate(*selected)
 		selected = &public
@@ -1316,7 +1325,10 @@ func (s *Server) startHLSPlayback(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request: "+err.Error())
 		return
 	}
-	stream, err := manager.Start(r.Context(), id, request.StartSeconds)
+	s.mu.RLock()
+	preferredLanguages := append([]string(nil), s.playbackLanguages[id]...)
+	s.mu.RUnlock()
+	stream, err := manager.Start(r.Context(), id, request.StartSeconds, preferredLanguages)
 	if err != nil {
 		s.invalidateCachedPlayback(id)
 		writeError(w, http.StatusBadGateway, err.Error())
