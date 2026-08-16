@@ -165,8 +165,15 @@ struct MacMovieDetailView: View {
     ) -> some View {
         HStack(spacing: 11) {
             if showsProgress {
-                ProgressView()
-                    .controlSize(.small)
+                ZStack {
+                    Circle()
+                        .fill(Color.macTeaBackground.opacity(0.08))
+                        .frame(width: 26, height: 26)
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(Color.macTeaBackground)
+                }
+                .frame(width: 28, height: 28)
             } else {
                 Image(systemName: systemImage)
                     .frame(width: 20)

@@ -16,6 +16,9 @@ struct MacPlayerView: View {
     @State private var didClose = false
     @State private var scrubPosition: Double?
     @State private var isFullScreen = false
+    @State private var controlsAreVisible = true
+    @State private var controlsHideTask: Task<Void, Never>?
+    @State private var keyEventMonitor: Any?
 
     init(
         movie: Movie,
@@ -36,11 +39,18 @@ struct MacPlayerView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            MacAVPlayerView(player: controller.player, onDoubleClick: toggleFullScreen)
-                .ignoresSafeArea()
+            MacAVPlayerView(
+                player: controller.player,
+                onPointerActivity: revealControls
+            )
+            .ignoresSafeArea()
 
             VStack(spacing: 0) {
                 playerHeader
+                    .opacity(controlsAreVisible ? 1 : 0)
+                    .allowsHitTesting(controlsAreVisible)
+                    .accessibilityHidden(!controlsAreVisible)
+
                 Spacer()
 
                 if let subtitle = controller.activeSubtitleText {
@@ -58,7 +68,11 @@ struct MacPlayerView: View {
                 }
 
                 playbackControls
+                    .opacity(controlsAreVisible ? 1 : 0)
+                    .allowsHitTesting(controlsAreVisible)
+                    .accessibilityHidden(!controlsAreVisible)
             }
+            .animation(.easeOut(duration: 0.2), value: controlsAreVisible)
 
             if let errorMessage = controller.errorMessage {
                 VStack(spacing: 14) {
@@ -86,13 +100,29 @@ struct MacPlayerView: View {
         }
         .onAppear {
             syncFullScreenState()
+            installPlayerKeyMonitor()
             controller.play()
+            revealControls()
         }
         .onDisappear {
+            controlsHideTask?.cancel()
+            removePlayerKeyMonitor()
             closePlayback()
         }
+        .onChange(of: controller.isPlaying) { _, isPlaying in
+            if isPlaying {
+                revealControls()
+            } else {
+                keepControlsVisible()
+            }
+        }
+        .onChange(of: controller.errorMessage) { _, errorMessage in
+            if errorMessage != nil {
+                keepControlsVisible()
+            }
+        }
         .onExitCommand {
-            if isFullScreen {
+            if activeWindow?.styleMask.contains(.fullScreen) == true {
                 toggleFullScreen()
             } else {
                 requestClose()
@@ -132,6 +162,7 @@ struct MacPlayerView: View {
             if !controller.subtitleOptions.isEmpty {
                 Menu {
                     Button {
+                        revealControls()
                         controller.selectSubtitle(nil)
                     } label: {
                         subtitleMenuLabel("Off", selected: controller.selectedSubtitle == nil)
@@ -139,6 +170,7 @@ struct MacPlayerView: View {
                     Divider()
                     ForEach(controller.subtitleOptions) { track in
                         Button {
+                            revealControls()
                             controller.selectSubtitle(track)
                         } label: {
                             subtitleMenuLabel(
@@ -157,15 +189,17 @@ struct MacPlayerView: View {
                 .fixedSize()
             }
 
-            Button(action: toggleFullScreen) {
+            Button {
+                revealControls()
+                toggleFullScreen()
+            } label: {
                 Label(
                     isFullScreen ? "Exit Full Screen" : "Full Screen",
                     systemImage: "arrow.up.left.and.arrow.down.right"
                 )
             }
             .buttonStyle(.borderless)
-            .keyboardShortcut("f", modifiers: [.control, .command])
-            .help("Full Screen (double-click the video)")
+            .help("Full Screen (F or double-click the video)")
 
             Button(action: requestClose) {
                 Label("Close", systemImage: "xmark.circle.fill")
@@ -204,6 +238,7 @@ struct MacPlayerView: View {
                 Spacer()
 
                 Button {
+                    revealControls()
                     controller.jump(by: -30)
                 } label: {
                     Label("Back 30 Seconds", systemImage: "gobackward.30")
@@ -212,6 +247,7 @@ struct MacPlayerView: View {
                 .help("Back 30 Seconds")
 
                 Button {
+                    revealControls()
                     controller.togglePlayback()
                 } label: {
                     Label(
@@ -225,6 +261,7 @@ struct MacPlayerView: View {
                 .keyboardShortcut(.space, modifiers: [])
 
                 Button {
+                    revealControls()
                     controller.jump(by: 30)
                 } label: {
                     Label("Forward 30 Seconds", systemImage: "goforward.30")
@@ -255,6 +292,7 @@ struct MacPlayerView: View {
 
     private func handleScrubbing(_ isEditing: Bool) {
         if isEditing {
+            keepControlsVisible()
             if scrubPosition == nil {
                 scrubPosition = controller.positionSeconds
             }
@@ -263,6 +301,7 @@ struct MacPlayerView: View {
         guard let target = scrubPosition else { return }
         scrubPosition = nil
         controller.seek(to: target)
+        revealControls()
     }
 
     private func subtitleMenuLabel(_ title: String, selected: Bool) -> some View {
@@ -270,6 +309,41 @@ struct MacPlayerView: View {
             Text(title)
             if selected {
                 Image(systemName: "checkmark")
+            }
+        }
+    }
+
+    private func revealControls() {
+        controlsHideTask?.cancel()
+        controlsHideTask = nil
+        if !controlsAreVisible {
+            withAnimation(.easeOut(duration: 0.2)) {
+                controlsAreVisible = true
+            }
+        }
+        guard controller.isPlaying else { return }
+
+        controlsHideTask = Task {
+            do {
+                try await Task.sleep(for: .seconds(3))
+            } catch {
+                return
+            }
+            guard controller.isPlaying, scrubPosition == nil else { return }
+            withAnimation(.easeOut(duration: 0.25)) {
+                controlsAreVisible = false
+            }
+            NSCursor.setHiddenUntilMouseMoves(true)
+            controlsHideTask = nil
+        }
+    }
+
+    private func keepControlsVisible() {
+        controlsHideTask?.cancel()
+        controlsHideTask = nil
+        if !controlsAreVisible {
+            withAnimation(.easeOut(duration: 0.2)) {
+                controlsAreVisible = true
             }
         }
     }
@@ -282,16 +356,46 @@ struct MacPlayerView: View {
         onClose()
     }
 
+    private var activeWindow: NSWindow? {
+        NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow
+    }
+
     private func toggleFullScreen() {
-        guard let window = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow else {
-            return
-        }
-        window.toggleFullScreen(nil)
+        activeWindow?.toggleFullScreen(nil)
     }
 
     private func syncFullScreenState() {
-        let window = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow
-        isFullScreen = window?.styleMask.contains(.fullScreen) == true
+        isFullScreen = activeWindow?.styleMask.contains(.fullScreen) == true
+    }
+
+    private func installPlayerKeyMonitor() {
+        guard keyEventMonitor == nil else { return }
+        keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard let window = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow else {
+                return event
+            }
+
+            if event.keyCode == 53, window.styleMask.contains(.fullScreen) {
+                window.toggleFullScreen(nil)
+                return nil
+            }
+
+            let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+            if !event.isARepeat,
+               modifiers.isEmpty,
+               event.charactersIgnoringModifiers?.lowercased() == "f" {
+                window.toggleFullScreen(nil)
+                return nil
+            }
+
+            return event
+        }
+    }
+
+    private func removePlayerKeyMonitor() {
+        guard let keyEventMonitor else { return }
+        NSEvent.removeMonitor(keyEventMonitor)
+        self.keyEventMonitor = nil
     }
 
     private func closePlayback() {
@@ -342,39 +446,86 @@ struct MacPlayerView: View {
 // TeaStream supplies movie controls because growing HLS playlists otherwise appear live to AVKit.
 private struct MacAVPlayerView: NSViewRepresentable {
     let player: AVPlayer
-    let onDoubleClick: () -> Void
+    let onPointerActivity: () -> Void
 
-    func makeNSView(context: Context) -> MacDoubleClickPlayerView {
-        let playerView = MacDoubleClickPlayerView()
+    func makeNSView(context: Context) -> MacInteractivePlayerView {
+        let playerView = MacInteractivePlayerView()
         playerView.player = player
         playerView.controlsStyle = .none
         playerView.videoGravity = .resizeAspect
-        playerView.onDoubleClick = onDoubleClick
+        playerView.onPointerActivity = onPointerActivity
         return playerView
     }
 
-    func updateNSView(_ playerView: MacDoubleClickPlayerView, context: Context) {
+    func updateNSView(_ playerView: MacInteractivePlayerView, context: Context) {
         if playerView.player !== player {
             playerView.player = player
         }
-        playerView.onDoubleClick = onDoubleClick
+        playerView.onPointerActivity = onPointerActivity
     }
 
-    static func dismantleNSView(_ playerView: MacDoubleClickPlayerView, coordinator: Void) {
+    static func dismantleNSView(_ playerView: MacInteractivePlayerView, coordinator: Void) {
         playerView.player = nil
-        playerView.onDoubleClick = nil
+        playerView.onPointerActivity = nil
     }
 }
 
-private final class MacDoubleClickPlayerView: AVPlayerView {
-    var onDoubleClick: (() -> Void)?
+private final class MacInteractivePlayerView: AVPlayerView {
+    var onPointerActivity: (() -> Void)?
+    private var pointerTrackingArea: NSTrackingArea?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        let doubleClickRecognizer = NSClickGestureRecognizer(
+            target: self,
+            action: #selector(handleDoubleClick)
+        )
+        doubleClickRecognizer.numberOfClicksRequired = 2
+        addGestureRecognizer(doubleClickRecognizer)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.acceptsMouseMovedEvents = true
+    }
+
+    override func updateTrackingAreas() {
+        if let pointerTrackingArea {
+            removeTrackingArea(pointerTrackingArea)
+        }
+        let trackingArea = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self
+        )
+        addTrackingArea(trackingArea)
+        pointerTrackingArea = trackingArea
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        onPointerActivity?()
+        super.mouseEntered(with: event)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        onPointerActivity?()
+        super.mouseMoved(with: event)
+    }
 
     override func mouseDown(with event: NSEvent) {
-        if event.clickCount == 2 {
-            onDoubleClick?()
-            return
-        }
+        onPointerActivity?()
         super.mouseDown(with: event)
+    }
+
+    @objc private func handleDoubleClick() {
+        onPointerActivity?()
+        window?.toggleFullScreen(nil)
     }
 }
 
