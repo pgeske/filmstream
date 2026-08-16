@@ -11,9 +11,12 @@ import (
 )
 
 type SearchRequest struct {
-	Query       string      `json:"query"`
-	Year        int         `json:"year,omitempty"`
-	Preferences Preferences `json:"preferences"`
+	Query         string      `json:"query"`
+	Year          int         `json:"year,omitempty"`
+	MediaType     string      `json:"media_type,omitempty"`
+	SeasonNumber  int         `json:"season_number,omitempty"`
+	EpisodeNumber int         `json:"episode_number,omitempty"`
+	Preferences   Preferences `json:"preferences"`
 }
 
 type Preferences struct {
@@ -60,10 +63,13 @@ type RankedCandidate struct {
 }
 
 var (
-	resolutionPattern = regexp.MustCompile(`(?i)(?:^|[^0-9])(2160p|1080p|720p|480p)(?:[^0-9]|$)`)
-	x265Pattern       = regexp.MustCompile(`(?i)(?:x265|h[ ._-]?265|hevc)`)
-	x264Pattern       = regexp.MustCompile(`(?i)(?:x264|h[ ._-]?264|avc)`)
-	releaseMarkers    = map[string]bool{
+	resolutionPattern    = regexp.MustCompile(`(?i)(?:^|[^0-9])(2160p|1080p|720p|480p)(?:[^0-9]|$)`)
+	x265Pattern          = regexp.MustCompile(`(?i)(?:x265|h[ ._-]?265|hevc)`)
+	x264Pattern          = regexp.MustCompile(`(?i)(?:x264|h[ ._-]?264|avc)`)
+	seasonEpisodePattern = regexp.MustCompile(`(?i)(?:^|[^a-z0-9])s(\d{1,2})[ ._-]*e(\d{1,3})(?:[^0-9]|$)`)
+	xEpisodePattern      = regexp.MustCompile(`(?i)(?:^|[^0-9])(\d{1,2})x(\d{1,3})(?:[^0-9]|$)`)
+	seasonPattern        = regexp.MustCompile(`(?i)(?:^|[^a-z0-9])(?:s|season[ ._-]*)(\d{1,2})(?:[^0-9]|$)`)
+	releaseMarkers       = map[string]bool{
 		"2160p": true, "1080p": true, "720p": true, "480p": true,
 		"bluray": true, "brrip": true, "dvd": true, "dvdrip": true,
 		"hdtv": true, "remux": true, "uhd": true, "web": true,
@@ -114,7 +120,24 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 				}
 			}
 		}
-		if request.Year > 0 && candidate.Year > 0 && request.Year != candidate.Year {
+		episodeMatch := false
+		seasonPack := false
+		if request.SeasonNumber > 0 && request.EpisodeNumber > 0 {
+			season, episode, hasEpisode := releaseEpisode(candidate.Name)
+			switch {
+			case hasEpisode && season == request.SeasonNumber && episode == request.EpisodeNumber:
+				episodeMatch = true
+			case hasEpisode:
+				continue
+			default:
+				candidateSeason, hasSeason := releaseSeason(candidate.Name)
+				if !hasSeason || candidateSeason != request.SeasonNumber {
+					continue
+				}
+				seasonPack = true
+			}
+		}
+		if request.MediaType != "show" && request.Year > 0 && candidate.Year > 0 && request.Year != candidate.Year {
 			continue
 		}
 
@@ -124,8 +147,15 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 		}
 		score := match * 500
 		reasons := []string{formatReason("title match", match*100)}
+		if episodeMatch {
+			score += 250
+			reasons = append(reasons, "exact episode")
+		} else if seasonPack {
+			score -= 80
+			reasons = append(reasons, "season pack")
+		}
 
-		if request.Year > 0 && candidate.Year == request.Year {
+		if request.MediaType != "show" && request.Year > 0 && candidate.Year == request.Year {
 			score += 80
 			reasons = append(reasons, "exact year")
 		}
@@ -306,12 +336,48 @@ func releaseTitle(normalizedQuery, normalizedCandidate string) string {
 		if _, partOfTitle := queryWords[word]; partOfTitle {
 			continue
 		}
+		if _, _, ok := releaseEpisode(word); ok || isSeasonToken(word) {
+			words = words[:index]
+			break
+		}
 		if _, ok := parseReleaseYear(word); ok || releaseMarkers[word] {
 			words = words[:index]
 			break
 		}
 	}
 	return strings.Join(words, " ")
+}
+
+func releaseEpisode(value string) (int, int, bool) {
+	for _, pattern := range []*regexp.Regexp{seasonEpisodePattern, xEpisodePattern} {
+		match := pattern.FindStringSubmatch(value)
+		if len(match) != 3 {
+			continue
+		}
+		season, seasonErr := strconv.Atoi(match[1])
+		episode, episodeErr := strconv.Atoi(match[2])
+		if seasonErr == nil && episodeErr == nil && season > 0 && episode > 0 {
+			return season, episode, true
+		}
+	}
+	return 0, 0, false
+}
+
+func releaseSeason(value string) (int, bool) {
+	match := seasonPattern.FindStringSubmatch(value)
+	if len(match) != 2 {
+		return 0, false
+	}
+	season, err := strconv.Atoi(match[1])
+	return season, err == nil && season > 0
+}
+
+func isSeasonToken(value string) bool {
+	if _, _, ok := releaseEpisode(value); ok {
+		return true
+	}
+	_, ok := releaseSeason(value)
+	return ok
 }
 
 func parseReleaseYear(value string) (int, bool) {

@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"slices"
 	"testing"
 	"time"
 )
@@ -191,6 +192,26 @@ func TestRankRejectsOriginalMovieForRequestedSequel(t *testing.T) {
 	}
 	if got := ranked[0].Candidate.Name; got != "Paddington 2 2017 1080p BluRay x264" {
 		t.Fatalf("top candidate = %q", got)
+	}
+}
+
+func TestRankSelectsExactEpisodeAndAllowsSeasonPackFallback(t *testing.T) {
+	ranked := Rank(SearchRequest{
+		Query: "Top Rated Show", MediaType: "show", SeasonNumber: 1, EpisodeNumber: 2,
+	}, []Candidate{
+		{Name: "Top.Rated.Show.S01E03.1080p.WEB.H264"},
+		{Name: "Top.Rated.Show.S01.Complete.1080p.WEB.H264"},
+		{Name: "Top.Rated.Show.S01E02.1080p.WEB.H264"},
+		{Name: "Top.Rated.Show.S02E02.1080p.WEB.H264"},
+	})
+	if len(ranked) != 2 {
+		t.Fatalf("ranked = %+v", ranked)
+	}
+	if ranked[0].Candidate.Name != "Top.Rated.Show.S01E02.1080p.WEB.H264" {
+		t.Fatalf("top candidate = %q", ranked[0].Candidate.Name)
+	}
+	if !slices.Contains(ranked[0].Reasons, "exact episode") {
+		t.Fatalf("reasons = %v", ranked[0].Reasons)
 	}
 }
 

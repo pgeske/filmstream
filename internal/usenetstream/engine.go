@@ -52,9 +52,10 @@ type Config struct {
 }
 
 type Source struct {
-	NZBURL  string
-	NZBPath string
-	Name    string
+	NZBURL   string
+	NZBPath  string
+	Name     string
+	FileHint string
 }
 
 type Engine struct {
@@ -247,7 +248,7 @@ func (e *Engine) Create(parent context.Context, source Source) (*Session, error)
 		return nil, err
 	}
 	mountDuration := time.Since(mountStartedAt)
-	video, err := e.waitForVideo(ctx, mount)
+	video, err := e.waitForVideo(ctx, mount, source.FileHint)
 	if err != nil {
 		return nil, err
 	}
@@ -652,11 +653,11 @@ type videoInfo struct {
 	size int64
 }
 
-func (e *Engine) waitForVideo(ctx context.Context, mount mountInfo) (videoInfo, error) {
+func (e *Engine) waitForVideo(ctx context.Context, mount mountInfo, fileHint string) (videoInfo, error) {
 	readyContext, cancel := context.WithTimeout(ctx, videoReadyTimeout)
 	defer cancel()
 	for {
-		video, err := e.findLargestVideo(readyContext, mount)
+		video, err := e.findLargestVideo(readyContext, mount, fileHint)
 		if err == nil || !errors.Is(err, errNoSupportedVideo) {
 			return video, err
 		}
@@ -670,7 +671,7 @@ func (e *Engine) waitForVideo(ctx context.Context, mount mountInfo) (videoInfo, 
 	}
 }
 
-func (e *Engine) findLargestVideo(ctx context.Context, mount mountInfo) (videoInfo, error) {
+func (e *Engine) findLargestVideo(ctx context.Context, mount mountInfo, fileHint string) (videoInfo, error) {
 	root := "/content/" + url.PathEscape(mount.category) + "/" + url.PathEscape(mount.folder)
 	rootPath := cleanDAVPath(root)
 	if rootPath == "" {
@@ -717,6 +718,13 @@ func (e *Engine) findLargestVideo(ctx context.Context, mount mountInfo) (videoIn
 	if len(videos) == 0 {
 		return videoInfo{}, errNoSupportedVideo
 	}
+	if strings.TrimSpace(fileHint) != "" && len(videos) > 1 {
+		matching := matchingWebDAVVideos(videos, fileHint)
+		if len(matching) == 0 {
+			return videoInfo{}, fmt.Errorf("Usenet release contains no video matching %s", fileHint)
+		}
+		videos = matching
+	}
 	best := videos[0]
 	for _, candidate := range videos[1:] {
 		if candidate.size > best.size {
@@ -732,6 +740,55 @@ func (e *Engine) findLargestVideo(ctx context.Context, mount mountInfo) (videoIn
 		best.size = size
 	}
 	return videoInfo{url: upstream, name: best.name, size: best.size}, nil
+}
+
+func matchingWebDAVVideos(videos []webDAVItem, hint string) []webDAVItem {
+	hint = normalizeFileHint(hint)
+	if hint == "" {
+		return nil
+	}
+	var matching []webDAVItem
+	for _, video := range videos {
+		name := normalizeFileHint(video.name)
+		if strings.Contains(name, hint) || matchesAlternateEpisodeCode(name, hint) {
+			matching = append(matching, video)
+		}
+	}
+	return matching
+}
+
+func normalizeFileHint(value string) string {
+	var builder strings.Builder
+	for _, character := range strings.ToLower(value) {
+		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' {
+			builder.WriteRune(character)
+		}
+	}
+	return builder.String()
+}
+
+func matchesAlternateEpisodeCode(name, hint string) bool {
+	if len(hint) < 6 || hint[0] != 's' {
+		return false
+	}
+	episodeIndex := strings.IndexByte(hint, 'e')
+	if episodeIndex < 2 || episodeIndex == len(hint)-1 {
+		return false
+	}
+	seasonRaw := hint[1:episodeIndex]
+	episodeRaw := hint[episodeIndex+1:]
+	season := strings.TrimLeft(seasonRaw, "0")
+	episode := strings.TrimLeft(episodeRaw, "0")
+	if season == "" {
+		season = "0"
+	}
+	if episode == "" {
+		episode = "0"
+	}
+	return strings.Contains(name, season+"x"+episode) ||
+		strings.Contains(name, season+"x"+episodeRaw) ||
+		strings.Contains(name, seasonRaw+"x"+episode) ||
+		strings.Contains(name, seasonRaw+"x"+episodeRaw)
 }
 
 func (e *Engine) propfind(ctx context.Context, davPath string) ([]webDAVItem, error) {

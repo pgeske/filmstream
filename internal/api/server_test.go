@@ -156,12 +156,44 @@ func (fakeRatings) Ratings(_ context.Context, title string, year int) (metadata.
 func (fakeMetadata) Discover(_ context.Context, collection metadata.Collection) ([]metadata.Movie, error) {
 	switch collection {
 	case metadata.CollectionPopular:
-		return []metadata.Movie{{ID: "tmdb:2", Title: "Popular Movie", Year: 2026}}, nil
+		return []metadata.Movie{{ID: "tmdb:2", MediaType: metadata.MediaTypeMovie, Title: "Popular Movie", Year: 2026}}, nil
 	case metadata.CollectionTopRated:
-		return []metadata.Movie{{ID: "tmdb:3", Title: "Top Rated Movie", Year: 1972}}, nil
+		return []metadata.Movie{{ID: "tmdb-tv:3", MediaType: metadata.MediaTypeShow, Title: "Top Rated Show", Year: 2020, NumberOfSeasons: 3}}, nil
 	default:
 		return nil, nil
 	}
+}
+
+func (fakeMetadata) Show(_ context.Context, id string) (metadata.Show, error) {
+	if id != "tmdb-tv:3" {
+		return metadata.Show{}, errors.New("show not found")
+	}
+	return metadata.Show{
+		Movie: metadata.Movie{
+			ID: id, MediaType: metadata.MediaTypeShow, Title: "Top Rated Show",
+			Year: 2020, NumberOfSeasons: 3,
+		},
+		Seasons: []metadata.SeasonSummary{{Number: 1, Name: "Season 1", EpisodeCount: 8}},
+	}, nil
+}
+
+func (fakeMetadata) Season(_ context.Context, id string, number int) (metadata.Season, error) {
+	if id != "tmdb-tv:3" || number != 1 {
+		return metadata.Season{}, errors.New("season not found")
+	}
+	return metadata.Season{
+		SeriesID: id, SeriesTitle: "Top Rated Show", Number: number, Name: "Season 1",
+		Episodes: []metadata.Episode{
+			{
+				ID: "tmdb-tv:3:s1:e1", SeriesID: id, SeriesTitle: "Top Rated Show",
+				SeasonNumber: 1, EpisodeNumber: 1, Title: "Pilot",
+			},
+			{
+				ID: "tmdb-tv:3:s1:e2", SeriesID: id, SeriesTitle: "Top Rated Show",
+				SeasonNumber: 1, EpisodeNumber: 2, Title: "Second",
+			},
+		},
+	}, nil
 }
 
 func (fakeResolver) Resolve(_ context.Context, input string) (resolver.Result, error) {
@@ -231,6 +263,59 @@ func TestCreatePlaybackPrefersUsenetCandidate(t *testing.T) {
 	}
 	if got := server.playbackLanguages[payload.ID]; !slices.Equal(got, []string{"en", "english"}) {
 		t.Fatalf("playback languages = %v", got)
+	}
+}
+
+func TestCreateEpisodePlaybackUsesTVSearchAndFileHint(t *testing.T) {
+	var tvSearchQuery string
+	indexerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("t") {
+		case "caps":
+			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><tv-search available="yes" supportedParams="q,season,ep"/></searching></caps>`)
+		case "tvsearch":
+			tvSearchQuery = r.URL.RawQuery
+			if r.URL.Query().Get("q") == "Original Show" {
+				fmt.Fprint(w, `<?xml version="1.0"?><rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel><item><title>Original.Show.S01E02.1080p.WEB.H264-GROUP</title><guid>episode-2</guid><enclosure url="/download/episode-2" length="607836000" type="application/x-nzb"/></item></channel></rss>`)
+			} else {
+				fmt.Fprint(w, `<?xml version="1.0"?><rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel/></rss>`)
+			}
+		case "search":
+			fmt.Fprint(w, `<?xml version="1.0"?><rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel/></rss>`)
+		default:
+			http.Error(w, "unsupported", http.StatusBadRequest)
+		}
+	}))
+	defer indexerServer.Close()
+	registry, err := indexer.NewRegistry([]config.Indexer{{
+		Name: "usenet", Type: "torznab", Endpoint: indexerServer.URL + "/api", APIKey: "secret",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	torrentEngine, err := torrentstream.New(torrentstream.Config{
+		DataDir: t.TempDir(), MetadataTimeout: time.Second, CleanOnClose: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer torrentEngine.Close()
+	server := New(registry, torrentEngine, catalog.Preferences{Codecs: []string{"h264"}}, slog.Default())
+	fakeUsenet := &fakeUsenetPlaybackEngine{session: &usenetstream.Session{
+		ID: "episode-playback", Name: "Top Rated Show", FileName: "Top.Rated.Show.S01E02.mkv",
+	}}
+	server.usenetEngine = fakeUsenet
+
+	body := `{"media_id":"tmdb-tv:3:s1:e2","media_type":"show","query":"Localized Name","original_title":"Original Show","year":2020,"series_id":"tmdb-tv:3","series_title":"Localized Name","season_number":1,"episode_number":2,"episode_title":"Second","preferences":{"codecs":["h264"]}}`
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/playbacks", strings.NewReader(body)))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(tvSearchQuery, "season=1") || !strings.Contains(tvSearchQuery, "ep=2") || !strings.Contains(tvSearchQuery, "q=Original+Show") {
+		t.Fatalf("TV search query = %q", tvSearchQuery)
+	}
+	if fakeUsenet.createdSource.FileHint != "S01E02" {
+		t.Fatalf("source = %+v", fakeUsenet.createdSource)
 	}
 }
 
@@ -492,7 +577,7 @@ func TestCatalogRatingsRequiresProvider(t *testing.T) {
 	}
 }
 
-func TestDiscoverCatalogReturnsMovieSections(t *testing.T) {
+func TestDiscoverCatalogReturnsMixedMediaSections(t *testing.T) {
 	server := &Server{metadataProvider: fakeMetadata{}}
 	request := httptest.NewRequest(http.MethodGet, "/v1/catalog/discover", nil)
 	response := httptest.NewRecorder()
@@ -512,8 +597,23 @@ func TestDiscoverCatalogReturnsMovieSections(t *testing.T) {
 	if payload.Sections[0].ID != "popular" || payload.Sections[0].Items[0].Title != "Popular Movie" {
 		t.Fatalf("popular = %+v", payload.Sections[0])
 	}
-	if payload.Sections[1].ID != "top-rated" || payload.Sections[1].Items[0].Title != "Top Rated Movie" {
+	if payload.Sections[1].ID != "top-rated" || payload.Sections[1].Items[0].Title != "Top Rated Show" || payload.Sections[1].Items[0].MediaType != metadata.MediaTypeShow {
 		t.Fatalf("top rated = %+v", payload.Sections[1])
+	}
+}
+
+func TestShowCatalogReturnsSeasonsAndEpisodes(t *testing.T) {
+	server := &Server{metadataProvider: fakeMetadata{}}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/catalog/shows/tmdb-tv:3", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"number_of_seasons":3`) || !strings.Contains(response.Body.String(), `"episode_count":8`) {
+		t.Fatalf("show status = %d, body = %s", response.Code, response.Body.String())
+	}
+
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/catalog/shows/tmdb-tv:3/seasons/1", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"id":"tmdb-tv:3:s1:e1"`) || !strings.Contains(response.Body.String(), `"title":"Pilot"`) {
+		t.Fatalf("season status = %d, body = %s", response.Code, response.Body.String())
 	}
 }
 
@@ -569,6 +669,61 @@ func TestRemoveWatchHistoryClearsSavedProgress(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("entries after removal = %+v", entries)
+	}
+}
+
+func TestCompletedEpisodeContinuesWithFirstUnwatchedEpisode(t *testing.T) {
+	store := history.New(t.TempDir())
+	_, err := store.RecordProgress(history.Entry{
+		MediaID: "tmdb-tv:3:s1:e1", MediaType: "show", Title: "Top Rated Show",
+		SeriesID: "tmdb-tv:3", SeriesTitle: "Top Rated Show", SeasonNumber: 1,
+		EpisodeNumber: 1, EpisodeTitle: "Pilot", PositionSeconds: 980, DurationSeconds: 1000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{historyStore: store, metadataProvider: fakeMetadata{}}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/watch-history?continue=true", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Entries []history.Entry `json:"entries"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Entries) != 1 || payload.Entries[0].MediaID != "tmdb-tv:3:s1:e2" || payload.Entries[0].EpisodeTitle != "Second" || payload.Entries[0].PositionSeconds != 0 {
+		t.Fatalf("continue entries = %+v", payload.Entries)
+	}
+}
+
+func TestEpisodeHistoryAndSeriesRemoval(t *testing.T) {
+	store := history.New(t.TempDir())
+	server := &Server{historyStore: store}
+	for episode := 1; episode <= 2; episode++ {
+		body := fmt.Sprintf(`{"media_id":"tmdb-tv:3:s1:e%d","media_type":"show","title":"Top Rated Show","year":2020,"series_id":"tmdb-tv:3","series_title":"Top Rated Show","season_number":1,"episode_number":%d,"episode_title":"Episode %d","position_seconds":120,"duration_seconds":1000}`, episode, episode, episode)
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/v1/watch-history", strings.NewReader(body)))
+		if response.Code != http.StatusOK {
+			t.Fatalf("update status = %d, body = %s", response.Code, response.Body.String())
+		}
+	}
+	entries, err := store.List()
+	if err != nil || len(entries) != 2 || entries[0].SeriesID != "tmdb-tv:3" {
+		t.Fatalf("episode entries = %+v, error = %v", entries, err)
+	}
+
+	request := httptest.NewRequest(http.MethodDelete, "/v1/watch-history/ignored?series_id=tmdb-tv%3A3", nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("remove status = %d, body = %s", response.Code, response.Body.String())
+	}
+	entries, err = store.List()
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("entries after series removal = %+v, error = %v", entries, err)
 	}
 }
 

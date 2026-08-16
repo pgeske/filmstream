@@ -54,6 +54,7 @@ type Source struct {
 	MagnetURI   string
 	TorrentURL  string
 	TorrentPath string
+	FileHint    string
 }
 
 type Engine struct {
@@ -290,7 +291,7 @@ func (e *Engine) Create(ctx context.Context, source Source) (*Session, error) {
 		return nil, fmt.Errorf("torrent is %.1f GiB; configured maximum is %.1f GiB", gib(length), gib(e.maxTorrentBytes))
 	}
 
-	file, err := selectVideoFile(t.Files())
+	file, err := selectVideoFile(t.Files(), source.FileHint)
 	if err != nil {
 		t.Drop()
 		return nil, err
@@ -769,7 +770,7 @@ func (e *Engine) prefetchTail(parent context.Context, session *Session) {
 	_, _ = io.CopyN(io.Discard, reader, tailBytes)
 }
 
-func selectVideoFile(files []*torrent.File) (*torrent.File, error) {
+func selectVideoFile(files []*torrent.File, fileHint string) (*torrent.File, error) {
 	videoExtensions := map[string]bool{
 		".avi": true, ".m4v": true, ".mkv": true, ".mov": true,
 		".mp4": true, ".mpeg": true, ".mpg": true, ".ts": true, ".webm": true,
@@ -783,10 +784,66 @@ func selectVideoFile(files []*torrent.File) (*torrent.File, error) {
 	if len(videos) == 0 {
 		return nil, errors.New("torrent contains no supported video files")
 	}
+	if strings.TrimSpace(fileHint) != "" && len(videos) > 1 {
+		matching := matchingVideoFiles(videos, fileHint)
+		if len(matching) == 0 {
+			return nil, fmt.Errorf("torrent contains no video matching %s", fileHint)
+		}
+		videos = matching
+	}
 	sort.SliceStable(videos, func(i, j int) bool {
 		return videos[i].Length() > videos[j].Length()
 	})
 	return videos[0], nil
+}
+
+func matchingVideoFiles(files []*torrent.File, hint string) []*torrent.File {
+	hint = normalizeFileHint(hint)
+	if hint == "" {
+		return nil
+	}
+	var matching []*torrent.File
+	for _, file := range files {
+		name := normalizeFileHint(file.Path())
+		if strings.Contains(name, hint) || matchesAlternateEpisodeCode(name, hint) {
+			matching = append(matching, file)
+		}
+	}
+	return matching
+}
+
+func normalizeFileHint(value string) string {
+	var builder strings.Builder
+	for _, character := range strings.ToLower(value) {
+		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' {
+			builder.WriteRune(character)
+		}
+	}
+	return builder.String()
+}
+
+func matchesAlternateEpisodeCode(name, hint string) bool {
+	if len(hint) < 6 || hint[0] != 's' {
+		return false
+	}
+	episodeIndex := strings.IndexByte(hint, 'e')
+	if episodeIndex < 2 || episodeIndex == len(hint)-1 {
+		return false
+	}
+	seasonRaw := hint[1:episodeIndex]
+	episodeRaw := hint[episodeIndex+1:]
+	season := strings.TrimLeft(seasonRaw, "0")
+	episode := strings.TrimLeft(episodeRaw, "0")
+	if season == "" {
+		season = "0"
+	}
+	if episode == "" {
+		episode = "0"
+	}
+	return strings.Contains(name, season+"x"+episode) ||
+		strings.Contains(name, season+"x"+episodeRaw) ||
+		strings.Contains(name, seasonRaw+"x"+episode) ||
+		strings.Contains(name, seasonRaw+"x"+episodeRaw)
 }
 
 func randomID() (string, error) {

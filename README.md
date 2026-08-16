@@ -8,20 +8,20 @@ Use it only with media you are authorized to access, download, or share.
 
 - Local backend bound to `127.0.0.1:8943`
 - Bubble Tea terminal UI with search, continue watching, progress, and history controls
-- TeaStream, cozy native iPhone, Apple TV, and Mac clients with poster search, movie details, selectable subtitles, AVPlayer HLS playback, and shared progress
+- TeaStream, cozy native iPhone, Apple TV, and Mac clients with mixed movie/show discovery, season and episode browsing, selectable subtitles, AVPlayer HLS playback, and shared progress
 - One-command CLI that starts the backend when needed and launches MPV
 - A small, trusted open-movie catalog plus an Internet Archive reference indexer
 - Standard Torznab indexers, including Prowlarr and Jackett endpoints for both NZBs and torrents
 - On-demand Usenet streaming through InfiniDysk, including HTTP Range seeking and virtual RAR/7z access
 - Configurable hybrid, Usenet-only, or torrent-only source selection
 - Optional natural-language movie resolution through OpenAI-compatible models
-- Release ranking by title, year, resolution, language, codec, size, seeders, and leechers
+- Release ranking by title, year or episode, resolution, language, codec, size, seeders, and leechers
 - Direct magnet and `.torrent` playback
 - HTTP Range streaming with seeking and 32 MiB read-ahead
 - Demand-driven smart sampling plus a small tail prefetch for container metadata
 - Automatic best-effort seeding toward a visible 1.0 ratio target
 - Automatic retirement, a 20 GiB cache safety limit, and ephemeral shutdown cleanup
-- Largest-video selection for multi-file torrents
+- Episode-aware file selection for season packs, with largest-video fallback for direct and movie sources
 
 ## Install
 
@@ -42,7 +42,7 @@ Open the terminal UI with no arguments:
 filmstream
 ```
 
-The home screen separates resumable movies from watch history. Use:
+The terminal home screen separates resumable movies from watch history. Use:
 
 - `/` or `s` to search by title, typo, or description
 - `Enter` to play or resume the selected movie
@@ -111,7 +111,7 @@ make tvos-build
 make macos-build
 ```
 
-Install signed development builds with `make ios-install` or `make tvos-install`. The apps use the server for catalog search, TMDB-powered Popular Now and Top Rated discovery rails, optional IMDb and Rotten Tomatoes scores from OMDb, Usenet-or-torrent playback preparation, and durable watch progress. Discovery excludes upcoming and theater-only titles by requiring an existing digital, physical, or TV release. See [`clients/apple/README.md`](clients/apple/README.md) for project generation, builds, device installation, metadata providers, and networking details.
+Install signed development builds with `make ios-install` or `make tvos-install`. The apps use the server for mixed movie/show catalog search, TMDB-powered Popular Now and Top Rated discovery rails, show and season metadata, optional IMDb and Rotten Tomatoes scores from OMDb, Usenet-or-torrent playback preparation, and durable episode-level watch progress. Movie discovery excludes upcoming and theater-only titles by requiring an existing digital, physical, or TV release. See [`clients/apple/README.md`](clients/apple/README.md) for project generation, builds, device installation, metadata providers, and networking details.
 
 ## Configuration
 
@@ -179,7 +179,7 @@ The optional configuration file is `~/.config/filmstream/config.json`:
 }
 ```
 
-Set `FILMSTREAM_CONFIG` to use another path or `FILMSTREAM_SERVER` to use an already-running backend. Set `OMDB_API_KEY` to enable the optional `GET /v1/catalog/ratings` endpoint. When a client opens movie details, the server resolves a supplied TMDB movie ID to its IMDb ID, queries OMDb, and caches successful results in memory. This avoids misses caused by localized or alternate titles, and the API key never leaves the server.
+Set `FILMSTREAM_CONFIG` to use another path or `FILMSTREAM_SERVER` to use an already-running backend. Set `OMDB_API_KEY` to enable the optional `GET /v1/catalog/ratings` endpoint. When a client opens media details, the server resolves a supplied TMDB movie or show ID to its IMDb ID, queries OMDb, and caches successful results in memory. This avoids misses caused by localized or alternate titles, and the API key never leaves the server.
 
 Temporary torrent data is stored beneath `<data_dir>/torrents`, and temporary native-player segments are stored beneath `<hls_dir>`. Filmstream owns and clears both locations on clean startup and shutdown; do not place unrelated files there. Durable watch progress and private selected-torrent metadata are stored separately beneath `<state_dir>` with owner-only permissions.
 
@@ -251,7 +251,7 @@ filmstream indexer test movies
 filmstream indexer remove movies
 ```
 
-Registration calls the Torznab `t=caps` endpoint and refuses endpoints that support neither basic nor movie searches. Each configured endpoint is searched concurrently. Filmstream identifies `application/x-nzb` enclosures as Usenet sources and normalizes standard Torznab fields such as protocol, size, seeders, peers, magnet/download URL, language, release group, and upload/download volume factors before ranking candidates.
+Registration calls the Torznab `t=caps` endpoint and refuses endpoints that support no compatible basic, movie, or TV search. Each configured endpoint is searched concurrently. Filmstream identifies `application/x-nzb` enclosures as Usenet sources and normalizes standard Torznab fields such as protocol, size, seeders, peers, magnet/download URL, language, release group, and upload/download volume factors before ranking candidates.
 
 Prowlarr exposes one Torznab URL per configured indexer, conventionally `http://HOST/INDEXER_ID/api`. Register each desired endpoint separately. Filmstream does not use Prowlarr's proprietary aggregate-search API.
 

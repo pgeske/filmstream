@@ -23,6 +23,8 @@ type Capabilities struct {
 	SearchAvailable      bool
 	MovieSearchAvailable bool
 	MovieSearchParams    map[string]bool
+	TVSearchAvailable    bool
+	TVSearchParams       map[string]bool
 }
 
 type Torznab struct {
@@ -95,6 +97,10 @@ func (t *Torznab) Capabilities(ctx context.Context) (Capabilities, error) {
 				Available       string `xml:"available,attr"`
 				SupportedParams string `xml:"supportedParams,attr"`
 			} `xml:"movie-search"`
+			TV struct {
+				Available       string `xml:"available,attr"`
+				SupportedParams string `xml:"supportedParams,attr"`
+			} `xml:"tv-search"`
 		} `xml:"searching"`
 	}
 	if err := xml.Unmarshal(body, &payload); err != nil {
@@ -104,9 +110,11 @@ func (t *Torznab) Capabilities(ctx context.Context) (Capabilities, error) {
 		SearchAvailable:      available(payload.Searching.Search.Available),
 		MovieSearchAvailable: available(payload.Searching.Movie.Available),
 		MovieSearchParams:    parameterSet(payload.Searching.Movie.SupportedParams),
+		TVSearchAvailable:    available(payload.Searching.TV.Available),
+		TVSearchParams:       parameterSet(payload.Searching.TV.SupportedParams),
 	}
-	if !capabilities.SearchAvailable && !capabilities.MovieSearchAvailable {
-		return Capabilities{}, fmt.Errorf("%s supports neither basic nor movie searches", t.name)
+	if !capabilities.SearchAvailable && !capabilities.MovieSearchAvailable && !capabilities.TVSearchAvailable {
+		return Capabilities{}, fmt.Errorf("%s supports no compatible searches", t.name)
 	}
 	t.capabilities = &capabilities
 	return capabilities, nil
@@ -119,6 +127,32 @@ func (t *Torznab) Search(ctx context.Context, request catalog.SearchRequest) ([]
 	}
 	basicParameters := map[string]string{
 		"t": "search", "q": torznabQuery(request.Query), "limit": "100",
+	}
+	if request.MediaType == "show" && request.SeasonNumber > 0 && request.EpisodeNumber > 0 {
+		episodeQuery := fmt.Sprintf("%s S%02dE%02d", torznabQuery(request.Query), request.SeasonNumber, request.EpisodeNumber)
+		fallbackParameters := map[string]string{"t": "search", "q": episodeQuery, "limit": "100"}
+		if !capabilities.TVSearchAvailable {
+			return t.search(ctx, fallbackParameters)
+		}
+		tvParameters := map[string]string{"t": "tvsearch", "q": torznabQuery(request.Query), "limit": "100"}
+		if capabilities.TVSearchParams["season"] {
+			tvParameters["season"] = strconv.Itoa(request.SeasonNumber)
+		}
+		if capabilities.TVSearchParams["ep"] {
+			tvParameters["ep"] = strconv.Itoa(request.EpisodeNumber)
+		}
+		tvCandidates, tvErr := t.search(ctx, tvParameters)
+		if tvErr == nil && len(tvCandidates) >= 20 {
+			return tvCandidates, nil
+		}
+		basicCandidates, basicErr := t.search(ctx, fallbackParameters)
+		if basicErr != nil {
+			if tvErr != nil {
+				return nil, errors.Join(tvErr, basicErr)
+			}
+			return tvCandidates, nil
+		}
+		return mergeCandidates(tvCandidates, basicCandidates), nil
 	}
 	if !capabilities.MovieSearchAvailable {
 		return t.search(ctx, basicParameters)

@@ -19,12 +19,19 @@ const resumeThresholdSeconds = 30
 type Entry struct {
 	ID              string    `json:"id"`
 	MediaID         string    `json:"media_id,omitempty"`
+	MediaType       string    `json:"media_type,omitempty"`
 	Title           string    `json:"title"`
 	Year            int       `json:"year,omitempty"`
 	Overview        string    `json:"overview,omitempty"`
 	PosterURL       string    `json:"poster_url,omitempty"`
 	BackdropURL     string    `json:"backdrop_url,omitempty"`
 	Genres          []string  `json:"genres,omitempty"`
+	NumberOfSeasons int       `json:"number_of_seasons,omitempty"`
+	SeriesID        string    `json:"series_id,omitempty"`
+	SeriesTitle     string    `json:"series_title,omitempty"`
+	SeasonNumber    int       `json:"season_number,omitempty"`
+	EpisodeNumber   int       `json:"episode_number,omitempty"`
+	EpisodeTitle    string    `json:"episode_title,omitempty"`
 	PositionSeconds float64   `json:"position_seconds"`
 	DurationSeconds float64   `json:"duration_seconds,omitempty"`
 	Completed       bool      `json:"completed"`
@@ -82,7 +89,7 @@ func (s *Store) Upsert(title string, year int) (Entry, error) {
 	if err != nil {
 		return Entry{}, err
 	}
-	id := entryID(title, year)
+	id := entryID("", title, year)
 	now := time.Now().UTC()
 	for i := range entries {
 		if entries[i].ID == id {
@@ -109,6 +116,10 @@ func (s *Store) RecordProgress(update Entry) (Entry, error) {
 		return Entry{}, errors.New("history title cannot be empty")
 	}
 	update.MediaID = strings.TrimSpace(update.MediaID)
+	update.MediaType = strings.TrimSpace(update.MediaType)
+	update.SeriesID = strings.TrimSpace(update.SeriesID)
+	update.SeriesTitle = strings.TrimSpace(update.SeriesTitle)
+	update.EpisodeTitle = strings.TrimSpace(update.EpisodeTitle)
 	update.Overview = strings.TrimSpace(update.Overview)
 	update.PosterURL = strings.TrimSpace(update.PosterURL)
 	update.BackdropURL = strings.TrimSpace(update.BackdropURL)
@@ -125,7 +136,7 @@ func (s *Store) RecordProgress(update Entry) (Entry, error) {
 	if err != nil {
 		return Entry{}, err
 	}
-	update.ID = entryID(update.Title, update.Year)
+	update.ID = entryID(update.MediaID, update.Title, update.Year)
 	update.UpdatedAt = time.Now().UTC()
 	for i := range entries {
 		if entries[i].ID != update.ID && (update.MediaID == "" || entries[i].MediaID != update.MediaID) {
@@ -134,6 +145,27 @@ func (s *Store) RecordProgress(update Entry) (Entry, error) {
 		update.ID = entries[i].ID
 		if update.MediaID == "" {
 			update.MediaID = entries[i].MediaID
+		}
+		if update.MediaType == "" {
+			update.MediaType = entries[i].MediaType
+		}
+		if update.SeriesID == "" {
+			update.SeriesID = entries[i].SeriesID
+		}
+		if update.SeriesTitle == "" {
+			update.SeriesTitle = entries[i].SeriesTitle
+		}
+		if update.SeasonNumber == 0 {
+			update.SeasonNumber = entries[i].SeasonNumber
+		}
+		if update.EpisodeNumber == 0 {
+			update.EpisodeNumber = entries[i].EpisodeNumber
+		}
+		if update.EpisodeTitle == "" {
+			update.EpisodeTitle = entries[i].EpisodeTitle
+		}
+		if update.NumberOfSeasons == 0 {
+			update.NumberOfSeasons = entries[i].NumberOfSeasons
 		}
 		if update.Overview == "" {
 			update.Overview = entries[i].Overview
@@ -178,6 +210,18 @@ func (s *Store) UpdateMetadata(id string, metadata Entry) (Entry, error) {
 		}
 		if value := strings.TrimSpace(metadata.MediaID); value != "" {
 			entries[i].MediaID = value
+		}
+		if value := strings.TrimSpace(metadata.MediaType); value != "" {
+			entries[i].MediaType = value
+		}
+		if value := strings.TrimSpace(metadata.SeriesID); value != "" {
+			entries[i].SeriesID = value
+		}
+		if value := strings.TrimSpace(metadata.SeriesTitle); value != "" {
+			entries[i].SeriesTitle = value
+		}
+		if metadata.NumberOfSeasons > 0 {
+			entries[i].NumberOfSeasons = metadata.NumberOfSeasons
 		}
 		if value := strings.TrimSpace(metadata.Overview); value != "" {
 			entries[i].Overview = value
@@ -279,6 +323,26 @@ func (s *Store) Remove(id string) error {
 	return nil
 }
 
+func (s *Store) RemoveSeries(seriesID string) error {
+	seriesID = strings.TrimSpace(seriesID)
+	if seriesID == "" {
+		return errors.New("series ID cannot be empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := s.read()
+	if err != nil {
+		return err
+	}
+	filtered := entries[:0]
+	for _, entry := range entries {
+		if entry.SeriesID != seriesID {
+			filtered = append(filtered, entry)
+		}
+	}
+	return s.write(filtered)
+}
+
 func (s *Store) read() ([]Entry, error) {
 	contents, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -304,7 +368,7 @@ func (s *Store) write(entries []Entry) error {
 	payload := struct {
 		Version int     `json:"version"`
 		Entries []Entry `json:"entries"`
-	}{Version: 1, Entries: entries}
+	}{Version: 2, Entries: entries}
 	contents, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return err
@@ -333,8 +397,11 @@ func (s *Store) write(entries []Entry) error {
 	return nil
 }
 
-func entryID(title string, year int) string {
-	normalized := strings.ToLower(strings.Join(strings.Fields(title), " "))
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s/%d", normalized, year)))
+func entryID(mediaID, title string, year int) string {
+	identity := strings.TrimSpace(mediaID)
+	if identity == "" {
+		identity = fmt.Sprintf("%s/%d", strings.ToLower(strings.Join(strings.Fields(title), " ")), year)
+	}
+	sum := sha256.Sum256([]byte(identity))
 	return hex.EncodeToString(sum[:8])
 }

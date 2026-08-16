@@ -208,12 +208,24 @@ func TestWaitForVideoRetriesUntilWebDAVMountIsPopulated(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer engine.Close()
-	video, err := engine.waitForVideo(t.Context(), mountInfo{category: "movies", folder: "Movie"})
+	video, err := engine.waitForVideo(t.Context(), mountInfo{category: "movies", folder: "Movie"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if video.name != "movie.mkv" || attempts < 2 {
 		t.Fatalf("video = %+v, attempts = %d", video, attempts)
+	}
+}
+
+func TestMatchingWebDAVVideosSelectsRequestedEpisode(t *testing.T) {
+	videos := []webDAVItem{
+		{name: "Show.Name.S01E01.mkv", size: 100},
+		{name: "Show.Name.1x02.mkv", size: 90},
+		{name: "Show.Name.S01E03.mkv", size: 110},
+	}
+	matching := matchingWebDAVVideos(videos, "S01E02")
+	if len(matching) != 1 || matching[0].name != "Show.Name.1x02.mkv" {
+		t.Fatalf("matching = %+v", matching)
 	}
 }
 

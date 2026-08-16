@@ -27,12 +27,19 @@ import (
 )
 
 type CreatePlaybackRequest struct {
-	MediaID     string              `json:"media_id,omitempty"`
-	Query       string              `json:"query,omitempty"`
-	Year        int                 `json:"year,omitempty"`
-	Preferences catalog.Preferences `json:"preferences,omitempty"`
-	MagnetURI   string              `json:"magnet_uri,omitempty"`
-	TorrentPath string              `json:"torrent_path,omitempty"`
+	MediaID       string              `json:"media_id,omitempty"`
+	MediaType     string              `json:"media_type,omitempty"`
+	Query         string              `json:"query,omitempty"`
+	OriginalTitle string              `json:"original_title,omitempty"`
+	Year          int                 `json:"year,omitempty"`
+	SeriesID      string              `json:"series_id,omitempty"`
+	SeriesTitle   string              `json:"series_title,omitempty"`
+	SeasonNumber  int                 `json:"season_number,omitempty"`
+	EpisodeNumber int                 `json:"episode_number,omitempty"`
+	EpisodeTitle  string              `json:"episode_title,omitempty"`
+	Preferences   catalog.Preferences `json:"preferences,omitempty"`
+	MagnetURI     string              `json:"magnet_uri,omitempty"`
+	TorrentPath   string              `json:"torrent_path,omitempty"`
 }
 
 const (
@@ -226,6 +233,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/resolve", s.resolveMovie)
 	mux.HandleFunc("GET /v1/catalog/search", s.searchCatalog)
 	mux.HandleFunc("GET /v1/catalog/discover", s.discoverCatalog)
+	mux.HandleFunc("GET /v1/catalog/shows/{id}", s.showDetails)
+	mux.HandleFunc("GET /v1/catalog/shows/{id}/seasons/{season}", s.showSeason)
 	mux.HandleFunc("GET /v1/catalog/ratings", s.catalogRatings)
 	mux.HandleFunc("GET /v1/watch-history", s.listWatchHistory)
 	mux.HandleFunc("PUT /v1/watch-history", s.updateWatchProgress)
@@ -307,7 +316,7 @@ func (s *Server) catalogRatings(w http.ResponseWriter, r *http.Request) {
 	if value := strings.TrimSpace(r.URL.Query().Get("year")); value != "" {
 		parsed, err := strconv.Atoi(value)
 		if err != nil || parsed < 1888 || parsed > 2100 {
-			writeError(w, http.StatusBadRequest, "year must be a valid movie release year")
+			writeError(w, http.StatusBadRequest, "year must be a valid release year")
 			return
 		}
 		year = parsed
@@ -318,7 +327,7 @@ func (s *Server) catalogRatings(w http.ResponseWriter, r *http.Request) {
 	movieMetadataProvider := s.metadataProvider
 	s.metadataMu.RUnlock()
 	if ratingsProvider == nil {
-		writeError(w, http.StatusServiceUnavailable, "external movie ratings are not configured")
+		writeError(w, http.StatusServiceUnavailable, "external media ratings are not configured")
 		return
 	}
 
@@ -362,8 +371,8 @@ func (s *Server) discoverCatalog(w http.ResponseWriter, r *http.Request) {
 		title    string
 		subtitle string
 	}{
-		{id: metadata.CollectionPopular, title: "Popular Now", subtitle: "Popular movies available for home viewing"},
-		{id: metadata.CollectionTopRated, title: "Top Rated", subtitle: "Audience favorites worth discovering"},
+		{id: metadata.CollectionPopular, title: "Popular Now", subtitle: "Movies and shows everyone is watching"},
+		{id: metadata.CollectionTopRated, title: "Top Rated", subtitle: "Acclaimed stories worth discovering"},
 	}
 	sections := make([]catalogSection, 0, len(collections))
 	var firstError error
@@ -395,6 +404,52 @@ func (s *Server) discoverCatalog(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, struct {
 		Sections []catalogSection `json:"sections"`
 	}{Sections: sections})
+}
+
+func (s *Server) showDetails(w http.ResponseWriter, r *http.Request) {
+	showID := strings.TrimSpace(r.PathValue("id"))
+	if showID == "" {
+		writeError(w, http.StatusBadRequest, "show ID cannot be empty")
+		return
+	}
+	s.metadataMu.RLock()
+	provider, ok := s.metadataProvider.(metadata.ShowProvider)
+	s.metadataMu.RUnlock()
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "show metadata is not configured")
+		return
+	}
+	show, err := provider.Show(r.Context(), showID)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Show    metadata.Movie           `json:"show"`
+		Seasons []metadata.SeasonSummary `json:"seasons"`
+	}{Show: show.Movie, Seasons: show.Seasons})
+}
+
+func (s *Server) showSeason(w http.ResponseWriter, r *http.Request) {
+	showID := strings.TrimSpace(r.PathValue("id"))
+	seasonNumber, err := strconv.Atoi(r.PathValue("season"))
+	if showID == "" || err != nil || seasonNumber <= 0 {
+		writeError(w, http.StatusBadRequest, "show ID and positive season number are required")
+		return
+	}
+	s.metadataMu.RLock()
+	provider, ok := s.metadataProvider.(metadata.ShowProvider)
+	s.metadataMu.RUnlock()
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "show metadata is not configured")
+		return
+	}
+	season, err := provider.Season(r.Context(), showID, seasonNumber)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, season)
 }
 
 func (s *Server) searchMovies(ctx context.Context, query string) ([]metadata.Movie, error) {
@@ -453,9 +508,10 @@ func (s *Server) searchMovies(ctx context.Context, query string) ([]metadata.Mov
 func fallbackMovie(title string, year int) metadata.Movie {
 	normalized := strings.ToLower(strings.Join(strings.Fields(title), "-"))
 	return metadata.Movie{
-		ID:    fmt.Sprintf("filmstream:%s:%d", normalized, year),
-		Title: strings.TrimSpace(title),
-		Year:  year,
+		ID:        fmt.Sprintf("filmstream:%s:%d", normalized, year),
+		MediaType: metadata.MediaTypeMovie,
+		Title:     strings.TrimSpace(title),
+		Year:      year,
 	}
 }
 
@@ -474,17 +530,105 @@ func (s *Server) listWatchHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	entries = s.enrichWatchHistory(r.Context(), entries)
 	if r.URL.Query().Get("continue") == "true" {
-		filtered := entries[:0]
-		for _, entry := range entries {
-			if entry.CanContinue() {
-				filtered = append(filtered, entry)
-			}
-		}
-		entries = filtered
+		entries = s.continueWatchHistory(r.Context(), entries)
 	}
 	writeJSON(w, http.StatusOK, struct {
 		Entries []history.Entry `json:"entries"`
 	}{Entries: entries})
+}
+
+func (s *Server) continueWatchHistory(ctx context.Context, entries []history.Entry) []history.Entry {
+	result := make([]history.Entry, 0, len(entries))
+	seenSeries := make(map[string]bool)
+	for _, entry := range entries {
+		if entry.SeriesID == "" {
+			if entry.CanContinue() {
+				result = append(result, entry)
+			}
+			continue
+		}
+		if seenSeries[entry.SeriesID] {
+			continue
+		}
+		seenSeries[entry.SeriesID] = true
+
+		seriesEntries := make([]history.Entry, 0)
+		for _, candidate := range entries {
+			if candidate.SeriesID == entry.SeriesID {
+				seriesEntries = append(seriesEntries, candidate)
+			}
+		}
+		if resumable := firstResumableEpisode(seriesEntries); resumable != nil {
+			result = append(result, *resumable)
+			continue
+		}
+		if next, ok := s.nextUnwatchedEpisode(ctx, entry, seriesEntries); ok {
+			result = append(result, next)
+		}
+	}
+	return result
+}
+
+func firstResumableEpisode(entries []history.Entry) *history.Entry {
+	for i := range entries {
+		if entries[i].CanContinue() {
+			return &entries[i]
+		}
+	}
+	return nil
+}
+
+func (s *Server) nextUnwatchedEpisode(
+	ctx context.Context,
+	latest history.Entry,
+	entries []history.Entry,
+) (history.Entry, bool) {
+	s.metadataMu.RLock()
+	provider, ok := s.metadataProvider.(metadata.ShowProvider)
+	s.metadataMu.RUnlock()
+	if !ok {
+		return history.Entry{}, false
+	}
+	show, err := provider.Show(ctx, latest.SeriesID)
+	if err != nil {
+		return history.Entry{}, false
+	}
+	completed := make(map[string]bool)
+	for _, entry := range entries {
+		if entry.Completed {
+			completed[entry.MediaID] = true
+		}
+	}
+	for _, summary := range show.Seasons {
+		season, err := provider.Season(ctx, show.ID, summary.Number)
+		if err != nil {
+			continue
+		}
+		for _, episode := range season.Episodes {
+			if completed[episode.ID] {
+				continue
+			}
+			return history.Entry{
+				ID:              latest.ID,
+				MediaID:         episode.ID,
+				MediaType:       string(metadata.MediaTypeShow),
+				Title:           show.Title,
+				Year:            show.Year,
+				Overview:        episode.Overview,
+				PosterURL:       show.PosterURL,
+				BackdropURL:     firstNonEmpty(episode.StillURL, show.BackdropURL),
+				Genres:          show.Genres,
+				NumberOfSeasons: show.NumberOfSeasons,
+				SeriesID:        show.ID,
+				SeriesTitle:     show.Title,
+				SeasonNumber:    episode.SeasonNumber,
+				EpisodeNumber:   episode.EpisodeNumber,
+				EpisodeTitle:    episode.Title,
+				UpdatedAt:       latest.UpdatedAt,
+			}, true
+		}
+	}
+	return history.Entry{}, false
 }
 
 func (s *Server) enrichWatchHistory(ctx context.Context, entries []history.Entry) []history.Entry {
@@ -495,10 +639,14 @@ func (s *Server) enrichWatchHistory(ctx context.Context, entries []history.Entry
 		return entries
 	}
 	for i, entry := range entries {
-		if strings.HasPrefix(entry.MediaID, "tmdb:") && len(entry.Genres) > 0 {
+		if (strings.HasPrefix(entry.MediaID, "tmdb:") || strings.HasPrefix(entry.SeriesID, "tmdb-tv:")) && len(entry.Genres) > 0 {
 			continue
 		}
-		movies, err := provider.Search(ctx, entry.Title)
+		searchTitle := entry.Title
+		if entry.SeriesTitle != "" {
+			searchTitle = entry.SeriesTitle
+		}
+		movies, err := provider.Search(ctx, searchTitle)
 		if err != nil {
 			if s.logger != nil {
 				s.logger.Warn("enrich watch history", "title", entry.Title, "error", err)
@@ -506,19 +654,27 @@ func (s *Server) enrichWatchHistory(ctx context.Context, entries []history.Entry
 			continue
 		}
 		for _, movie := range movies {
-			hasTMDBID := strings.HasPrefix(entry.MediaID, "tmdb:")
-			if hasTMDBID && movie.ID != entry.MediaID {
+			expectedID := entry.MediaID
+			if entry.SeriesID != "" {
+				expectedID = entry.SeriesID
+			}
+			hasTMDBID := strings.HasPrefix(expectedID, "tmdb:") || strings.HasPrefix(expectedID, "tmdb-tv:")
+			if hasTMDBID && movie.ID != expectedID {
 				continue
 			}
 			if !hasTMDBID && entry.Year > 0 && movie.Year > 0 && entry.Year != movie.Year {
 				continue
 			}
 			enriched, err := s.historyStore.UpdateMetadata(entry.ID, history.Entry{
-				MediaID:     movie.ID,
-				Overview:    movie.Overview,
-				PosterURL:   movie.PosterURL,
-				BackdropURL: movie.BackdropURL,
-				Genres:      movie.Genres,
+				MediaID:         firstNonEmpty(entry.MediaID, movie.ID),
+				MediaType:       string(movie.MediaType),
+				SeriesID:        entry.SeriesID,
+				SeriesTitle:     entry.SeriesTitle,
+				NumberOfSeasons: movie.NumberOfSeasons,
+				Overview:        movie.Overview,
+				PosterURL:       movie.PosterURL,
+				BackdropURL:     movie.BackdropURL,
+				Genres:          movie.Genres,
 			})
 			if err == nil {
 				entries[i] = enriched
@@ -541,7 +697,14 @@ func (s *Server) removeWatchHistory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "watch history ID cannot be empty")
 		return
 	}
-	if err := s.historyStore.Remove(id); err != nil {
+	seriesID := strings.TrimSpace(r.URL.Query().Get("series_id"))
+	var err error
+	if seriesID != "" {
+		err = s.historyStore.RemoveSeries(seriesID)
+	} else {
+		err = s.historyStore.Remove(id)
+	}
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -556,12 +719,19 @@ func (s *Server) updateWatchProgress(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 	var request struct {
 		MediaID         string   `json:"media_id,omitempty"`
+		MediaType       string   `json:"media_type,omitempty"`
 		Title           string   `json:"title"`
 		Year            int      `json:"year,omitempty"`
 		Overview        string   `json:"overview,omitempty"`
 		PosterURL       string   `json:"poster_url,omitempty"`
 		BackdropURL     string   `json:"backdrop_url,omitempty"`
 		Genres          []string `json:"genres,omitempty"`
+		NumberOfSeasons int      `json:"number_of_seasons,omitempty"`
+		SeriesID        string   `json:"series_id,omitempty"`
+		SeriesTitle     string   `json:"series_title,omitempty"`
+		SeasonNumber    int      `json:"season_number,omitempty"`
+		EpisodeNumber   int      `json:"episode_number,omitempty"`
+		EpisodeTitle    string   `json:"episode_title,omitempty"`
 		PositionSeconds float64  `json:"position_seconds"`
 		DurationSeconds float64  `json:"duration_seconds,omitempty"`
 	}
@@ -573,12 +743,19 @@ func (s *Server) updateWatchProgress(w http.ResponseWriter, r *http.Request) {
 	}
 	entry, err := s.historyStore.RecordProgress(history.Entry{
 		MediaID:         request.MediaID,
+		MediaType:       request.MediaType,
 		Title:           request.Title,
 		Year:            request.Year,
 		Overview:        request.Overview,
 		PosterURL:       request.PosterURL,
 		BackdropURL:     request.BackdropURL,
 		Genres:          request.Genres,
+		NumberOfSeasons: request.NumberOfSeasons,
+		SeriesID:        request.SeriesID,
+		SeriesTitle:     request.SeriesTitle,
+		SeasonNumber:    request.SeasonNumber,
+		EpisodeNumber:   request.EpisodeNumber,
+		EpisodeTitle:    request.EpisodeTitle,
 		PositionSeconds: request.PositionSeconds,
 		DurationSeconds: request.DurationSeconds,
 	})
@@ -623,7 +800,22 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	request.MediaID = strings.TrimSpace(request.MediaID)
+	request.MediaType = strings.TrimSpace(request.MediaType)
 	request.Query = strings.TrimSpace(request.Query)
+	request.OriginalTitle = strings.TrimSpace(request.OriginalTitle)
+	request.SeriesID = strings.TrimSpace(request.SeriesID)
+	request.SeriesTitle = strings.TrimSpace(request.SeriesTitle)
+	request.EpisodeTitle = strings.TrimSpace(request.EpisodeTitle)
+	if request.SeasonNumber > 0 || request.EpisodeNumber > 0 {
+		if request.SeasonNumber <= 0 || request.EpisodeNumber <= 0 || request.SeriesID == "" {
+			writeError(w, http.StatusBadRequest, "episode playback requires series_id, season_number, and episode_number")
+			return
+		}
+		request.MediaType = "show"
+		if request.Query == "" {
+			request.Query = request.SeriesTitle
+		}
+	}
 
 	preferences := mergePreferences(s.defaults, request.Preferences)
 	sourceCount := 0
@@ -644,7 +836,11 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 	var session *playbackSession
 	var selected *catalog.RankedCandidate
 	if request.Query != "" {
-		search := catalog.SearchRequest{Query: request.Query, Year: request.Year, Preferences: preferences}
+		search := catalog.SearchRequest{
+			Query: request.Query, Year: request.Year, MediaType: request.MediaType,
+			SeasonNumber: request.SeasonNumber, EpisodeNumber: request.EpisodeNumber,
+			Preferences: preferences,
+		}
 		allowUsenet := s.playbackSourceMode != config.PlaybackSourceTorrentOnly
 		allowTorrent := s.playbackSourceMode != config.PlaybackSourceUsenetOnly
 		var ranked []catalog.RankedCandidate
@@ -660,12 +856,13 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 			} else {
 				session, selected = s.createCachedUsenetPlayback(r.Context(), request, preferences)
 				if session == nil {
-					candidates, err := s.indexers.SearchFirstProtocol(r.Context(), search, catalog.ProtocolUsenet)
-					if err != nil {
-						searchErr = err
-					} else {
-						ranked = catalog.Rank(search, candidates)
-						session, selected, usenetErr = s.createRankedUsenetPlayback(r.Context(), ranked, preferences)
+					ranked, searchErr = s.searchAndRank(
+						r.Context(), search, request.OriginalTitle, catalog.ProtocolUsenet,
+					)
+					if searchErr == nil {
+						session, selected, usenetErr = s.createRankedUsenetPlayback(
+							r.Context(), ranked, preferences, playbackFileHint(request),
+						)
 						if session == nil {
 							ranked = nil
 						}
@@ -699,12 +896,7 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 		}
 		if session == nil {
 			if ranked == nil && searchErr == nil {
-				candidates, err := s.indexers.Search(r.Context(), search)
-				if err != nil {
-					searchErr = err
-				} else {
-					ranked = catalog.Rank(search, candidates)
-				}
+				ranked, searchErr = s.searchAndRank(r.Context(), search, request.OriginalTitle, "")
 			}
 			if searchErr != nil {
 				writeError(w, http.StatusBadGateway, searchErr.Error())
@@ -714,7 +906,9 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusNotFound, "no matching streaming candidates found")
 				return
 			}
-			torrentSession, torrentSelected, err := s.createRankedPlayback(r.Context(), ranked, preferences)
+			torrentSession, torrentSelected, err := s.createRankedPlayback(
+				r.Context(), ranked, preferences, playbackFileHint(request),
+			)
 			if err != nil {
 				if usenetErr != nil {
 					err = fmt.Errorf("Usenet candidates failed: %v; torrent fallback failed: %w", usenetErr, err)
@@ -731,6 +925,7 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 	} else {
 		torrentSession, err := s.engine.Create(r.Context(), torrentstream.Source{
 			MagnetURI: request.MagnetURI, TorrentPath: request.TorrentPath,
+			FileHint: playbackFileHint(request),
 		})
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
@@ -770,6 +965,43 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 		StreamURL: fmt.Sprintf("%s://%s/v1/playbacks/%s/stream", requestScheme(r), r.Host, session.ID),
 		Selected:  selected,
 	})
+}
+
+func (s *Server) searchAndRank(
+	ctx context.Context,
+	request catalog.SearchRequest,
+	originalTitle string,
+	protocol string,
+) ([]catalog.RankedCandidate, error) {
+	titles := []string{request.Query}
+	if originalTitle = strings.TrimSpace(originalTitle); originalTitle != "" && !strings.EqualFold(originalTitle, request.Query) {
+		titles = append(titles, originalTitle)
+	}
+	var failures []error
+	hadSuccessfulSearch := false
+	for _, title := range titles {
+		search := request
+		search.Query = title
+		var candidates []catalog.Candidate
+		var err error
+		if protocol == "" {
+			candidates, err = s.indexers.Search(ctx, search)
+		} else {
+			candidates, err = s.indexers.SearchFirstProtocol(ctx, search, protocol)
+		}
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		hadSuccessfulSearch = true
+		if ranked := catalog.Rank(search, candidates); len(ranked) > 0 {
+			return ranked, nil
+		}
+	}
+	if !hadSuccessfulSearch && len(failures) > 0 {
+		return nil, errors.Join(failures...)
+	}
+	return nil, nil
 }
 
 func wrapTorrentSession(session *torrentstream.Session) *playbackSession {
@@ -819,12 +1051,13 @@ func (s *Server) createCachedUsenetPlayback(
 	preparationContext, cancel := context.WithTimeout(ctx, maxUsenetPreparation)
 	defer cancel()
 	session, err := s.usenetEngine.Create(preparationContext, usenetstream.Source{
-		NZBPath: cached.NZBPath,
-		Name:    cached.Selected.Candidate.Name,
+		NZBPath:  cached.NZBPath,
+		Name:     cached.Selected.Candidate.Name,
+		FileHint: playbackFileHint(request),
 	})
 	if err != nil {
 		if ctx.Err() == nil {
-			s.markUsenetCandidateFailed(cached.Selected.Candidate)
+			s.markUsenetCandidateFailed(cached.Selected.Candidate, playbackFileHint(request))
 		}
 		if removeErr := s.playbackCache.RemoveUsenet(request.MediaID, request.Query, request.Year); removeErr != nil {
 			s.logger.Warn("remove unusable cached NZB", "title", request.Query, "error", removeErr)
@@ -846,7 +1079,7 @@ func (s *Server) createCachedUsenetPlayback(
 			return nil, nil
 		}
 	}
-	s.clearUsenetCandidateFailure(cached.Selected.Candidate)
+	s.clearUsenetCandidateFailure(cached.Selected.Candidate, playbackFileHint(request))
 	s.logger.Info("reused cached Usenet playback selection", "id", session.ID,
 		"name", cached.Selected.Candidate.Name)
 	selected := cached.Selected
@@ -869,7 +1102,9 @@ func (s *Server) createCachedPlayback(
 	if !found {
 		return nil, nil, nil
 	}
-	session, err := s.engine.Create(ctx, torrentstream.Source{TorrentPath: cached.TorrentPath})
+	session, err := s.engine.Create(ctx, torrentstream.Source{
+		TorrentPath: cached.TorrentPath, FileHint: playbackFileHint(request),
+	})
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
@@ -976,6 +1211,7 @@ func (s *Server) createRankedUsenetPlayback(
 	ctx context.Context,
 	ranked []catalog.RankedCandidate,
 	preferences catalog.Preferences,
+	fileHint string,
 ) (*playbackSession, *catalog.RankedCandidate, error) {
 	if s.usenetEngine == nil {
 		return nil, nil, nil
@@ -990,7 +1226,7 @@ func (s *Server) createRankedUsenetPlayback(
 		if candidate.Candidate.Protocol != catalog.ProtocolUsenet && candidate.Candidate.NZBURL == "" {
 			continue
 		}
-		if s.usenetCandidateRecentlyFailed(candidate.Candidate) {
+		if s.usenetCandidateRecentlyFailed(candidate.Candidate, fileHint) {
 			failures = append(failures, candidate.Candidate.Name+": recently failed validation")
 			continue
 		}
@@ -1002,10 +1238,10 @@ func (s *Server) createRankedUsenetPlayback(
 		if err == nil {
 			var session *usenetstream.Session
 			session, err = s.usenetEngine.Create(preparationContext, usenetstream.Source{
-				NZBURL: resolved.NZBURL, Name: candidate.Candidate.Name,
+				NZBURL: resolved.NZBURL, Name: candidate.Candidate.Name, FileHint: fileHint,
 			})
 			if err == nil {
-				s.clearUsenetCandidateFailure(candidate.Candidate)
+				s.clearUsenetCandidateFailure(candidate.Candidate, fileHint)
 				if !preferences.PreferTextSubtitles {
 					s.logger.Info("selected Usenet playback", "id", session.ID, "name", candidate.Candidate.Name)
 					return wrapUsenetSession(session), &candidate, nil
@@ -1044,7 +1280,7 @@ func (s *Server) createRankedUsenetPlayback(
 			}
 			return nil, nil, fmt.Errorf("Usenet preparation exceeded %s", maxUsenetPreparation)
 		}
-		s.markUsenetCandidateFailed(candidate.Candidate)
+		s.markUsenetCandidateFailed(candidate.Candidate, fileHint)
 		failures = append(failures, fmt.Sprintf("%s: %v", candidate.Candidate.Name, err))
 	}
 	if fallbackSession != nil {
@@ -1058,8 +1294,8 @@ func (s *Server) createRankedUsenetPlayback(
 	return nil, nil, nil
 }
 
-func (s *Server) usenetCandidateRecentlyFailed(candidate catalog.Candidate) bool {
-	key := usenetCandidateKey(candidate)
+func (s *Server) usenetCandidateRecentlyFailed(candidate catalog.Candidate, fileHint ...string) bool {
+	key := usenetCandidateKey(candidate, fileHint...)
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1071,21 +1307,21 @@ func (s *Server) usenetCandidateRecentlyFailed(candidate catalog.Candidate) bool
 	return found
 }
 
-func (s *Server) markUsenetCandidateFailed(candidate catalog.Candidate) {
+func (s *Server) markUsenetCandidateFailed(candidate catalog.Candidate, fileHint ...string) {
 	s.mu.Lock()
 	if s.usenetFailures == nil {
 		s.usenetFailures = make(map[string]time.Time)
 	}
-	s.usenetFailures[usenetCandidateKey(candidate)] = time.Now().Add(usenetFailureTTL)
+	s.usenetFailures[usenetCandidateKey(candidate, fileHint...)] = time.Now().Add(usenetFailureTTL)
 	failures := copyUsenetFailures(s.usenetFailures)
 	store := s.playbackCache
 	s.mu.Unlock()
 	s.persistUsenetFailures(store, failures)
 }
 
-func (s *Server) clearUsenetCandidateFailure(candidate catalog.Candidate) {
+func (s *Server) clearUsenetCandidateFailure(candidate catalog.Candidate, fileHint ...string) {
 	s.mu.Lock()
-	delete(s.usenetFailures, usenetCandidateKey(candidate))
+	delete(s.usenetFailures, usenetCandidateKey(candidate, fileHint...))
 	failures := copyUsenetFailures(s.usenetFailures)
 	store := s.playbackCache
 	s.mu.Unlock()
@@ -1109,17 +1345,22 @@ func copyUsenetFailures(failures map[string]time.Time) map[string]time.Time {
 	return result
 }
 
-func usenetCandidateKey(candidate catalog.Candidate) string {
+func usenetCandidateKey(candidate catalog.Candidate, fileHint ...string) string {
+	key := candidate.Indexer + ":" + candidate.Name
 	if candidate.ID != "" {
-		return candidate.Indexer + ":" + candidate.ID
+		key = candidate.Indexer + ":" + candidate.ID
 	}
-	return candidate.Indexer + ":" + candidate.Name
+	if len(fileHint) > 0 && fileHint[0] != "" {
+		key += ":" + strings.ToLower(fileHint[0])
+	}
+	return key
 }
 
 func (s *Server) createRankedPlayback(
 	ctx context.Context,
 	ranked []catalog.RankedCandidate,
 	preferences catalog.Preferences,
+	fileHint string,
 ) (*torrentstream.Session, *catalog.RankedCandidate, error) {
 	torrents := make([]catalog.RankedCandidate, 0, len(ranked))
 	for _, candidate := range ranked {
@@ -1151,7 +1392,7 @@ func (s *Server) createRankedPlayback(
 			continue
 		}
 		session, err := s.engine.Create(ctx, torrentstream.Source{
-			MagnetURI: resolved.MagnetURI, TorrentURL: resolved.TorrentURL,
+			MagnetURI: resolved.MagnetURI, TorrentURL: resolved.TorrentURL, FileHint: fileHint,
 		})
 		if err != nil {
 			if ctx.Err() != nil {
@@ -1504,6 +1745,22 @@ func (s *Server) serveHLSAsset(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	}
 	http.ServeFile(w, r, path)
+}
+
+func playbackFileHint(request CreatePlaybackRequest) string {
+	if request.SeasonNumber <= 0 || request.EpisodeNumber <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("S%02dE%02d", request.SeasonNumber, request.EpisodeNumber)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func mergePreferences(defaults, requested catalog.Preferences) catalog.Preferences {

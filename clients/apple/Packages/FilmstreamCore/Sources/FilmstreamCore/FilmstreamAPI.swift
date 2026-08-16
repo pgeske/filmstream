@@ -35,6 +35,60 @@ public struct FilmstreamAPI: Sendable {
         return response.sections
     }
 
+    public func seriesDetails(for showID: String) async throws -> SeriesDetails {
+        try await send(
+            url: baseURL
+                .appendingPathComponent("v1/catalog/shows")
+                .appendingPathComponent(showID)
+        )
+    }
+
+    public func season(_ number: Int, for showID: String) async throws -> ShowSeason {
+        try await send(
+            url: baseURL
+                .appendingPathComponent("v1/catalog/shows")
+                .appendingPathComponent(showID)
+                .appendingPathComponent("seasons")
+                .appendingPathComponent(String(number))
+        )
+    }
+
+    public func playbackSelection(
+        for details: SeriesDetails,
+        history: [WatchHistoryEntry]
+    ) async throws -> EpisodePlaybackSelection {
+        let showHistory = history
+            .filter { $0.seriesID == details.show.id }
+            .sorted { $0.updatedAt > $1.updatedAt }
+
+        if let resumable = showHistory.first(where: {
+            !$0.completed && $0.positionSeconds >= 30 && $0.seasonNumber != nil && $0.episodeNumber != nil
+        }),
+           let seasonNumber = resumable.seasonNumber,
+           let episodeNumber = resumable.episodeNumber {
+            let showSeason = try await season(seasonNumber, for: details.show.id)
+            if let episode = showSeason.episodes.first(where: { $0.episodeNumber == episodeNumber }) {
+                return EpisodePlaybackSelection(episode: episode, startSeconds: resumable.positionSeconds)
+            }
+        }
+
+        let completedIDs = Set(showHistory.filter(\.completed).compactMap(\.mediaID))
+        var firstEpisode: Episode?
+        for summary in details.seasons.sorted(by: { $0.number < $1.number }) {
+            let showSeason = try await season(summary.number, for: details.show.id)
+            if firstEpisode == nil {
+                firstEpisode = showSeason.episodes.first
+            }
+            if let episode = showSeason.episodes.first(where: { !completedIDs.contains($0.id) }) {
+                return EpisodePlaybackSelection(episode: episode, startSeconds: 0)
+            }
+        }
+        guard let firstEpisode else {
+            throw FilmstreamError.decoding("This show has no available episodes.")
+        }
+        return EpisodePlaybackSelection(episode: firstEpisode, startSeconds: 0)
+    }
+
     public func ratings(for movie: Movie) async throws -> MovieRatings {
         var components = URLComponents(
             url: baseURL.appendingPathComponent("v1/catalog/ratings"),
@@ -54,6 +108,11 @@ public struct FilmstreamAPI: Sendable {
         return try await send(url: url)
     }
 
+    public func watchHistory() async throws -> [WatchHistoryEntry] {
+        let response: HistoryResponse = try await send(path: "v1/watch-history")
+        return response.entries
+    }
+
     public func continueWatching() async throws -> [WatchHistoryEntry] {
         var components = URLComponents(
             url: baseURL.appendingPathComponent("v1/watch-history"),
@@ -68,11 +127,19 @@ public struct FilmstreamAPI: Sendable {
     }
 
     public func removeFromContinueWatching(_ entry: WatchHistoryEntry) async throws {
-        var request = URLRequest(
+        var components = URLComponents(
             url: baseURL
                 .appendingPathComponent("v1/watch-history")
-                .appendingPathComponent(entry.id)
+                .appendingPathComponent(entry.id),
+            resolvingAgainstBaseURL: false
         )
+        if let seriesID = entry.seriesID {
+            components?.queryItems = [URLQueryItem(name: "series_id", value: seriesID)]
+        }
+        guard let url = components?.url else {
+            throw FilmstreamError.invalidURL
+        }
+        var request = URLRequest(url: url)
         request.httpMethod = "DELETE"
         request.timeoutInterval = 15
         let _: HealthResponse = try await send(request)
@@ -84,8 +151,15 @@ public struct FilmstreamAPI: Sendable {
             method: "POST",
             body: CreatePlaybackRequest(
                 mediaID: movie.id,
-                query: movie.title,
+                mediaType: movie.mediaType,
+                query: movie.seriesTitle ?? movie.title,
+                originalTitle: movie.originalTitle,
                 year: movie.year,
+                seriesID: movie.seriesID,
+                seriesTitle: movie.seriesTitle,
+                seasonNumber: movie.seasonNumber,
+                episodeNumber: movie.episodeNumber,
+                episodeTitle: movie.episodeTitle,
                 preferences: .appleTV
             )
         )
@@ -255,13 +329,29 @@ private struct HistoryResponse: Decodable {
 
 private struct CreatePlaybackRequest: Encodable {
     let mediaID: String
+    let mediaType: MediaType?
     let query: String
+    let originalTitle: String?
     let year: Int?
+    let seriesID: String?
+    let seriesTitle: String?
+    let seasonNumber: Int?
+    let episodeNumber: Int?
+    let episodeTitle: String?
     let preferences: PlaybackPreferences
 
     private enum CodingKeys: String, CodingKey {
         case mediaID = "media_id"
-        case query, year, preferences
+        case mediaType = "media_type"
+        case query
+        case originalTitle = "original_title"
+        case year
+        case seriesID = "series_id"
+        case seriesTitle = "series_title"
+        case seasonNumber = "season_number"
+        case episodeNumber = "episode_number"
+        case episodeTitle = "episode_title"
+        case preferences
     }
 }
 

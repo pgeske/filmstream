@@ -19,6 +19,20 @@ import Testing
     #expect(section.items.first?.title == "Blade Runner 2049")
 }
 
+@Test func decodesMixedShowMetadataAndEpisodes() throws {
+    let showData = Data(#"{"show":{"id":"tmdb-tv:66732","media_type":"show","title":"Stranger Things","year":2016,"genres":["Drama"],"number_of_seasons":5},"seasons":[{"number":1,"name":"Season 1","episode_count":8}]}"#.utf8)
+    let details = try JSONDecoder().decode(SeriesDetails.self, from: showData)
+    #expect(details.show.isShow)
+    #expect(details.show.catalogMetadata == "Show • Drama • 2016 • 5 Seasons")
+    #expect(details.seasons.first?.episodeCount == 8)
+
+    let seasonData = Data(#"{"series_id":"tmdb-tv:66732","series_title":"Stranger Things","number":1,"name":"Season 1","episodes":[{"id":"tmdb-tv:66732:s1:e1","series_id":"tmdb-tv:66732","series_title":"Stranger Things","season_number":1,"episode_number":1,"title":"Chapter One","still_url":"https://image.tmdb.org/episode.jpg","runtime_minutes":49}]}"#.utf8)
+    let season = try JSONDecoder().decode(ShowSeason.self, from: seasonData)
+    let episode = try #require(season.episodes.first)
+    #expect(episode.label == "S1 E1")
+    #expect(episode.playbackMovie(in: details.show).seriesID == details.show.id)
+}
+
 @Test func decodesExternalMovieRatings() throws {
     let data = Data(#"{"imdb":8.7,"rotten_tomatoes":83,"content_rating":"R"}"#.utf8)
     let ratings = try JSONDecoder().decode(MovieRatings.self, from: data)
@@ -54,6 +68,15 @@ import Testing
         SubtitleCue(startSeconds: 121.25, endSeconds: 123.5, text: "Wake up, Neo."),
         SubtitleCue(startSeconds: 124, endSeconds: 126, text: "The Matrix has you.")
     ])
+}
+
+@Test func decodesEpisodeContinueWatchingAsShow() throws {
+    let data = Data(#"{"id":"entry-show","media_id":"tmdb-tv:66732:s1:e2","media_type":"show","title":"Stranger Things","year":2016,"number_of_seasons":5,"series_id":"tmdb-tv:66732","series_title":"Stranger Things","season_number":1,"episode_number":2,"episode_title":"Chapter Two","position_seconds":600,"duration_seconds":1800,"completed":false,"updated_at":"2026-08-10T00:00:00Z"}"#.utf8)
+    let entry = try JSONDecoder().decode(WatchHistoryEntry.self, from: data)
+    #expect(entry.episodeLabel == "S1 E2")
+    #expect(entry.movie.id == "tmdb-tv:66732")
+    #expect(entry.movie.isShow)
+    #expect(entry.movie.episodeLabel == "S1 E2")
 }
 
 @Test func computesContinueWatchingProgress() throws {
