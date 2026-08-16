@@ -261,20 +261,20 @@ struct MacMovieCard: View {
                     .lineLimit(1)
                     .frame(width: width, alignment: .leading)
 
-                HStack(spacing: 6) {
-                    Text(movie.catalogMetadata)
-                        .lineLimit(1)
+                Text(movie.catalogMetadata)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.macTeaMuted)
+                    .lineLimit(2)
+
+                HStack(spacing: 7) {
                     if let episodeLabel = movie.episodeLabel {
-                        Text("•")
                         Text(episodeLabel)
                             .foregroundStyle(Color.macTeaAccentLight)
                     }
                     if let contentRating {
-                        Text("•")
                         Text(contentRating)
                     }
                     if let progress, progress > 0 {
-                        Text("•")
                         Text("\(Int(progress * 100))% watched")
                             .foregroundStyle(Color.macTeaAccentLight)
                     }

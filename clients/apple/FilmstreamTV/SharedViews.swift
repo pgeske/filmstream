@@ -510,24 +510,25 @@ private struct NetflixShelfCard: View {
                             .foregroundStyle(Color.teaCream)
                             .lineLimit(2)
 
+                        Text(item.movie.catalogMetadata)
+                            .font(.system(size: 23, weight: .semibold))
+                            .foregroundStyle(Color.teaMuted)
+                            .lineLimit(2)
+
                         HStack(spacing: 7) {
-                            Text(item.movie.catalogMetadata)
                             if let episodeLabel = item.movie.episodeLabel {
-                                Text("•")
                                 Text(episodeLabel)
                                     .foregroundStyle(Color.teaAccentLight)
                             }
                             if let contentRating = item.contentRating {
-                                Text("•")
                                 Text(contentRating)
                             }
                             if let progress = item.progress, progress > 0 {
-                                Text("•")
                                 Text("\(Int(progress * 100))% watched")
                                     .foregroundStyle(Color.teaAccentLight)
                             }
                         }
-                        .font(.system(size: 23, weight: .semibold))
+                        .font(.system(size: 20, weight: .semibold))
                         .foregroundStyle(Color.teaMuted)
 
                         if let overview = item.movie.overview, !overview.isEmpty {
@@ -720,8 +721,8 @@ struct MovieNavigationCard: View {
                     .lineLimit(1)
                 Text(movie.catalogMetadata)
                     .font(.subheadline)
-                    .lineLimit(1)
-                .foregroundStyle(Color.teaMuted)
+                    .lineLimit(2)
+                    .foregroundStyle(Color.teaMuted)
             }
             .frame(width: cardWidth, alignment: .leading)
         }
