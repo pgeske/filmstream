@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import FilmstreamCore
 
-@Test func prewarmerReusesParkedPlayback() async throws {
+@Test func prewarmerReusesAndRebuildsParkedPlayback() async throws {
     let recorder = RequestRecorder()
     MockURLProtocol.handler = { request in
         recorder.response(for: request)
@@ -33,6 +33,16 @@ import Testing
     #expect(recorder.hlsStartCount == 2)
     #expect(recorder.parkCount == 1)
     #expect(recorder.stopCount == 0)
+
+    // A fresh Continue Watching load after a quick exit must warm the same
+    // resume point again, even when progress changed by less than a second.
+    await prewarmer.synchronize(with: [entry], using: api)
+    for _ in 0..<100 where recorder.parkCount < 2 {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(recorder.createCount == 2)
+    #expect(recorder.hlsStartCount == 3)
+    #expect(recorder.parkCount == 2)
 }
 
 private final class RequestRecorder: @unchecked Sendable {

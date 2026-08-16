@@ -35,12 +35,9 @@ public actor PlaybackPrewarmer {
         }
         desired = Dictionary(targets.map { ($0.movie.id, $0) }, uniquingKeysWith: { first, _ in first })
 
-        for (mediaID, position) in suppressed {
-            guard let target = desired[mediaID], matches(position, target.startSeconds) else {
-                suppressed.removeValue(forKey: mediaID)
-                continue
-            }
-        }
+        // Synchronization follows a fresh Home/history load, so a playback claimed
+        // during the previous snapshot no longer owns its old resume position.
+        suppressed.removeAll()
 
         for (mediaID, cached) in warmed {
             guard let target = desired[mediaID], matches(cached.target, target) else {
