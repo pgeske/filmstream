@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"github.com/pgeske/filmstream/internal/hls"
 	"github.com/pgeske/filmstream/internal/indexer"
 	"github.com/pgeske/filmstream/internal/metadata"
+	"github.com/pgeske/filmstream/internal/playbackcache"
 	"github.com/pgeske/filmstream/internal/resolver"
 	"github.com/pgeske/filmstream/internal/torrentstream"
 	"github.com/pgeske/filmstream/internal/usenetstream"
@@ -38,8 +40,10 @@ type fakeRatings struct{}
 
 type fakeUsenetPlaybackEngine struct {
 	createdSource usenetstream.Source
+	created       []usenetstream.Source
 	createErr     error
 	session       *usenetstream.Session
+	nzb           []byte
 	cleanup       func(string, string)
 }
 
@@ -49,6 +53,7 @@ func (f *fakeUsenetPlaybackEngine) SetCleanupHandler(handler func(string, string
 
 func (f *fakeUsenetPlaybackEngine) Create(_ context.Context, source usenetstream.Source) (*usenetstream.Session, error) {
 	f.createdSource = source
+	f.created = append(f.created, source)
 	if f.createErr != nil {
 		return nil, f.createErr
 	}
@@ -57,6 +62,13 @@ func (f *fakeUsenetPlaybackEngine) Create(_ context.Context, source usenetstream
 
 func (f *fakeUsenetPlaybackEngine) Get(id string) (*usenetstream.Session, bool) {
 	return f.session, f.session != nil && f.session.ID == id
+}
+
+func (f *fakeUsenetPlaybackEngine) NZB(id string) ([]byte, error) {
+	if f.session == nil || f.session.ID != id {
+		return nil, errors.New("playback not found")
+	}
+	return append([]byte(nil), f.nzb...), nil
 }
 
 func (f *fakeUsenetPlaybackEngine) Status(id string) (usenetstream.Status, bool) {
@@ -219,6 +231,121 @@ func TestCreatePlaybackPrefersUsenetCandidate(t *testing.T) {
 	}
 	if got := server.playbackLanguages[payload.ID]; !slices.Equal(got, []string{"en", "english"}) {
 		t.Fatalf("playback languages = %v", got)
+	}
+}
+
+func TestCreatePlaybackReusesCachedUsenetReleaseWithoutSearching(t *testing.T) {
+	var searches atomic.Int32
+	var indexerServer *httptest.Server
+	indexerServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("apikey") != "secret" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Query().Get("t") {
+		case "caps":
+			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><movie-search available="yes" supportedParams="q,year"/></searching></caps>`)
+		case "movie", "search":
+			searches.Add(1)
+			fmt.Fprintf(w, `<?xml version="1.0"?><rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel><item><title>Sintel.2010.1080p.WEB.H264-GROUP</title><guid>release-1</guid><enclosure url="%s/download/1" length="607836000" type="application/x-nzb"/></item></channel></rss>`, indexerServer.URL)
+		default:
+			http.Error(w, "unsupported", http.StatusBadRequest)
+		}
+	}))
+	defer indexerServer.Close()
+	registry, err := indexer.NewRegistry([]config.Indexer{{
+		Name: "usenet", Type: "torznab", Endpoint: indexerServer.URL + "/api", APIKey: "secret",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	torrentEngine, err := torrentstream.New(torrentstream.Config{
+		DataDir: t.TempDir(), MetadataTimeout: time.Second, CleanOnClose: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer torrentEngine.Close()
+	server := New(registry, torrentEngine, catalog.Preferences{}, slog.Default())
+	fakeUsenet := &fakeUsenetPlaybackEngine{
+		session: &usenetstream.Session{ID: "usenet-playback", Name: "Sintel", FileName: "Sintel.mkv", FileSize: 607836000},
+		nzb:     []byte(`<?xml version="1.0"?><nzb/>`),
+	}
+	server.usenetEngine = fakeUsenet
+	server.playbackSourceMode = config.PlaybackSourceUsenetOnly
+	server.hlsManager = &fakeHLSManager{}
+	store := playbackcache.New(t.TempDir())
+	server.SetPlaybackCache(store)
+
+	create := func() CreatePlaybackResponse {
+		request := httptest.NewRequest(http.MethodPost, "/v1/playbacks", strings.NewReader(
+			`{"media_id":"tmdb:1","query":"Sintel","year":2010}`,
+		))
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusCreated {
+			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+		}
+		var payload CreatePlaybackResponse
+		if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload
+	}
+
+	first := create()
+	searchesAfterFirst := searches.Load()
+	if searchesAfterFirst == 0 || fakeUsenet.createdSource.NZBURL == "" {
+		t.Fatalf("initial searches = %d, source = %+v", searchesAfterFirst, fakeUsenet.createdSource)
+	}
+	hlsRequest := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/playbacks/"+first.ID+"/hls",
+		strings.NewReader(`{}`),
+	)
+	hlsResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(hlsResponse, hlsRequest)
+	if hlsResponse.Code != http.StatusCreated {
+		t.Fatalf("HLS status = %d, body = %s", hlsResponse.Code, hlsResponse.Body.String())
+	}
+	if _, found, err := store.LookupUsenet("tmdb:1", "Sintel", 2010); err != nil || !found {
+		t.Fatalf("cached Usenet playback found = %v, error = %v", found, err)
+	}
+
+	create()
+	if searches.Load() != searchesAfterFirst {
+		t.Fatalf("search count after cached playback = %d, want %d", searches.Load(), searchesAfterFirst)
+	}
+	if fakeUsenet.createdSource.NZBPath == "" || fakeUsenet.createdSource.NZBURL != "" {
+		t.Fatalf("cached source = %+v", fakeUsenet.createdSource)
+	}
+}
+
+func TestUnavailableCachedUsenetReleaseIsRemoved(t *testing.T) {
+	store := playbackcache.New(t.TempDir())
+	candidate := catalog.RankedCandidate{Candidate: catalog.Candidate{
+		ID: "release-1", Indexer: "usenet", Name: "Movie.1080p", Protocol: catalog.ProtocolUsenet,
+	}}
+	if _, err := store.SaveUsenet("tmdb:1", "Movie", 2001, candidate, []byte("nzb")); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{
+		usenetEngine:   &fakeUsenetPlaybackEngine{createErr: errors.New("articles unavailable")},
+		playbackCache:  store,
+		usenetFailures: make(map[string]time.Time),
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	session, selected := server.createCachedUsenetPlayback(t.Context(), CreatePlaybackRequest{
+		MediaID: "tmdb:1", Query: "Movie", Year: 2001,
+	}, catalog.Preferences{})
+	if session != nil || selected != nil {
+		t.Fatalf("session = %+v, selected = %+v", session, selected)
+	}
+	if _, found, err := store.LookupUsenet("tmdb:1", "Movie", 2001); err != nil || found {
+		t.Fatalf("cached Usenet playback found = %v, error = %v", found, err)
+	}
+	if !server.usenetCandidateRecentlyFailed(candidate.Candidate) {
+		t.Fatal("unavailable cached candidate was not temporarily skipped")
 	}
 }
 

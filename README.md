@@ -50,7 +50,7 @@ The home screen separates resumable movies from watch history. Use:
 - `d` to remove it from tracking
 - `q` to quit
 
-Filmstream records MPV position through its local IPC socket. Continue Watching starts after 30 seconds, and a movie is marked watched at 90%. History is stored privately in `~/.local/state/filmstream/history.json`; downloaded media remains temporary and is not needed to remember progress. The server privately caches the selected torrent metadata so a later resume can reuse the known-good release without searching indexers again. If that cached swarm is no longer available, Filmstream falls back to a fresh ranked search.
+Filmstream records MPV position through its local IPC socket. Continue Watching starts after 30 seconds, and a movie is marked watched at 90%. History is stored privately in `~/.local/state/filmstream/history.json`; downloaded media remains temporary and is not needed to remember progress. The server privately caches successful torrent metadata and NZBs so later playback can reuse the known-good release without searching indexers again. If a cached source is no longer available, Filmstream removes it and falls back to a fresh ranked search.
 
 The direct CLI searches configured indexers, selects a release, starts the local server if necessary, and opens MPV:
 
@@ -189,7 +189,7 @@ Filmstream delegates NNTP article retrieval, yEnc decoding, archive mapping, and
 
 `playback_source_mode` controls automatic query playback. `hybrid` strongly prefers compatible Usenet releases and falls back to cached or newly ranked torrents. `usenet_only` tries only NZBs and deliberately bypasses cached torrent selections, including when resuming Continue Watching. `torrent_only` skips Usenet and retains the existing cached-torrent and live-swarm path. Explicit `--magnet` and `--torrent` inputs remain direct overrides.
 
-Filmstream tries ranked NZBs within one 30-second preparation budget, up to ten candidates when failures are detected quickly. Missing articles, invalid archives, unsupported files, and provider failures move to the next NZB; only `hybrid` continues to torrent fallback afterward.
+After HLS starts successfully, Filmstream stores the selected NZB and sanitized release metadata privately under `state_dir`. Later playback tries that NZB before contacting an indexer. Missing articles, invalid archives, unsupported files, or changed subtitle requirements invalidate the cached release and resume the normal ranked search. Filmstream otherwise tries ranked NZBs within one 30-second preparation budget, up to ten candidates when failures are detected quickly; only `hybrid` continues to torrent fallback afterward.
 
 Usenet credentials belong only in InfiniDysk or an orchestrator secret. Filmstream stores only a private InfiniDysk API key and WebDAV credential; it never receives NNTP usernames or passwords. Idle Usenet sessions and their virtual mounts are removed automatically after `idle_grace_seconds`, and closing Filmstream removes any remaining managed sessions.
 

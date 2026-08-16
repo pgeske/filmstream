@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -108,12 +110,21 @@ func TestCreateAndServeRange(t *testing.T) {
 	}
 	defer engine.Close()
 
-	session, err := engine.Create(context.Background(), Source{NZBURL: server.URL + "/release.nzb", Name: "Test Release"})
+	nzb := []byte(`<?xml version="1.0"?><nzb/>`)
+	nzbPath := filepath.Join(t.TempDir(), "release.nzb")
+	if err := os.WriteFile(nzbPath, nzb, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session, err := engine.Create(context.Background(), Source{NZBPath: nzbPath, Name: "Test Release"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if session.FileName != "movie.mkv" || session.FileSize != int64(len(media)) {
 		t.Fatalf("session = %+v", session)
+	}
+	cachedNZB, err := engine.NZB(session.ID)
+	if err != nil || string(cachedNZB) != string(nzb) {
+		t.Fatalf("cached NZB = %q, error = %v", cachedNZB, err)
 	}
 
 	request := httptest.NewRequest(http.MethodGet, "/stream", nil)

@@ -25,9 +25,21 @@ type Entry struct {
 	TorrentPath string                  `json:"-"`
 }
 
+type UsenetEntry struct {
+	ID        string                  `json:"id"`
+	MediaID   string                  `json:"media_id,omitempty"`
+	Title     string                  `json:"title"`
+	Year      int                     `json:"year,omitempty"`
+	Selected  catalog.RankedCandidate `json:"selected"`
+	UpdatedAt time.Time               `json:"updated_at"`
+	NZBPath   string                  `json:"-"`
+}
+
 type Store struct {
 	path               string
 	torrentDir         string
+	usenetPath         string
+	usenetDir          string
 	usenetFailuresPath string
 	mu                 sync.Mutex
 }
@@ -36,6 +48,8 @@ func New(stateDir string) *Store {
 	return &Store{
 		path:               filepath.Join(stateDir, "playback-cache.json"),
 		torrentDir:         filepath.Join(stateDir, "playback-cache"),
+		usenetPath:         filepath.Join(stateDir, "usenet-playback-cache.json"),
+		usenetDir:          filepath.Join(stateDir, "playback-cache"),
 		usenetFailuresPath: filepath.Join(stateDir, "usenet-failures.json"),
 	}
 }
@@ -170,6 +184,137 @@ func (s *Store) Save(
 	return entry, nil
 }
 
+func (s *Store) LookupUsenet(mediaID, title string, year int) (UsenetEntry, bool, error) {
+	mediaID = strings.TrimSpace(mediaID)
+	title = strings.TrimSpace(title)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := s.readUsenet()
+	if err != nil {
+		return UsenetEntry{}, false, err
+	}
+	index := -1
+	if mediaID != "" {
+		for i := range entries {
+			if entries[i].MediaID == mediaID {
+				index = i
+				break
+			}
+		}
+	}
+	if index < 0 {
+		for i := range entries {
+			if entries[i].Year == year && strings.EqualFold(entries[i].Title, title) {
+				index = i
+				break
+			}
+		}
+	}
+	if index < 0 {
+		return UsenetEntry{}, false, nil
+	}
+	entry := entries[index]
+	if !validID(entry.ID) {
+		return UsenetEntry{}, false, fmt.Errorf("Usenet playback cache contains invalid entry ID %q", entry.ID)
+	}
+	entry.NZBPath = filepath.Join(s.usenetDir, entry.ID+".nzb")
+	if _, err := os.Stat(entry.NZBPath); errors.Is(err, os.ErrNotExist) {
+		return UsenetEntry{}, false, nil
+	} else if err != nil {
+		return UsenetEntry{}, false, fmt.Errorf("inspect cached NZB: %w", err)
+	}
+	return entry, true, nil
+}
+
+func (s *Store) RemoveUsenet(mediaID, title string, year int) error {
+	mediaID = strings.TrimSpace(mediaID)
+	title = strings.TrimSpace(title)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := s.readUsenet()
+	if err != nil {
+		return err
+	}
+	for i := range entries {
+		matchingMediaID := mediaID != "" && entries[i].MediaID == mediaID
+		matchingTitle := entries[i].Year == year && strings.EqualFold(entries[i].Title, title)
+		if !matchingMediaID && !matchingTitle {
+			continue
+		}
+		if validID(entries[i].ID) {
+			path := filepath.Join(s.usenetDir, entries[i].ID+".nzb")
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove cached NZB: %w", err)
+			}
+		}
+		entries = append(entries[:i], entries[i+1:]...)
+		return s.writeUsenet(entries)
+	}
+	return nil
+}
+
+func (s *Store) SaveUsenet(
+	mediaID, title string,
+	year int,
+	selected catalog.RankedCandidate,
+	nzb []byte,
+) (UsenetEntry, error) {
+	mediaID = strings.TrimSpace(mediaID)
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return UsenetEntry{}, errors.New("cached Usenet playback title cannot be empty")
+	}
+	if len(nzb) == 0 {
+		return UsenetEntry{}, errors.New("cached NZB cannot be empty")
+	}
+	selected.Candidate.MagnetURI = ""
+	selected.Candidate.TorrentURL = ""
+	selected.Candidate.NZBURL = ""
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := s.readUsenet()
+	if err != nil {
+		return UsenetEntry{}, err
+	}
+	id := cacheID(title, year)
+	index := -1
+	for i := range entries {
+		matchingMediaID := mediaID != "" && entries[i].MediaID == mediaID
+		matchingTitle := entries[i].Year == year && strings.EqualFold(entries[i].Title, title)
+		if matchingMediaID || matchingTitle {
+			id = entries[i].ID
+			index = i
+			break
+		}
+	}
+	if !validID(id) {
+		return UsenetEntry{}, fmt.Errorf("invalid Usenet playback cache ID %q", id)
+	}
+	if err := os.MkdirAll(s.usenetDir, 0o700); err != nil {
+		return UsenetEntry{}, fmt.Errorf("create Usenet playback cache directory: %w", err)
+	}
+	nzbPath := filepath.Join(s.usenetDir, id+".nzb")
+	if err := writePrivateFile(nzbPath, nzb); err != nil {
+		return UsenetEntry{}, fmt.Errorf("write cached NZB: %w", err)
+	}
+	entry := UsenetEntry{
+		ID: id, MediaID: mediaID, Title: title, Year: year,
+		Selected: selected, UpdatedAt: time.Now().UTC(), NZBPath: nzbPath,
+	}
+	if index >= 0 {
+		entries[index] = entry
+	} else {
+		entries = append(entries, entry)
+	}
+	if err := s.writeUsenet(entries); err != nil {
+		return UsenetEntry{}, err
+	}
+	return entry, nil
+}
+
 func (s *Store) LoadUsenetFailures() (map[string]time.Time, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -266,6 +411,43 @@ func (s *Store) write(entries []Entry) error {
 	contents = append(contents, '\n')
 	if err := writePrivateFile(s.path, contents); err != nil {
 		return fmt.Errorf("replace playback cache: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) readUsenet() ([]UsenetEntry, error) {
+	contents, err := os.ReadFile(s.usenetPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read Usenet playback cache: %w", err)
+	}
+	var payload struct {
+		Version int           `json:"version"`
+		Entries []UsenetEntry `json:"entries"`
+	}
+	if err := json.Unmarshal(contents, &payload); err != nil {
+		return nil, fmt.Errorf("parse Usenet playback cache: %w", err)
+	}
+	return payload.Entries, nil
+}
+
+func (s *Store) writeUsenet(entries []UsenetEntry) error {
+	if err := os.MkdirAll(filepath.Dir(s.usenetPath), 0o700); err != nil {
+		return fmt.Errorf("create state directory: %w", err)
+	}
+	payload := struct {
+		Version int           `json:"version"`
+		Entries []UsenetEntry `json:"entries"`
+	}{Version: 1, Entries: entries}
+	contents, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	contents = append(contents, '\n')
+	if err := writePrivateFile(s.usenetPath, contents); err != nil {
+		return fmt.Errorf("replace Usenet playback cache: %w", err)
 	}
 	return nil
 }

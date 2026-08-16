@@ -52,8 +52,9 @@ type Config struct {
 }
 
 type Source struct {
-	NZBURL string
-	Name   string
+	NZBURL  string
+	NZBPath string
+	Name    string
 }
 
 type Engine struct {
@@ -89,6 +90,7 @@ type Session struct {
 
 	nzoID         string
 	upstreamURL   string
+	nzb           []byte
 	activeStreams int
 	lastActivity  time.Time
 	bytesRead     int64
@@ -209,13 +211,21 @@ func (e *Engine) SetCleanupHandler(handler func(string, string)) {
 
 func (e *Engine) Create(parent context.Context, source Source) (*Session, error) {
 	startedAt := time.Now()
-	if strings.TrimSpace(source.NZBURL) == "" {
-		return nil, errors.New("NZB URL cannot be empty")
+	hasURL := strings.TrimSpace(source.NZBURL) != ""
+	hasPath := strings.TrimSpace(source.NZBPath) != ""
+	if hasURL == hasPath {
+		return nil, errors.New("provide exactly one NZB URL or cached NZB path")
 	}
 	ctx, cancel := context.WithTimeout(parent, e.startupTimeout)
 	defer cancel()
 
-	nzb, err := e.downloadNZB(ctx, source.NZBURL)
+	var nzb []byte
+	var err error
+	if hasPath {
+		nzb, err = readNZBFile(source.NZBPath)
+	} else {
+		nzb, err = e.downloadNZB(ctx, source.NZBURL)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -254,7 +264,7 @@ func (e *Engine) Create(parent context.Context, source Source) (*Session, error)
 	session := &Session{
 		ID: id, Name: strings.TrimSuffix(name, filepath.Ext(name)),
 		FileName: video.name, FileSize: video.size, CreatedAt: now,
-		nzoID: nzoID, upstreamURL: video.url, lastActivity: now,
+		nzoID: nzoID, upstreamURL: video.url, nzb: append([]byte(nil), nzb...), lastActivity: now,
 	}
 	e.mu.Lock()
 	e.sessions[id] = session
@@ -272,6 +282,16 @@ func (e *Engine) Get(id string) (*Session, bool) {
 	defer e.mu.RUnlock()
 	session, ok := e.sessions[id]
 	return session, ok
+}
+
+func (e *Engine) NZB(id string) ([]byte, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	session, ok := e.sessions[id]
+	if !ok {
+		return nil, errors.New("playback not found")
+	}
+	return append([]byte(nil), session.nzb...), nil
 }
 
 func (e *Engine) Status(id string) (Status, bool) {
@@ -439,6 +459,25 @@ func (e *Engine) cleanup(now time.Time) {
 			handler(session.ID, "idle")
 		}
 	}
+}
+
+func readNZBFile(fileName string) ([]byte, error) {
+	file, err := os.Open(fileName)
+	if err != nil {
+		return nil, fmt.Errorf("open cached NZB: %w", err)
+	}
+	defer file.Close()
+	contents, err := io.ReadAll(io.LimitReader(file, maxNZBBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read cached NZB: %w", err)
+	}
+	if len(contents) == 0 {
+		return nil, errors.New("cached NZB is empty")
+	}
+	if len(contents) > maxNZBBytes {
+		return nil, errors.New("cached NZB exceeds 32 MiB")
+	}
+	return contents, nil
 }
 
 func (e *Engine) downloadNZB(ctx context.Context, rawURL string) ([]byte, error) {

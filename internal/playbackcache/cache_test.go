@@ -59,6 +59,59 @@ func TestSaveAndLookupCachedPlayback(t *testing.T) {
 	}
 }
 
+func TestSaveAndLookupCachedUsenetPlayback(t *testing.T) {
+	store := New(t.TempDir())
+	selected := catalog.RankedCandidate{
+		Candidate: catalog.Candidate{
+			ID:       "release-1",
+			Indexer:  "usenet",
+			Name:     "The Movie 2001 1080p x264",
+			Protocol: catalog.ProtocolUsenet,
+			NZBURL:   "https://indexer.example/download?apikey=secret",
+		},
+		Score: 1200,
+	}
+	nzb := []byte(`<?xml version="1.0"?><nzb/>`)
+	entry, err := store.SaveUsenet("tmdb:1", "The Movie", 2001, selected, nzb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.Selected.Candidate.NZBURL != "" {
+		t.Fatal("cached Usenet selection retained a private source URL")
+	}
+	for _, path := range []string{store.usenetPath, entry.NZBPath} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("%s mode = %o, want 600", path, got)
+		}
+	}
+
+	cached, ok, err := store.LookupUsenet("tmdb:1", "Different Title", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || cached.ID != entry.ID || cached.Selected.Candidate.Name != selected.Candidate.Name {
+		t.Fatalf("cached entry = %+v, found = %v", cached, ok)
+	}
+	contents, err := os.ReadFile(cached.NZBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != string(nzb) {
+		t.Fatalf("NZB contents = %q", contents)
+	}
+	cacheJSON, err := os.ReadFile(store.usenetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(cacheJSON), "apikey=secret") {
+		t.Fatal("Usenet playback cache JSON contains a private source URL")
+	}
+}
+
 func TestSaveAndLoadUsenetFailures(t *testing.T) {
 	store := New(t.TempDir())
 	future := time.Now().Add(time.Hour).UTC()
@@ -111,6 +164,29 @@ func TestRemoveDeletesCachedSelectionAndTorrent(t *testing.T) {
 		t.Fatalf("cached torrent still exists: %v", err)
 	}
 	if _, ok, err := store.Lookup("tmdb:1", "The Movie", 2001); err != nil || ok {
+		t.Fatalf("found = %v, error = %v", ok, err)
+	}
+}
+
+func TestRemoveDeletesCachedUsenetSelectionAndNZB(t *testing.T) {
+	store := New(t.TempDir())
+	entry, err := store.SaveUsenet(
+		"tmdb:1",
+		"The Movie",
+		2001,
+		catalog.RankedCandidate{Candidate: catalog.Candidate{Protocol: catalog.ProtocolUsenet}},
+		[]byte("nzb"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RemoveUsenet("tmdb:1", "The Movie", 2001); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(entry.NZBPath); !os.IsNotExist(err) {
+		t.Fatalf("cached NZB still exists: %v", err)
+	}
+	if _, ok, err := store.LookupUsenet("tmdb:1", "The Movie", 2001); err != nil || ok {
 		t.Fatalf("found = %v, error = %v", ok, err)
 	}
 }
