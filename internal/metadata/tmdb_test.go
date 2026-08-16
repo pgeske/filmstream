@@ -153,7 +153,7 @@ func TestTMDBReturnsShowSeasonsAndEpisodes(t *testing.T) {
 		case "/tv/66732":
 			_, _ = w.Write([]byte(`{"id":66732,"name":"Stranger Things","original_name":"Stranger Things","first_air_date":"2016-07-15","overview":"A mystery unfolds.","poster_path":"/show.jpg","backdrop_path":"/show-bg.jpg","number_of_seasons":5,"genres":[{"name":"Drama"}],"seasons":[{"season_number":0,"name":"Specials","episode_count":2},{"season_number":1,"name":"Season 1","episode_count":8,"poster_path":"/s1.jpg"},{"season_number":2,"name":"Season 2","episode_count":9}]}`))
 		case "/tv/66732/season/1":
-			_, _ = w.Write([]byte(`{"name":"Season 1","season_number":1,"episodes":[{"id":1,"name":"Chapter One: The Vanishing of Will Byers","overview":"Will disappears.","air_date":"2016-07-15","still_path":"/episode.jpg","runtime":49,"season_number":1,"episode_number":1}]}`))
+			_, _ = w.Write([]byte(`{"name":"Season 1","season_number":1,"episodes":[{"id":1,"name":"Chapter One: The Vanishing of Will Byers","overview":"Will disappears.","air_date":"2016-07-15","still_path":"/episode.jpg","runtime":49,"season_number":1,"episode_number":1},{"id":2,"name":"A Future Chapter","air_date":"2099-01-01","season_number":1,"episode_number":2}]}`))
 		default:
 			http.NotFound(w, r)
 		}

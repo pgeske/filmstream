@@ -342,7 +342,11 @@ func (t *TMDB) Season(ctx context.Context, mediaID string, number int) (Season, 
 	if payload.PosterPath != "" {
 		season.PosterURL = posterBaseURL + payload.PosterPath
 	}
+	today := time.Now().UTC().Format(time.DateOnly)
 	for _, item := range payload.Episodes {
+		if item.AirDate != "" && item.AirDate > today {
+			continue
+		}
 		seasonNumber := item.SeasonNumber
 		if seasonNumber <= 0 {
 			seasonNumber = number
