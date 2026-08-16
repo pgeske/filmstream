@@ -77,6 +77,7 @@ import Testing
     #expect(entry.movie.id == "tmdb-tv:66732")
     #expect(entry.movie.isShow)
     #expect(entry.movie.episodeLabel == "S1 E2")
+    #expect(entry.playbackMovie.id == "tmdb-tv:66732:s1:e2")
 }
 
 @Test func computesContinueWatchingProgress() throws {

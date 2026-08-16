@@ -90,6 +90,7 @@ func (*fakeUsenetPlaybackEngine) Drop(string) error { return nil }
 
 type fakeHLSManager struct {
 	dir              string
+	parked           string
 	stopped          string
 	subtitlePlayback string
 	subtitleIndex    int
@@ -114,6 +115,11 @@ func (f *fakeHLSManager) StartSubtitle(_ context.Context, playbackID string, ind
 
 func (f *fakeHLSManager) AssetPath(_, name string) (string, error) {
 	return filepath.Join(f.dir, name), nil
+}
+
+func (f *fakeHLSManager) Park(id string) error {
+	f.parked = id
+	return nil
 }
 
 func (f *fakeHLSManager) Stop(id string) {
@@ -407,6 +413,22 @@ func TestCreatePlaybackReusesCachedUsenetReleaseWithoutSearching(t *testing.T) {
 	}
 	if fakeUsenet.createdSource.NZBPath == "" || fakeUsenet.createdSource.NZBURL != "" {
 		t.Fatalf("cached source = %+v", fakeUsenet.createdSource)
+	}
+}
+
+func TestParkHLSPlayback(t *testing.T) {
+	manager := &fakeHLSManager{}
+	server := &Server{hlsManager: manager}
+	request := httptest.NewRequest(http.MethodPost, "/v1/playbacks/warm-playback/hls/park", nil)
+	response := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if manager.parked != "warm-playback" {
+		t.Fatalf("parked playback = %q", manager.parked)
 	}
 }
 

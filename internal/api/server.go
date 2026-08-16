@@ -85,6 +85,7 @@ type HLSStreamManager interface {
 	Start(context.Context, string, float64, []string) (hls.Stream, error)
 	StartSubtitle(context.Context, string, int) error
 	AssetPath(string, string) (string, error)
+	Park(string) error
 	Stop(string)
 }
 
@@ -245,6 +246,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/playbacks/{id}/stream", s.streamPlayback)
 	mux.HandleFunc("HEAD /v1/playbacks/{id}/stream", s.streamPlayback)
 	mux.HandleFunc("POST /v1/playbacks/{id}/hls", s.startHLSPlayback)
+	mux.HandleFunc("POST /v1/playbacks/{id}/hls/park", s.parkHLSPlayback)
 	mux.HandleFunc("DELETE /v1/playbacks/{id}/hls", s.stopHLSPlayback)
 	mux.HandleFunc("POST /v1/playbacks/{id}/hls/subtitles/{index}", s.startHLSSubtitle)
 	mux.HandleFunc("GET /v1/playbacks/{id}/hls/{asset}", s.serveHLSAsset)
@@ -1714,6 +1716,25 @@ func (s *Server) startHLSSubtitle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "preparing"})
+}
+
+func (s *Server) parkHLSPlayback(w http.ResponseWriter, r *http.Request) {
+	s.hlsMu.RLock()
+	manager := s.hlsManager
+	s.hlsMu.RUnlock()
+	if manager == nil {
+		writeError(w, http.StatusNotImplemented, "HLS playback is not configured")
+		return
+	}
+	if err := manager.Park(r.PathValue("id")); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, "HLS playback not found")
+			return
+		}
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "parked"})
 }
 
 func (s *Server) stopHLSPlayback(w http.ResponseWriter, r *http.Request) {

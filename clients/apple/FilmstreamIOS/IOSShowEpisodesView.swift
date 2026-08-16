@@ -179,9 +179,8 @@ struct IOSShowEpisodesView: View {
             !$0.completed && $0.positionSeconds >= 30 ? $0.positionSeconds : nil
         } ?? 0
         do {
-            let playback = try await model.api.createPlayback(for: movie)
-            let prepared = try await model.api.prepareNativePlayback(
-                playback,
+            let prepared = try await model.preparePlayback(
+                for: movie,
                 startSeconds: startSeconds
             )
             activePlayback = IOSEpisodeBrowserPlaybackSession(movie: movie, prepared: prepared)

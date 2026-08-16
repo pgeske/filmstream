@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -20,6 +22,7 @@ const (
 	defaultStartupBufferSeconds = 24
 	defaultReadRate             = 1.25
 	defaultSegmentSeconds       = 4
+	defaultParkedTTL            = 30 * time.Minute
 )
 
 type Config struct {
@@ -31,6 +34,7 @@ type Config struct {
 	BufferSeconds  int
 	ReadRate       float64
 	SegmentSeconds int
+	ParkedTTL      time.Duration
 	Logger         *slog.Logger
 }
 
@@ -59,6 +63,7 @@ type Manager struct {
 	bufferSeconds  int
 	readRate       float64
 	segmentSeconds int
+	parkedTTL      time.Duration
 	logger         *slog.Logger
 
 	ctx       context.Context
@@ -78,6 +83,12 @@ type runningStream struct {
 	done           chan struct{}
 	errMu          sync.RWMutex
 	err            error
+	command        *exec.Cmd
+	processMu      sync.Mutex
+	parked         bool
+	parkedAt       time.Time
+	parkTimer      *time.Timer
+	languages      []string
 
 	subtitleMu     sync.Mutex
 	subtitleIndex  int
@@ -139,6 +150,9 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.SegmentSeconds <= 0 {
 		cfg.SegmentSeconds = defaultSegmentSeconds
 	}
+	if cfg.ParkedTTL <= 0 {
+		cfg.ParkedTTL = defaultParkedTTL
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
@@ -158,6 +172,7 @@ func New(cfg Config) (*Manager, error) {
 		bufferSeconds:  cfg.BufferSeconds,
 		readRate:       cfg.ReadRate,
 		segmentSeconds: cfg.SegmentSeconds,
+		parkedTTL:      cfg.ParkedTTL,
 		logger:         cfg.Logger,
 		ctx:            ctx,
 		cancel:         cancel,
@@ -183,6 +198,9 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 	}
 	if startSeconds < 0 {
 		return Stream{}, errors.New("start_seconds cannot be negative")
+	}
+	if stream, ok := m.resumePreparedStream(playbackID, startSeconds, preferredLanguages); ok {
+		return stream, nil
 	}
 	m.Stop(playbackID)
 
@@ -244,6 +262,8 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 		ctx:            streamContext,
 		cancel:         cancel,
 		done:           make(chan struct{}),
+		command:        command,
+		languages:      append([]string(nil), preferredLanguages...),
 		subtitleIndex:  -1,
 	}
 	m.mu.Lock()
@@ -272,6 +292,115 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 		"text_subtitle_tracks", len(subtitles),
 		"requested_start_seconds", startSeconds, "timeline_start_seconds", timelineStart)
 	return stream.info, nil
+}
+
+func (m *Manager) resumePreparedStream(
+	playbackID string,
+	startSeconds float64,
+	preferredLanguages []string,
+) (Stream, bool) {
+	m.mu.RLock()
+	stream := m.streams[playbackID]
+	m.mu.RUnlock()
+	if stream == nil || math.Abs(stream.requestedStart-startSeconds) > 0.5 ||
+		!equalStrings(stream.languages, preferredLanguages) || !playlistReady(stream.dir, m.bufferSeconds) {
+		return Stream{}, false
+	}
+
+	stream.processMu.Lock()
+	defer stream.processMu.Unlock()
+	select {
+	case <-stream.done:
+		return Stream{}, false
+	default:
+	}
+	m.mu.RLock()
+	isCurrent := m.streams[playbackID] == stream
+	m.mu.RUnlock()
+	if !isCurrent {
+		return Stream{}, false
+	}
+	if stream.parked {
+		if err := stream.command.Process.Signal(syscall.SIGCONT); err != nil {
+			m.logger.Warn("resume prepared HLS stream", "playback_id", playbackID, "error", err)
+			return Stream{}, false
+		}
+		stream.parked = false
+		stream.parkedAt = time.Time{}
+		if stream.parkTimer != nil {
+			stream.parkTimer.Stop()
+			stream.parkTimer = nil
+		}
+		m.logger.Info("resumed prepared HLS stream", "playback_id", playbackID,
+			"start_seconds", stream.info.StartSeconds)
+	}
+	return stream.info, true
+}
+
+func (m *Manager) Park(playbackID string) error {
+	m.mu.RLock()
+	stream := m.streams[playbackID]
+	m.mu.RUnlock()
+	if stream == nil {
+		return os.ErrNotExist
+	}
+
+	stream.processMu.Lock()
+	defer stream.processMu.Unlock()
+	m.mu.RLock()
+	isCurrent := m.streams[playbackID] == stream
+	m.mu.RUnlock()
+	if !isCurrent {
+		return os.ErrNotExist
+	}
+	select {
+	case <-stream.done:
+		return errors.New("HLS packager is no longer running")
+	default:
+	}
+	if stream.parked {
+		return nil
+	}
+	if !playlistReady(stream.dir, m.bufferSeconds) {
+		return errors.New("HLS startup buffer is not ready")
+	}
+	// Keep the same FFmpeg process and source connection so resuming preserves
+	// A/V timestamps while avoiding any additional download or packaging work.
+	if err := stream.command.Process.Signal(syscall.SIGSTOP); err != nil {
+		return fmt.Errorf("park HLS packager: %w", err)
+	}
+	stream.parked = true
+	stream.parkedAt = time.Now()
+	parkedAt := stream.parkedAt
+	stream.parkTimer = time.AfterFunc(m.parkedTTL, func() {
+		m.expireParkedStream(playbackID, stream, parkedAt)
+	})
+	m.logger.Info("parked prepared HLS stream", "playback_id", playbackID,
+		"expires_in", m.parkedTTL)
+	return nil
+}
+
+func (m *Manager) expireParkedStream(playbackID string, stream *runningStream, parkedAt time.Time) {
+	stream.processMu.Lock()
+	if !stream.parked || !stream.parkedAt.Equal(parkedAt) {
+		stream.processMu.Unlock()
+		return
+	}
+	m.mu.Lock()
+	if m.streams[playbackID] != stream {
+		m.mu.Unlock()
+		stream.processMu.Unlock()
+		return
+	}
+	delete(m.streams, playbackID)
+	m.mu.Unlock()
+	stream.parked = false
+	stream.parkedAt = time.Time{}
+	stream.parkTimer = nil
+	stream.processMu.Unlock()
+
+	m.logger.Info("expired prepared HLS stream", "playback_id", playbackID)
+	m.stopStream(playbackID, stream)
 }
 
 func (m *Manager) StartSubtitle(_ context.Context, playbackID string, index int) error {
@@ -356,6 +485,18 @@ func (m *Manager) Stop(playbackID string) {
 	if stream == nil {
 		return
 	}
+	stream.processMu.Lock()
+	stream.parked = false
+	stream.parkedAt = time.Time{}
+	if stream.parkTimer != nil {
+		stream.parkTimer.Stop()
+		stream.parkTimer = nil
+	}
+	stream.processMu.Unlock()
+	m.stopStream(playbackID, stream)
+}
+
+func (m *Manager) stopStream(playbackID string, stream *runningStream) {
 	stream.subtitleMu.Lock()
 	m.stopSubtitleLocked(stream)
 	stream.subtitleMu.Unlock()
@@ -563,6 +704,7 @@ func (m *Manager) ffmpegArgs(sourceURL, dir, codec string, startSeconds float64,
 	args := []string{
 		"-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
 		"-readrate", strconv.FormatFloat(m.readRate, 'f', -1, 64),
+		"-readrate_catchup", strconv.FormatFloat(m.readRate, 'f', -1, 64),
 		"-readrate_initial_burst", strconv.Itoa(initialBurstSeconds),
 	}
 	if startSeconds > 0 {
@@ -603,6 +745,7 @@ func (m *Manager) subtitleArgs(stream *runningStream, index int) []string {
 	args := []string{
 		"-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
 		"-readrate", strconv.FormatFloat(m.readRate, 'f', -1, 64),
+		"-readrate_catchup", strconv.FormatFloat(m.readRate, 'f', -1, 64),
 		"-readrate_initial_burst", strconv.Itoa(initialBurstSeconds),
 	}
 	if stream.requestedStart > 0 {
@@ -728,6 +871,18 @@ func clearDirectory(path string) error {
 		}
 	}
 	return nil
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func defaultString(value, fallback string) string {

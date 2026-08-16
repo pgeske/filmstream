@@ -177,6 +177,15 @@ public struct FilmstreamAPI: Sendable {
         return PreparedPlayback(playback: playback, hls: hls)
     }
 
+    public func parkNativePlayback(_ playbackID: String) async throws {
+        var request = URLRequest(
+            url: baseURL.appendingPathComponent("v1/playbacks/\(playbackID)/hls/park")
+        )
+        request.httpMethod = "POST"
+        request.timeoutInterval = 15
+        let _: HealthResponse = try await send(request)
+    }
+
     public func stopNativePlayback(_ playbackID: String) async throws {
         var request = URLRequest(url: baseURL.appendingPathComponent("v1/playbacks/\(playbackID)/hls"))
         request.httpMethod = "DELETE"

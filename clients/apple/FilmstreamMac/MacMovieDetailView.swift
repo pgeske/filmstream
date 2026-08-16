@@ -193,9 +193,8 @@ struct MacMovieDetailView: View {
         isPreparing = true
         defer { isPreparing = false }
         do {
-            let playback = try await model.api.createPlayback(for: movie)
-            let prepared = try await model.api.prepareNativePlayback(
-                playback,
+            let prepared = try await model.preparePlayback(
+                for: movie,
                 startSeconds: startSeconds
             )
             model.presentPlayback(movie: movie, prepared: prepared)

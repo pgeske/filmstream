@@ -199,9 +199,8 @@ struct IOSMovieDetailView: View {
         isPreparing = true
         defer { isPreparing = false }
         do {
-            let playback = try await model.api.createPlayback(for: movie)
-            preparedPlayback = try await model.api.prepareNativePlayback(
-                playback,
+            preparedPlayback = try await model.preparePlayback(
+                for: movie,
                 startSeconds: startSeconds
             )
             errorMessage = nil

@@ -302,6 +302,29 @@ public struct WatchHistoryEntry: Codable, Hashable, Identifiable, Sendable {
         )
     }
 
+    public var playbackMovie: Movie {
+        let item = movie
+        return Movie(
+            id: mediaID ?? item.id,
+            mediaType: item.mediaType,
+            title: item.title,
+            originalTitle: item.originalTitle,
+            year: item.year,
+            releaseDate: item.releaseDate,
+            overview: item.overview,
+            posterURL: item.posterURL,
+            backdropURL: item.backdropURL,
+            voteAverage: item.voteAverage,
+            genres: item.genres,
+            numberOfSeasons: item.numberOfSeasons,
+            seriesID: item.seriesID,
+            seriesTitle: item.seriesTitle,
+            seasonNumber: item.seasonNumber,
+            episodeNumber: item.episodeNumber,
+            episodeTitle: item.episodeTitle
+        )
+    }
+
     private enum CodingKeys: String, CodingKey {
         case id, title, year, overview, genres, completed
         case mediaID = "media_id"

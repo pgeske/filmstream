@@ -28,6 +28,7 @@ final class MacAppModel {
     var activePlayback: MacPlaybackSession?
     private(set) var ratingsByMovieID: [String: MovieRatings] = [:]
     private var requestedRatingIDs: Set<String> = []
+    private let playbackPrewarmer = PlaybackPrewarmer()
     var isLoading = false
     var errorMessage: String?
 
@@ -45,6 +46,7 @@ final class MacAppModel {
         var errors: [String] = []
         do {
             continueWatching = try await continueRequest
+            await playbackPrewarmer.synchronize(with: continueWatching, using: api)
         } catch {
             errors.append(error.localizedDescription)
         }
@@ -67,6 +69,7 @@ final class MacAppModel {
             async let historyRequest = api.watchHistory()
             continueWatching = try await continueRequest
             watchHistory = try await historyRequest
+            await playbackPrewarmer.synchronize(with: continueWatching, using: api)
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
@@ -75,6 +78,7 @@ final class MacAppModel {
 
     func removeFromContinueWatching(_ entry: WatchHistoryEntry) async throws {
         try await api.removeFromContinueWatching(entry)
+        await playbackPrewarmer.remove(entry, using: api)
         withAnimation(.snappy(duration: 0.25)) {
             if let seriesID = entry.seriesID {
                 continueWatching.removeAll { $0.seriesID == seriesID }
@@ -84,6 +88,18 @@ final class MacAppModel {
                 watchHistory.removeAll { $0.id == entry.id }
             }
         }
+    }
+
+    func preparePlayback(for movie: Movie, startSeconds: Double) async throws -> PreparedPlayback {
+        if let prepared = await playbackPrewarmer.preparedPlayback(
+            for: movie,
+            startSeconds: startSeconds,
+            using: api
+        ) {
+            return prepared
+        }
+        let playback = try await api.createPlayback(for: movie)
+        return try await api.prepareNativePlayback(playback, startSeconds: startSeconds)
     }
 
     func presentPlayback(movie: Movie, prepared: PreparedPlayback) {

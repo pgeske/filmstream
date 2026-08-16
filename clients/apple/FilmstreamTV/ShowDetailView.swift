@@ -260,9 +260,8 @@ struct ShowDetailView: View {
         defer { isPreparing = false }
         let movie = playbackSelection.episode.playbackMovie(in: details.show)
         do {
-            let playback = try await model.api.createPlayback(for: movie)
-            let prepared = try await model.api.prepareNativePlayback(
-                playback,
+            let prepared = try await model.preparePlayback(
+                for: movie,
                 startSeconds: startSeconds
             )
             activePlayback = TVEpisodePlaybackSession(movie: movie, prepared: prepared)

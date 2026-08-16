@@ -3,6 +3,7 @@ package hls
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -99,6 +100,83 @@ while :; do sleep 1; done
 	}
 }
 
+func TestManagerParksAndReusesPreparedStream(t *testing.T) {
+	probeCount := filepath.Join(t.TempDir(), "probe-count")
+	packagerCount := filepath.Join(t.TempDir(), "packager-count")
+	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
+printf 'x\n' >> %q
+cat <<'JSON'
+{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]}],"format":{"duration":"7200"}}
+JSON
+`, probeCount))
+	ffmpeg := writeExecutable(t, "ffmpeg", fmt.Sprintf(`#!/bin/sh
+printf 'x\n' >> %q
+for last do :; done
+dir=$(dirname "$last")
+printf 'init' > "$dir/init.mp4"
+printf 'segment' > "$dir/segment-000000.m4s"
+cat > "$dir/index.m3u8" <<'PLAYLIST'
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:4.0,
+segment-000000.m4s
+PLAYLIST
+while :; do sleep 1; done
+`, packagerCount))
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943", StartupTimeout: 5 * time.Second,
+		BufferSeconds: 4, ParkedTTL: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	first, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Park(first.PlaybackID); err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.PlaybackID != first.PlaybackID || second.StartSeconds != first.StartSeconds ||
+		second.VideoCodec != first.VideoCodec || second.DurationSeconds != first.DurationSeconds {
+		t.Fatalf("reused stream = %+v, want %+v", second, first)
+	}
+	probeCalls, err := os.ReadFile(probeCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packagerCalls, err := os.ReadFile(packagerCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(probeCalls), "x") != 1 || strings.Count(string(packagerCalls), "x") != 1 {
+		t.Fatalf("probe calls = %q, packager calls = %q", probeCalls, packagerCalls)
+	}
+
+	if err := manager.Park(first.PlaybackID); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, err = manager.AssetPath(first.PlaybackID, "index.m3u8")
+		if errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("parked stream did not expire: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestManagerProbesTextSubtitlesWithoutStartingPlayback(t *testing.T) {
 	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
 cat <<'JSON'
@@ -148,7 +226,7 @@ func TestFFmpegArgsPaceInputAndTagHEVC(t *testing.T) {
 	manager := &Manager{bufferSeconds: 16, readRate: 1.25, segmentSeconds: 4}
 	args := strings.Join(manager.ffmpegArgs("http://source", t.TempDir(), "hevc", 30, 2), " ")
 	for _, expected := range []string{
-		"-readrate 1.25", "-readrate_initial_burst 20", "-noaccurate_seek -ss 30.000", "-map 0:2?", "-c:v copy", "-tag:v hvc1", "-c:a aac",
+		"-readrate 1.25", "-readrate_catchup 1.25", "-readrate_initial_burst 20", "-noaccurate_seek -ss 30.000", "-map 0:2?", "-c:v copy", "-tag:v hvc1", "-c:a aac",
 	} {
 		if !strings.Contains(args, expected) {
 			t.Fatalf("FFmpeg arguments do not contain %q: %s", expected, args)
@@ -169,7 +247,7 @@ func TestSubtitleArgsAlignToKeyframeTimeline(t *testing.T) {
 	}
 	args := strings.Join(manager.subtitleArgs(stream, 4), " ")
 	for _, expected := range []string{
-		"-noaccurate_seek -ss 120.000", "-map 0:4", "-c:s webvtt",
+		"-readrate_catchup 1.25", "-noaccurate_seek -ss 120.000", "-map 0:4", "-c:s webvtt",
 		"-output_ts_offset 1.500", "-flush_packets 1 -f webvtt",
 	} {
 		if !strings.Contains(args, expected) {
