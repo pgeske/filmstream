@@ -114,7 +114,7 @@ final class MacAppModel {
 
     func history(for movie: Movie) -> WatchHistoryEntry? {
         if movie.isShow {
-            return histories(for: movie).first { !$0.completed && $0.positionSeconds >= 30 }
+            return continueWatching.first { $0.seriesID == movie.id }
         }
         return watchHistory.first {
             guard !$0.completed, $0.positionSeconds >= 30 else { return false }

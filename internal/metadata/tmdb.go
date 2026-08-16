@@ -264,8 +264,14 @@ func (t *TMDB) Show(ctx context.Context, mediaID string) (Show, error) {
 			show.Genres = append(show.Genres, name)
 		}
 	}
+	today := time.Now().UTC().Format(time.DateOnly)
+	hiddenFutureSeasons := 0
 	for _, season := range payload.Seasons {
 		if season.SeasonNumber <= 0 || season.EpisodeCount <= 0 {
+			continue
+		}
+		if season.AirDate != "" && season.AirDate > today {
+			hiddenFutureSeasons++
 			continue
 		}
 		summary := SeasonSummary{
@@ -281,9 +287,7 @@ func (t *TMDB) Show(ctx context.Context, mediaID string) (Show, error) {
 		show.Seasons = append(show.Seasons, summary)
 	}
 	sort.Slice(show.Seasons, func(i, j int) bool { return show.Seasons[i].Number < show.Seasons[j].Number })
-	if show.NumberOfSeasons == 0 {
-		show.NumberOfSeasons = len(show.Seasons)
-	}
+	show.NumberOfSeasons = max(len(show.Seasons), show.NumberOfSeasons-hiddenFutureSeasons)
 
 	t.mu.Lock()
 	t.shows[mediaID] = show

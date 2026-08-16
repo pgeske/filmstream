@@ -200,10 +200,8 @@ struct MacShowDetailView: View {
         isLoading = true
         defer { isLoading = false }
         do {
-            async let detailRequest = model.api.seriesDetails(for: show.id)
-            async let ratingsRequest: Void = model.loadRatings(for: show)
-            let loadedDetails = try await detailRequest
-            _ = await ratingsRequest
+            Task { await model.loadRatings(for: show) }
+            let loadedDetails = try await model.api.seriesDetails(for: show.id)
             details = loadedDetails
             playbackSelection = try await model.api.playbackSelection(
                 for: loadedDetails,

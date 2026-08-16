@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -979,6 +980,8 @@ func (s *Server) searchAndRank(
 	}
 	var failures []error
 	hadSuccessfulSearch := false
+	var rankedCandidates []catalog.RankedCandidate
+	seenCandidates := make(map[string]bool)
 	for _, title := range titles {
 		search := request
 		search.Query = title
@@ -994,14 +997,22 @@ func (s *Server) searchAndRank(
 			continue
 		}
 		hadSuccessfulSearch = true
-		if ranked := catalog.Rank(search, candidates); len(ranked) > 0 {
-			return ranked, nil
+		for _, ranked := range catalog.Rank(search, candidates) {
+			key := ranked.Candidate.Indexer + ":" + firstNonEmpty(ranked.Candidate.ID, ranked.Candidate.Name)
+			if seenCandidates[key] {
+				continue
+			}
+			seenCandidates[key] = true
+			rankedCandidates = append(rankedCandidates, ranked)
 		}
 	}
 	if !hadSuccessfulSearch && len(failures) > 0 {
 		return nil, errors.Join(failures...)
 	}
-	return nil, nil
+	sort.SliceStable(rankedCandidates, func(i, j int) bool {
+		return rankedCandidates[i].Score > rankedCandidates[j].Score
+	})
+	return rankedCandidates, nil
 }
 
 func wrapTorrentSession(session *torrentstream.Session) *playbackSession {
