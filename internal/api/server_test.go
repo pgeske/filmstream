@@ -97,10 +97,14 @@ type fakeHLSManager struct {
 	subtitlePlayback string
 	subtitleIndex    int
 	subtitleTracks   map[string][]hls.SubtitleTrack
+	probeErrors      map[string]error
 	languages        []string
 }
 
 func (f *fakeHLSManager) ProbeSubtitles(_ context.Context, id string) ([]hls.SubtitleTrack, error) {
+	if err := f.probeErrors[id]; err != nil {
+		return nil, err
+	}
 	return f.subtitleTracks[id], nil
 }
 
@@ -599,6 +603,56 @@ func TestRankedUsenetPlaybackTriesPastTenIncompletePosts(t *testing.T) {
 	}
 	if attempts != 11 {
 		t.Fatalf("attempts = %d, want 11", attempts)
+	}
+}
+
+func TestRankedUsenetPlaybackRejectsMediaProbeFailure(t *testing.T) {
+	registry, err := indexer.NewRegistry([]config.Indexer{{
+		Name: "usenet", Type: "torznab", Endpoint: "https://indexer.example/api",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := 0
+	fakeUsenet := &fakeUsenetPlaybackEngine{createFunc: func(source usenetstream.Source) (*usenetstream.Session, error) {
+		attempt++
+		return &usenetstream.Session{
+			ID: fmt.Sprintf("playback-%d", attempt), Name: source.Name, FileName: "episode.mkv",
+		}, nil
+	}}
+	server := &Server{
+		indexers: registry, usenetEngine: fakeUsenet,
+		hlsManager: &fakeHLSManager{
+			probeErrors: map[string]error{"playback-1": errors.New("probe playback media: exit status 1")},
+			subtitleTracks: map[string][]hls.SubtitleTrack{
+				"playback-2": {{Index: 2, Language: "en"}},
+			},
+		},
+		usenetFailures: make(map[string]time.Time),
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	ranked := []catalog.RankedCandidate{
+		{Candidate: catalog.Candidate{
+			ID: "broken", Indexer: "usenet", Name: "Show.S01E01.Broken",
+			Protocol: catalog.ProtocolUsenet, NZBURL: "https://indexer.example/broken",
+		}},
+		{Candidate: catalog.Candidate{
+			ID: "healthy", Indexer: "usenet", Name: "Show.S01E01.Healthy",
+			Protocol: catalog.ProtocolUsenet, NZBURL: "https://indexer.example/healthy",
+		}},
+	}
+
+	session, selected, err := server.createRankedUsenetPlayback(
+		t.Context(), ranked, catalog.Preferences{PreferTextSubtitles: true}, "S01E01",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session == nil || session.ID != "playback-2" || selected == nil || selected.Candidate.ID != "healthy" {
+		t.Fatalf("session = %+v, selected = %+v", session, selected)
+	}
+	if !server.usenetCandidateRecentlyFailed(ranked[0].Candidate, "S01E01") {
+		t.Fatal("candidate that failed media probing was not skipped")
 	}
 }
 

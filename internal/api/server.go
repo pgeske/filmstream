@@ -1134,8 +1134,16 @@ func (s *Server) createCachedUsenetPlayback(
 	if preferences.PreferTextSubtitles {
 		hasTextSubtitles, probeErr := s.playbackHasTextSubtitles(preparationContext, session.ID)
 		if probeErr != nil {
-			s.logger.Warn("probe cached Usenet playback subtitles", "title", request.Query, "error", probeErr)
-		} else if !hasTextSubtitles {
+			_ = s.usenetEngine.Drop(session.ID)
+			s.markUsenetCandidateFailed(cached.Selected.Candidate, playbackFileHint(request))
+			if removeErr := s.playbackCache.RemoveUsenet(request.MediaID, request.Query, request.Year); removeErr != nil {
+				s.logger.Warn("remove cached NZB that failed media probing", "title", request.Query, "error", removeErr)
+			}
+			s.logger.Warn("cached Usenet playback failed media probing; searching again",
+				"title", request.Query, "name", cached.Selected.Candidate.Name, "error", probeErr)
+			return nil, nil
+		}
+		if !hasTextSubtitles {
 			_ = s.usenetEngine.Drop(session.ID)
 			if removeErr := s.playbackCache.RemoveUsenet(request.MediaID, request.Query, request.Year); removeErr != nil {
 				s.logger.Warn("remove cached NZB without text subtitles", "title", request.Query, "error", removeErr)
@@ -1318,9 +1326,14 @@ func (s *Server) createRankedUsenetPlayback(
 				}
 				hasTextSubtitles, probeErr := s.playbackHasTextSubtitles(preparationContext, session.ID)
 				if probeErr != nil {
-					s.logger.Warn("probe Usenet playback subtitles", "id", session.ID,
+					_ = s.usenetEngine.Drop(session.ID)
+					s.markUsenetCandidateFailed(candidate.Candidate, fileHint)
+					failures = append(failures, fmt.Sprintf("%s: probe media: %v", candidate.Candidate.Name, probeErr))
+					s.logger.Warn("reject Usenet playback that failed media probing", "id", session.ID,
 						"name", candidate.Candidate.Name, "error", probeErr)
-				} else if hasTextSubtitles {
+					continue
+				}
+				if hasTextSubtitles {
 					if fallbackSession != nil {
 						_ = s.usenetEngine.Drop(fallbackSession.ID)
 					}
