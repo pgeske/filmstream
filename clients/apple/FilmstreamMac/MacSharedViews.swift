@@ -233,6 +233,7 @@ private extension View {
 struct MacMovieCard: View {
     let movie: Movie
     var progress: Double? = nil
+    var contentRating: String? = nil
     var width: CGFloat = 304
     @State private var isHovering = false
 
@@ -241,6 +242,8 @@ struct MacMovieCard: View {
             VStack(alignment: .leading, spacing: 9) {
                 MacShelfArtwork(movie: movie)
                     .frame(width: width, height: width * 9 / 16)
+                    .clipped()
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                     .overlay {
                         RoundedRectangle(cornerRadius: 14, style: .continuous)
                             .stroke(
@@ -269,10 +272,14 @@ struct MacMovieCard: View {
                     .frame(width: width, alignment: .leading)
 
                 HStack(spacing: 6) {
-                    Text("Movie")
+                    Text(movie.primaryGenre ?? "Movie")
                     if let year = movie.year {
                         Text("•")
                         Text(String(year))
+                    }
+                    if let contentRating {
+                        Text("•")
+                        Text(contentRating)
                     }
                     if let progress, progress > 0 {
                         Text("•")

@@ -15,7 +15,7 @@ func TestOMDbReturnsIMDbAndRottenTomatoesRatings(t *testing.T) {
 		if r.URL.Query().Get("apikey") != "test-key" || r.URL.Query().Get("t") != "The Matrix" || r.URL.Query().Get("y") != "1999" {
 			t.Fatalf("query = %q", r.URL.RawQuery)
 		}
-		_, _ = w.Write([]byte(`{"Response":"True","imdbRating":"8.7","Ratings":[{"Source":"Internet Movie Database","Value":"8.7/10"},{"Source":"Rotten Tomatoes","Value":"83%"}]}`))
+		_, _ = w.Write([]byte(`{"Response":"True","Rated":"R","imdbRating":"8.7","Ratings":[{"Source":"Internet Movie Database","Value":"8.7/10"},{"Source":"Rotten Tomatoes","Value":"83%"}]}`))
 	}))
 	defer server.Close()
 
@@ -28,7 +28,7 @@ func TestOMDbReturnsIMDbAndRottenTomatoesRatings(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if ratings.IMDb == nil || *ratings.IMDb != 8.7 || ratings.RottenTomatoes == nil || *ratings.RottenTomatoes != 83 {
+		if ratings.IMDb == nil || *ratings.IMDb != 8.7 || ratings.RottenTomatoes == nil || *ratings.RottenTomatoes != 83 || ratings.ContentRating == nil || *ratings.ContentRating != "R" {
 			t.Fatalf("ratings = %+v", ratings)
 		}
 	}
@@ -44,7 +44,7 @@ func TestOMDbLooksUpRatingsByIMDbID(t *testing.T) {
 		if r.URL.Query().Get("i") != "tt0241527" || r.URL.Query().Get("t") != "" {
 			t.Fatalf("query = %q", r.URL.RawQuery)
 		}
-		_, _ = w.Write([]byte(`{"Response":"True","imdbRating":"7.7","Ratings":[{"Source":"Rotten Tomatoes","Value":"80%"}]}`))
+		_, _ = w.Write([]byte(`{"Response":"True","Rated":"PG","imdbRating":"7.7","Ratings":[{"Source":"Rotten Tomatoes","Value":"80%"}]}`))
 	}))
 	defer server.Close()
 
@@ -57,7 +57,7 @@ func TestOMDbLooksUpRatingsByIMDbID(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if ratings.IMDb == nil || *ratings.IMDb != 7.7 || ratings.RottenTomatoes == nil || *ratings.RottenTomatoes != 80 {
+		if ratings.IMDb == nil || *ratings.IMDb != 7.7 || ratings.RottenTomatoes == nil || *ratings.RottenTomatoes != 80 || ratings.ContentRating == nil || *ratings.ContentRating != "PG" {
 			t.Fatalf("ratings = %+v", ratings)
 		}
 	}

@@ -493,7 +493,7 @@ func (s *Server) enrichWatchHistory(ctx context.Context, entries []history.Entry
 		return entries
 	}
 	for i, entry := range entries {
-		if strings.HasPrefix(entry.MediaID, "tmdb:") {
+		if strings.HasPrefix(entry.MediaID, "tmdb:") && len(entry.Genres) > 0 {
 			continue
 		}
 		movies, err := provider.Search(ctx, entry.Title)
@@ -504,7 +504,11 @@ func (s *Server) enrichWatchHistory(ctx context.Context, entries []history.Entry
 			continue
 		}
 		for _, movie := range movies {
-			if entry.Year > 0 && movie.Year > 0 && entry.Year != movie.Year {
+			hasTMDBID := strings.HasPrefix(entry.MediaID, "tmdb:")
+			if hasTMDBID && movie.ID != entry.MediaID {
+				continue
+			}
+			if !hasTMDBID && entry.Year > 0 && movie.Year > 0 && entry.Year != movie.Year {
 				continue
 			}
 			enriched, err := s.historyStore.UpdateMetadata(entry.ID, history.Entry{
@@ -512,6 +516,7 @@ func (s *Server) enrichWatchHistory(ctx context.Context, entries []history.Entry
 				Overview:    movie.Overview,
 				PosterURL:   movie.PosterURL,
 				BackdropURL: movie.BackdropURL,
+				Genres:      movie.Genres,
 			})
 			if err == nil {
 				entries[i] = enriched
@@ -548,14 +553,15 @@ func (s *Server) updateWatchProgress(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 	var request struct {
-		MediaID         string  `json:"media_id,omitempty"`
-		Title           string  `json:"title"`
-		Year            int     `json:"year,omitempty"`
-		Overview        string  `json:"overview,omitempty"`
-		PosterURL       string  `json:"poster_url,omitempty"`
-		BackdropURL     string  `json:"backdrop_url,omitempty"`
-		PositionSeconds float64 `json:"position_seconds"`
-		DurationSeconds float64 `json:"duration_seconds,omitempty"`
+		MediaID         string   `json:"media_id,omitempty"`
+		Title           string   `json:"title"`
+		Year            int      `json:"year,omitempty"`
+		Overview        string   `json:"overview,omitempty"`
+		PosterURL       string   `json:"poster_url,omitempty"`
+		BackdropURL     string   `json:"backdrop_url,omitempty"`
+		Genres          []string `json:"genres,omitempty"`
+		PositionSeconds float64  `json:"position_seconds"`
+		DurationSeconds float64  `json:"duration_seconds,omitempty"`
 	}
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	decoder.DisallowUnknownFields()
@@ -570,6 +576,7 @@ func (s *Server) updateWatchProgress(w http.ResponseWriter, r *http.Request) {
 		Overview:        request.Overview,
 		PosterURL:       request.PosterURL,
 		BackdropURL:     request.BackdropURL,
+		Genres:          request.Genres,
 		PositionSeconds: request.PositionSeconds,
 		DurationSeconds: request.DurationSeconds,
 	})

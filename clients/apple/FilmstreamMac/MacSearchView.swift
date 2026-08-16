@@ -55,7 +55,13 @@ struct MacSearchView: View {
         if !results.isEmpty {
             LazyVGrid(columns: columns, alignment: .leading, spacing: 28) {
                 ForEach(results) { movie in
-                    MacMovieCard(movie: movie)
+                    MacMovieCard(
+                        movie: movie,
+                        contentRating: model.ratings(for: movie)?.contentRating
+                    )
+                    .task(id: movie.id) {
+                        await model.loadRatings(for: movie)
+                    }
                 }
             }
             .padding(.vertical, 8)

@@ -112,7 +112,13 @@ func (fakeMetadata) IMDbID(_ context.Context, mediaID string) (string, error) {
 }
 
 func (fakeMetadata) Search(_ context.Context, _ string) ([]metadata.Movie, error) {
-	return []metadata.Movie{{ID: "tmdb:1", Title: "The Movie", Year: 2001, PosterURL: "https://image.example/poster.jpg"}}, nil
+	return []metadata.Movie{{
+		ID:        "tmdb:1",
+		Title:     "The Movie",
+		Year:      2001,
+		PosterURL: "https://image.example/poster.jpg",
+		Genres:    []string{"Drama", "Thriller"},
+	}}, nil
 }
 
 func (fakeRatings) RatingsByIMDbID(_ context.Context, imdbID string) (metadata.MovieRatings, error) {
@@ -121,7 +127,8 @@ func (fakeRatings) RatingsByIMDbID(_ context.Context, imdbID string) (metadata.M
 	}
 	imdb := 9.1
 	rottenTomatoes := 95
-	return metadata.MovieRatings{IMDb: &imdb, RottenTomatoes: &rottenTomatoes}, nil
+	contentRating := "PG-13"
+	return metadata.MovieRatings{IMDb: &imdb, RottenTomatoes: &rottenTomatoes, ContentRating: &contentRating}, nil
 }
 
 func (fakeRatings) Ratings(_ context.Context, title string, year int) (metadata.MovieRatings, error) {
@@ -130,7 +137,8 @@ func (fakeRatings) Ratings(_ context.Context, title string, year int) (metadata.
 	}
 	imdb := 8.4
 	rottenTomatoes := 91
-	return metadata.MovieRatings{IMDb: &imdb, RottenTomatoes: &rottenTomatoes}, nil
+	contentRating := "PG"
+	return metadata.MovieRatings{IMDb: &imdb, RottenTomatoes: &rottenTomatoes, ContentRating: &contentRating}, nil
 }
 
 func (fakeMetadata) Discover(_ context.Context, collection metadata.Collection) ([]metadata.Movie, error) {
@@ -332,7 +340,7 @@ func TestCatalogRatingsReturnsExternalScores(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/v1/catalog/ratings?title=The+Movie&year=2001", nil)
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"imdb":8.4`) || !strings.Contains(response.Body.String(), `"rotten_tomatoes":91`) {
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"imdb":8.4`) || !strings.Contains(response.Body.String(), `"rotten_tomatoes":91`) || !strings.Contains(response.Body.String(), `"content_rating":"PG"`) {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
 }
@@ -342,7 +350,7 @@ func TestCatalogRatingsUsesTMDBMovieIDForReliableLookup(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/v1/catalog/ratings?title=Localized+Movie&year=2001&media_id=tmdb%3A1", nil)
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"imdb":9.1`) || !strings.Contains(response.Body.String(), `"rotten_tomatoes":95`) {
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"imdb":9.1`) || !strings.Contains(response.Body.String(), `"rotten_tomatoes":95`) || !strings.Contains(response.Body.String(), `"content_rating":"PG-13"`) {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
 }
@@ -384,7 +392,7 @@ func TestDiscoverCatalogReturnsMovieSections(t *testing.T) {
 
 func TestWatchHistoryProgressRoundTrip(t *testing.T) {
 	server := &Server{historyStore: history.New(t.TempDir())}
-	body := `{"media_id":"tmdb:1","title":"The Movie","year":2001,"poster_url":"https://image.example/poster.jpg","position_seconds":120,"duration_seconds":1000}`
+	body := `{"media_id":"tmdb:1","title":"The Movie","year":2001,"poster_url":"https://image.example/poster.jpg","genres":["Drama","Thriller"],"position_seconds":120,"duration_seconds":1000}`
 	request := httptest.NewRequest(http.MethodPut, "/v1/watch-history", strings.NewReader(body))
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
@@ -404,7 +412,7 @@ func TestWatchHistoryProgressRoundTrip(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
 		t.Fatal(err)
 	}
-	if len(payload.Entries) != 1 || payload.Entries[0].ResumePosition() != 120 {
+	if len(payload.Entries) != 1 || payload.Entries[0].ResumePosition() != 120 || len(payload.Entries[0].Genres) != 2 {
 		t.Fatalf("entries = %+v", payload.Entries)
 	}
 }
@@ -456,7 +464,7 @@ func TestWatchHistoryAddsMissingMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 || entries[0].MediaID != "tmdb:1" || entries[0].UpdatedAt != entry.UpdatedAt {
+	if len(entries) != 1 || entries[0].MediaID != "tmdb:1" || len(entries[0].Genres) != 2 || entries[0].UpdatedAt != entry.UpdatedAt {
 		t.Fatalf("entries = %+v", entries)
 	}
 }

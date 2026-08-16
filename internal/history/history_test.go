@@ -58,20 +58,24 @@ func TestStoreRecordsSharedProgressMetadata(t *testing.T) {
 		Overview:        "A young blade runner uncovers a secret.",
 		PosterURL:       "https://image.example/poster.jpg",
 		BackdropURL:     "https://image.example/backdrop.jpg",
+		Genres:          []string{"Science Fiction", "Drama", "science fiction"},
 		PositionSeconds: 600,
 		DurationSeconds: 1800,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !entry.CanContinue() || entry.MediaID != "tmdb:335984" {
+	if !entry.CanContinue() || entry.MediaID != "tmdb:335984" || len(entry.Genres) != 2 {
 		t.Fatalf("entry = %+v", entry)
 	}
-	enriched, err := store.UpdateMetadata(entry.ID, Entry{BackdropURL: "https://image.example/new-backdrop.jpg"})
+	enriched, err := store.UpdateMetadata(entry.ID, Entry{
+		BackdropURL: "https://image.example/new-backdrop.jpg",
+		Genres:      []string{"Science Fiction", "Thriller"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if enriched.UpdatedAt != entry.UpdatedAt || enriched.BackdropURL != "https://image.example/new-backdrop.jpg" {
+	if enriched.UpdatedAt != entry.UpdatedAt || enriched.BackdropURL != "https://image.example/new-backdrop.jpg" || len(enriched.Genres) != 2 || enriched.Genres[1] != "Thriller" {
 		t.Fatalf("enriched entry = %+v", enriched)
 	}
 	updated, err := store.RecordProgress(Entry{
@@ -83,7 +87,7 @@ func TestStoreRecordsSharedProgressMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if updated.ID != entry.ID || updated.DurationSeconds != 1800 {
+	if updated.ID != entry.ID || updated.DurationSeconds != 1800 || len(updated.Genres) != 2 {
 		t.Fatalf("updated entry = %+v", updated)
 	}
 }

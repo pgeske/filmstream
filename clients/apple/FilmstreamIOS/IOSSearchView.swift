@@ -151,11 +151,19 @@ private struct MobileGridMovieCard: View {
                 .foregroundStyle(Color.mobileTeaCream)
                 .lineLimit(3)
 
-            if let year = movie.year {
-                Text(String(year))
-                    .font(.caption)
-                    .foregroundStyle(Color.mobileTeaMuted)
+            HStack(spacing: 5) {
+                if let genre = movie.primaryGenre {
+                    Text(genre)
+                }
+                if movie.primaryGenre != nil, movie.year != nil {
+                    Text("•")
+                }
+                if let year = movie.year {
+                    Text(String(year))
+                }
             }
+            .font(.caption)
+            .foregroundStyle(Color.mobileTeaMuted)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }

@@ -150,7 +150,15 @@ private struct MacLibraryView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     LazyHStack(alignment: .top, spacing: 18) {
                         ForEach(model.continueWatching) { entry in
-                            MacMovieCard(movie: entry.movie, progress: entry.progress)
+                            let movie = entry.movie
+                            MacMovieCard(
+                                movie: movie,
+                                progress: entry.progress,
+                                contentRating: model.ratings(for: movie)?.contentRating
+                            )
+                            .task(id: movie.id) {
+                                await model.loadRatings(for: movie)
+                            }
                         }
                     }
                     .padding(.horizontal, 3)
@@ -169,7 +177,13 @@ private struct MacLibraryView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     LazyHStack(alignment: .top, spacing: 18) {
                         ForEach(section.items) { movie in
-                            MacMovieCard(movie: movie)
+                            MacMovieCard(
+                                movie: movie,
+                                contentRating: model.ratings(for: movie)?.contentRating
+                            )
+                            .task(id: movie.id) {
+                                await model.loadRatings(for: movie)
+                            }
                         }
                     }
                     .padding(.horizontal, 3)

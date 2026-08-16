@@ -98,10 +98,18 @@ struct IOSHomeView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     LazyHStack(alignment: .top, spacing: 14) {
                         ForEach(model.continueWatching) { entry in
-                            NavigationLink(value: entry.movie) {
-                                MobileMovieCard(movie: entry.movie, progress: entry.progress)
+                            let movie = entry.movie
+                            NavigationLink(value: movie) {
+                                MobileMovieCard(
+                                    movie: movie,
+                                    progress: entry.progress,
+                                    contentRating: model.ratings(for: movie)?.contentRating
+                                )
                             }
                             .buttonStyle(.plain)
+                            .task(id: movie.id) {
+                                await model.loadRatings(for: movie)
+                            }
                         }
                     }
                     .padding(.horizontal, 18)
@@ -122,9 +130,15 @@ struct IOSHomeView: View {
                     LazyHStack(alignment: .top, spacing: 14) {
                         ForEach(section.items) { movie in
                             NavigationLink(value: movie) {
-                                MobileMovieCard(movie: movie)
+                                MobileMovieCard(
+                                    movie: movie,
+                                    contentRating: model.ratings(for: movie)?.contentRating
+                                )
                             }
                             .buttonStyle(.plain)
+                            .task(id: movie.id) {
+                                await model.loadRatings(for: movie)
+                            }
                         }
                     }
                     .padding(.horizontal, 18)

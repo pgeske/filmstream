@@ -85,10 +85,14 @@ struct IOSMovieDetailView: View {
     private var content: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(spacing: 9) {
-                Text("Movie")
+                Text(movie.genreSummary ?? "Movie")
                 if let year = movie.year {
                     Text("•")
                     Text(String(year))
+                }
+                if let contentRating = ratings?.contentRating {
+                    Text("•")
+                    Text(contentRating)
                 }
                 if let history, history.progress > 0 {
                     Text("•")

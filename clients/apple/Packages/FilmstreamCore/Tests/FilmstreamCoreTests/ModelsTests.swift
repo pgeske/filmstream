@@ -3,11 +3,13 @@ import Testing
 @testable import FilmstreamCore
 
 @Test func decodesMovieArtwork() throws {
-    let data = Data(#"{"id":"tmdb:335984","title":"Blade Runner 2049","year":2017,"poster_url":"https://image.tmdb.org/poster.jpg","backdrop_url":"https://image.tmdb.org/backdrop.jpg"}"#.utf8)
+    let data = Data(#"{"id":"tmdb:335984","title":"Blade Runner 2049","year":2017,"poster_url":"https://image.tmdb.org/poster.jpg","backdrop_url":"https://image.tmdb.org/backdrop.jpg","genres":["Science Fiction","Drama"]}"#.utf8)
     let movie = try JSONDecoder().decode(Movie.self, from: data)
     #expect(movie.id == "tmdb:335984")
     #expect(movie.year == 2017)
     #expect(movie.posterURL?.host == "image.tmdb.org")
+    #expect(movie.primaryGenre == "Science Fiction")
+    #expect(movie.genreSummary == "Science Fiction • Drama")
 }
 
 @Test func decodesDiscoverySections() throws {
@@ -18,10 +20,11 @@ import Testing
 }
 
 @Test func decodesExternalMovieRatings() throws {
-    let data = Data(#"{"imdb":8.7,"rotten_tomatoes":83}"#.utf8)
+    let data = Data(#"{"imdb":8.7,"rotten_tomatoes":83,"content_rating":"R"}"#.utf8)
     let ratings = try JSONDecoder().decode(MovieRatings.self, from: data)
     #expect(ratings.imdb == 8.7)
     #expect(ratings.rottenTomatoes == 83)
+    #expect(ratings.contentRating == "R")
     #expect(!ratings.isEmpty)
 }
 
@@ -54,8 +57,9 @@ import Testing
 }
 
 @Test func computesContinueWatchingProgress() throws {
-    let data = Data(#"{"id":"entry-1","media_id":"tmdb:335984","title":"Blade Runner 2049","year":2017,"position_seconds":600,"duration_seconds":1800,"completed":false,"updated_at":"2026-08-10T00:00:00Z"}"#.utf8)
+    let data = Data(#"{"id":"entry-1","media_id":"tmdb:335984","title":"Blade Runner 2049","year":2017,"genres":["Science Fiction"],"position_seconds":600,"duration_seconds":1800,"completed":false,"updated_at":"2026-08-10T00:00:00Z"}"#.utf8)
     let entry = try JSONDecoder().decode(WatchHistoryEntry.self, from: data)
     #expect(entry.progress == 1.0 / 3.0)
     #expect(entry.movie.id == "tmdb:335984")
+    #expect(entry.movie.primaryGenre == "Science Fiction")
 }

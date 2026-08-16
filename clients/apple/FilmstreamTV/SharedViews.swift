@@ -313,14 +313,26 @@ private struct TomatoMark: View {
 struct NetflixShelfItem: Identifiable {
     let movie: Movie
     var progress: Double? = nil
+    var contentRating: String? = nil
 
     var id: String { movie.id }
+}
+
+private enum NetflixShelfLayout {
+    static let collapsedWidth: CGFloat = 223
+    static let expandedWidth: CGFloat = 632
+    static let artworkHeight: CGFloat = 334
+    static let firstCardInset: CGFloat = 88
+    static let viewportOverflow: CGFloat = 72
+    static let trailingScrollSpace: CGFloat = 1240
+    static let focusedAnchor = UnitPoint(x: 0.07, y: 0.5)
 }
 
 struct NetflixMovieShelf: View {
     let title: String
     let items: [NetflixShelfItem]
     var requestsInitialFocus = false
+    var onFocus: (Movie) -> Void = { _ in }
 
     @State private var expandedMovieID: String?
 
@@ -329,6 +341,7 @@ struct NetflixMovieShelf: View {
             Text(title)
                 .font(.system(size: 38, weight: .bold, design: .rounded))
                 .foregroundStyle(Color.teaCream)
+                .padding(.horizontal, 16)
 
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
@@ -340,27 +353,41 @@ struct NetflixMovieShelf: View {
                                 requestsInitialFocus: requestsInitialFocus && item.id == items.first?.id
                             ) { isFocused in
                                 if isFocused {
-                                    expandedMovieID = item.id
+                                    onFocus(item.movie)
+                                    withAnimation(.easeInOut(duration: 0.28)) {
+                                        expandedMovieID = item.id
+                                    }
                                     Task { @MainActor in
-                                        try? await Task.sleep(for: .milliseconds(80))
+                                        await Task.yield()
                                         guard expandedMovieID == item.id else { return }
-                                        withAnimation(.snappy(duration: 0.26)) {
-                                            proxy.scrollTo(item.id, anchor: .leading)
+                                        withAnimation(.easeInOut(duration: 0.32)) {
+                                            proxy.scrollTo(item.id, anchor: NetflixShelfLayout.focusedAnchor)
                                         }
                                     }
                                 } else if expandedMovieID == item.id {
-                                    expandedMovieID = nil
+                                    Task { @MainActor in
+                                        try? await Task.sleep(for: .milliseconds(80))
+                                        guard expandedMovieID == item.id else { return }
+                                        withAnimation(.easeInOut(duration: 0.2)) {
+                                            expandedMovieID = nil
+                                        }
+                                    }
                                 }
                             }
                             .id(item.id)
                         }
+
+                        Color.clear
+                            .frame(width: NetflixShelfLayout.trailingScrollSpace, height: 1)
+                            .accessibilityHidden(true)
                     }
+                    .padding(.leading, NetflixShelfLayout.firstCardInset)
                     .padding(.top, 12)
                     .padding(.bottom, 18)
                 }
+                .padding(.horizontal, -NetflixShelfLayout.viewportOverflow)
             }
         }
-        .padding(.horizontal, 16)
         .focusSection()
     }
 }
@@ -373,14 +400,17 @@ private struct NetflixShelfCard: View {
 
     @FocusState private var isFocused: Bool
 
-    private let artworkHeight: CGFloat = 334
-    private var cardWidth: CGFloat { isExpanded ? 632 : 223 }
+    private var cardWidth: CGFloat {
+        isExpanded ? NetflixShelfLayout.expandedWidth : NetflixShelfLayout.collapsedWidth
+    }
 
     var body: some View {
         NavigationLink(value: item.movie) {
             VStack(alignment: .leading, spacing: 12) {
                 artwork
-                    .frame(width: cardWidth, height: artworkHeight)
+                    .frame(width: cardWidth, height: NetflixShelfLayout.artworkHeight)
+                    .clipped()
+                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                     .overlay {
                         RoundedRectangle(cornerRadius: 18, style: .continuous)
                             .stroke(
@@ -403,17 +433,21 @@ private struct NetflixShelfCard: View {
                     )
 
                 if isExpanded {
-                    VStack(alignment: .leading, spacing: 5) {
+                    VStack(alignment: .leading, spacing: 4) {
                         Text(item.movie.title)
-                            .font(.title2.weight(.bold))
+                            .font(.system(size: 28, weight: .bold, design: .rounded))
                             .foregroundStyle(Color.teaCream)
                             .lineLimit(2)
 
-                        HStack(spacing: 8) {
-                            Text("Movie")
+                        HStack(spacing: 7) {
+                            Text(item.movie.primaryGenre ?? "Movie")
                             if let year = item.movie.year {
                                 Text("•")
                                 Text(String(year))
+                            }
+                            if let contentRating = item.contentRating {
+                                Text("•")
+                                Text(contentRating)
                             }
                             if let progress = item.progress, progress > 0 {
                                 Text("•")
@@ -421,18 +455,19 @@ private struct NetflixShelfCard: View {
                                     .foregroundStyle(Color.teaAccentLight)
                             }
                         }
-                        .font(.headline)
+                        .font(.system(size: 23, weight: .semibold))
                         .foregroundStyle(Color.teaMuted)
 
                         if let overview = item.movie.overview, !overview.isEmpty {
                             Text(overview)
-                                .font(.headline)
-                                .foregroundStyle(Color.teaCream.opacity(0.82))
+                                .font(.system(size: 22, weight: .regular))
+                                .foregroundStyle(Color.teaCream.opacity(0.78))
+                                .lineSpacing(2)
                                 .lineLimit(2)
                                 .frame(maxWidth: cardWidth, alignment: .leading)
                         }
                     }
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .transition(.opacity)
                 }
             }
             .frame(width: cardWidth, alignment: .leading)
@@ -442,7 +477,7 @@ private struct NetflixShelfCard: View {
         .focusEffectDisabled()
         .focused($isFocused)
         .zIndex(isExpanded ? 1 : 0)
-        .animation(.snappy(duration: 0.24), value: isExpanded)
+        .animation(.easeInOut(duration: 0.28), value: isExpanded)
         .onChange(of: isFocused) { _, focused in
             onFocusChange(focused)
         }
@@ -453,19 +488,35 @@ private struct NetflixShelfCard: View {
         }
     }
 
-    @ViewBuilder
     private var artwork: some View {
-        if isExpanded {
-            NetflixShelfArtwork(movie: item.movie, landscape: true)
-        } else {
-            PosterImage(movie: item.movie)
+        ZStack {
+            if isExpanded {
+                NetflixShelfArtwork(
+                    movie: item.movie,
+                    landscape: true,
+                    width: cardWidth,
+                    height: NetflixShelfLayout.artworkHeight
+                )
+                .transition(.opacity)
+            } else {
+                NetflixShelfArtwork(
+                    movie: item.movie,
+                    landscape: false,
+                    width: cardWidth,
+                    height: NetflixShelfLayout.artworkHeight
+                )
+                .transition(.opacity)
+            }
         }
+        .animation(.easeInOut(duration: 0.2), value: isExpanded)
     }
 }
 
 private struct NetflixShelfArtwork: View {
     let movie: Movie
     let landscape: Bool
+    let width: CGFloat
+    let height: CGFloat
 
     var body: some View {
         AsyncImage(url: landscape ? (movie.backdropURL ?? movie.posterURL) : (movie.posterURL ?? movie.backdropURL)) { phase in
@@ -493,6 +544,8 @@ private struct NetflixShelfArtwork: View {
                 }
             }
         }
+        .frame(width: width, height: height)
+        .clipped()
         .overlay {
             LinearGradient(
                 colors: [.clear, Color.teaBackground.opacity(0.2)],
@@ -587,16 +640,24 @@ struct MovieNavigationCard: View {
                     y: isFocused ? 12 : 8
                 )
 
-            VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(movie.title)
                     .font(.headline.weight(.semibold))
                     .foregroundStyle(isFocused ? Color.teaAccentLight : Color.teaCream)
                     .lineLimit(1)
-                if let year = movie.year {
-                    Text(String(year))
-                        .font(.subheadline)
-                        .foregroundStyle(Color.teaMuted)
+                HStack(spacing: 6) {
+                    if let genre = movie.primaryGenre {
+                        Text(genre)
+                    }
+                    if movie.primaryGenre != nil, movie.year != nil {
+                        Text("•")
+                    }
+                    if let year = movie.year {
+                        Text(String(year))
+                    }
                 }
+                .font(.subheadline)
+                .foregroundStyle(Color.teaMuted)
             }
             .frame(width: cardWidth, alignment: .leading)
         }

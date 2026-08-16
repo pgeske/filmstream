@@ -100,12 +100,15 @@ struct MobileSectionHeader: View {
 struct MobileMovieCard: View {
     let movie: Movie
     var progress: Double? = nil
+    var contentRating: String? = nil
     var width: CGFloat = 286
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             MobileShelfArtwork(movie: movie)
                 .frame(width: width, height: width * 9 / 16)
+                .clipped()
+                .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
                 .overlay {
                     RoundedRectangle(cornerRadius: 15, style: .continuous)
                         .stroke(Color.mobileTeaAccentLight.opacity(0.22), lineWidth: 1)
@@ -127,10 +130,14 @@ struct MobileMovieCard: View {
                 .frame(width: width, alignment: .leading)
 
             HStack(spacing: 6) {
-                Text("Movie")
+                Text(movie.primaryGenre ?? "Movie")
                 if let year = movie.year {
                     Text("•")
                     Text(String(year))
+                }
+                if let contentRating {
+                    Text("•")
+                    Text(contentRating)
                 }
                 if let progress, progress > 0 {
                     Text("•")

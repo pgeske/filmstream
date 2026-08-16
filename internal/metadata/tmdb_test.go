@@ -15,7 +15,7 @@ func TestTMDBSearchReturnsMovieArtwork(t *testing.T) {
 			t.Fatalf("query = %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"results":[{"id":335984,"title":"Blade Runner 2049","original_title":"Blade Runner 2049","release_date":"2017-10-04","overview":"A young blade runner uncovers a secret.","poster_path":"/poster.jpg","backdrop_path":"/backdrop.jpg","vote_average":7.6}]}`))
+		_, _ = w.Write([]byte(`{"results":[{"id":335984,"title":"Blade Runner 2049","original_title":"Blade Runner 2049","release_date":"2017-10-04","overview":"A young blade runner uncovers a secret.","poster_path":"/poster.jpg","backdrop_path":"/backdrop.jpg","vote_average":7.6,"genre_ids":[878,18]}]}`))
 	}))
 	defer server.Close()
 
@@ -36,6 +36,9 @@ func TestTMDBSearchReturnsMovieArtwork(t *testing.T) {
 	}
 	if movie.PosterURL != posterBaseURL+"/poster.jpg" || movie.BackdropURL != backdropBaseURL+"/backdrop.jpg" {
 		t.Fatalf("artwork = %q, %q", movie.PosterURL, movie.BackdropURL)
+	}
+	if len(movie.Genres) != 2 || movie.Genres[0] != "Science Fiction" || movie.Genres[1] != "Drama" {
+		t.Fatalf("genres = %v", movie.Genres)
 	}
 }
 

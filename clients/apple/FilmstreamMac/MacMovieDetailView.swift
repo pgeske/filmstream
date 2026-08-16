@@ -95,10 +95,14 @@ struct MacMovieDetailView: View {
     @ViewBuilder
     private var metadataLine: some View {
         HStack(spacing: 11) {
-            Text("Movie")
+            Text(movie.genreSummary ?? "Movie")
             if let year = movie.year {
                 Text("•")
                 Text(String(year))
+            }
+            if let contentRating = ratings?.contentRating {
+                Text("•")
+                Text(contentRating)
             }
             MacMovieRatingBadges(ratings: ratings, tmdbRating: movie.voteAverage)
             if let history, history.progress > 0 {

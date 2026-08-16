@@ -20,6 +20,28 @@ const (
 	backdropBaseURL      = "https://image.tmdb.org/t/p/w1280"
 )
 
+var tmdbMovieGenres = map[int]string{
+	12:    "Adventure",
+	14:    "Fantasy",
+	16:    "Animation",
+	18:    "Drama",
+	27:    "Horror",
+	28:    "Action",
+	35:    "Comedy",
+	36:    "History",
+	37:    "Western",
+	53:    "Thriller",
+	80:    "Crime",
+	99:    "Documentary",
+	878:   "Science Fiction",
+	9648:  "Mystery",
+	10402: "Music",
+	10749: "Romance",
+	10751: "Family",
+	10752: "War",
+	10770: "TV Movie",
+}
+
 type TMDB struct {
 	baseURL  string
 	token    string
@@ -192,6 +214,7 @@ func (t *TMDB) fetchMovies(ctx context.Context, path string, values url.Values) 
 			PosterPath    string  `json:"poster_path"`
 			BackdropPath  string  `json:"backdrop_path"`
 			VoteAverage   float64 `json:"vote_average"`
+			GenreIDs      []int   `json:"genre_ids"`
 			Adult         bool    `json:"adult"`
 		} `json:"results"`
 	}
@@ -212,6 +235,7 @@ func (t *TMDB) fetchMovies(ctx context.Context, path string, values url.Values) 
 			ReleaseDate:   result.ReleaseDate,
 			Overview:      strings.TrimSpace(result.Overview),
 			VoteAverage:   result.VoteAverage,
+			Genres:        genreNames(result.GenreIDs),
 		}
 		if result.PosterPath != "" {
 			movie.PosterURL = posterBaseURL + result.PosterPath
@@ -222,6 +246,16 @@ func (t *TMDB) fetchMovies(ctx context.Context, path string, values url.Values) 
 		movies = append(movies, movie)
 	}
 	return movies, nil
+}
+
+func genreNames(ids []int) []string {
+	genres := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if genre, ok := tmdbMovieGenres[id]; ok {
+			genres = append(genres, genre)
+		}
+	}
+	return genres
 }
 
 func releaseYear(releaseDate string) int {

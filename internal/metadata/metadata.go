@@ -3,20 +3,22 @@ package metadata
 import "context"
 
 type Movie struct {
-	ID            string  `json:"id"`
-	Title         string  `json:"title"`
-	OriginalTitle string  `json:"original_title,omitempty"`
-	Year          int     `json:"year,omitempty"`
-	ReleaseDate   string  `json:"release_date,omitempty"`
-	Overview      string  `json:"overview,omitempty"`
-	PosterURL     string  `json:"poster_url,omitempty"`
-	BackdropURL   string  `json:"backdrop_url,omitempty"`
-	VoteAverage   float64 `json:"vote_average,omitempty"`
+	ID            string   `json:"id"`
+	Title         string   `json:"title"`
+	OriginalTitle string   `json:"original_title,omitempty"`
+	Year          int      `json:"year,omitempty"`
+	ReleaseDate   string   `json:"release_date,omitempty"`
+	Overview      string   `json:"overview,omitempty"`
+	PosterURL     string   `json:"poster_url,omitempty"`
+	BackdropURL   string   `json:"backdrop_url,omitempty"`
+	VoteAverage   float64  `json:"vote_average,omitempty"`
+	Genres        []string `json:"genres,omitempty"`
 }
 
 type MovieRatings struct {
 	IMDb           *float64 `json:"imdb,omitempty"`
 	RottenTomatoes *int     `json:"rotten_tomatoes,omitempty"`
+	ContentRating  *string  `json:"content_rating,omitempty"`
 }
 
 type Provider interface {

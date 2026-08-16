@@ -26,6 +26,7 @@ struct HomeView: View {
                     .padding(.top, 54)
                     .padding(.bottom, 110)
                 }
+                .ignoresSafeArea(.container, edges: .horizontal)
             }
             .navigationDestination(for: Movie.self) { movie in
                 MovieDetailView(movie: movie)
@@ -77,9 +78,15 @@ struct HomeView: View {
             NetflixMovieShelf(
                 title: "Continue Watching",
                 items: model.continueWatching.map {
-                    NetflixShelfItem(movie: $0.movie, progress: $0.progress)
+                    let movie = $0.movie
+                    return NetflixShelfItem(
+                        movie: movie,
+                        progress: $0.progress,
+                        contentRating: model.ratings(for: movie)?.contentRating
+                    )
                 },
-                requestsInitialFocus: true
+                requestsInitialFocus: true,
+                onFocus: loadRatings
             )
         }
     }
@@ -89,8 +96,20 @@ struct HomeView: View {
         if !section.items.isEmpty {
             NetflixMovieShelf(
                 title: section.title,
-                items: section.items.map { NetflixShelfItem(movie: $0) }
+                items: section.items.map {
+                    NetflixShelfItem(
+                        movie: $0,
+                        contentRating: model.ratings(for: $0)?.contentRating
+                    )
+                },
+                onFocus: loadRatings
             )
+        }
+    }
+
+    private func loadRatings(for movie: Movie) {
+        Task {
+            await model.loadRatings(for: movie)
         }
     }
 

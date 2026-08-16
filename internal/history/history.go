@@ -24,6 +24,7 @@ type Entry struct {
 	Overview        string    `json:"overview,omitempty"`
 	PosterURL       string    `json:"poster_url,omitempty"`
 	BackdropURL     string    `json:"backdrop_url,omitempty"`
+	Genres          []string  `json:"genres,omitempty"`
 	PositionSeconds float64   `json:"position_seconds"`
 	DurationSeconds float64   `json:"duration_seconds,omitempty"`
 	Completed       bool      `json:"completed"`
@@ -111,6 +112,7 @@ func (s *Store) RecordProgress(update Entry) (Entry, error) {
 	update.Overview = strings.TrimSpace(update.Overview)
 	update.PosterURL = strings.TrimSpace(update.PosterURL)
 	update.BackdropURL = strings.TrimSpace(update.BackdropURL)
+	update.Genres = normalizeGenres(update.Genres)
 	update.PositionSeconds = max(0, update.PositionSeconds)
 	update.DurationSeconds = max(0, update.DurationSeconds)
 	if update.DurationSeconds > 0 {
@@ -141,6 +143,9 @@ func (s *Store) RecordProgress(update Entry) (Entry, error) {
 		}
 		if update.BackdropURL == "" {
 			update.BackdropURL = entries[i].BackdropURL
+		}
+		if len(update.Genres) == 0 {
+			update.Genres = entries[i].Genres
 		}
 		if update.DurationSeconds == 0 {
 			update.DurationSeconds = entries[i].DurationSeconds
@@ -183,6 +188,9 @@ func (s *Store) UpdateMetadata(id string, metadata Entry) (Entry, error) {
 		if value := strings.TrimSpace(metadata.BackdropURL); value != "" {
 			entries[i].BackdropURL = value
 		}
+		if genres := normalizeGenres(metadata.Genres); len(genres) > 0 {
+			entries[i].Genres = genres
+		}
 		if err := s.write(entries); err != nil {
 			return Entry{}, err
 		}
@@ -216,6 +224,24 @@ func (s *Store) UpdateProgress(id string, position, duration float64) error {
 		return s.write(entries)
 	}
 	return fmt.Errorf("history entry %q not found", id)
+}
+
+func normalizeGenres(genres []string) []string {
+	normalized := make([]string, 0, len(genres))
+	seen := make(map[string]struct{}, len(genres))
+	for _, genre := range genres {
+		genre = strings.TrimSpace(genre)
+		key := strings.ToLower(genre)
+		if genre == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		normalized = append(normalized, genre)
+	}
+	return normalized
 }
 
 func (s *Store) MarkUnwatched(id string) error {

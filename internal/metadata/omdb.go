@@ -115,6 +115,7 @@ func (o *OMDb) fetchRatings(ctx context.Context, cacheKey string, values url.Val
 		Response   string `json:"Response"`
 		Error      string `json:"Error"`
 		IMDbRating string `json:"imdbRating"`
+		Rated      string `json:"Rated"`
 		Ratings    []struct {
 			Source string `json:"Source"`
 			Value  string `json:"Value"`
@@ -131,6 +132,9 @@ func (o *OMDb) fetchRatings(ctx context.Context, cacheKey string, values url.Val
 	}
 
 	ratings := MovieRatings{}
+	if contentRating := strings.TrimSpace(payload.Rated); contentRating != "" && !strings.EqualFold(contentRating, "N/A") {
+		ratings.ContentRating = &contentRating
+	}
 	if value, err := strconv.ParseFloat(payload.IMDbRating, 64); err == nil && value > 0 {
 		ratings.IMDb = &value
 	}
