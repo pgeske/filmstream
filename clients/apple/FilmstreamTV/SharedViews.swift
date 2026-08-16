@@ -46,27 +46,17 @@ struct TeaStreamMark: View {
     var size: CGFloat = 54
 
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: size * 0.3, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [Color.teaAccentLight, Color.teaAccent],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-            Image(systemName: "leaf.fill")
-                .font(.system(size: size * 0.58, weight: .semibold))
-                .foregroundStyle(Color.teaBackground)
-                .rotationEffect(.degrees(-18))
-            Image(systemName: "play.fill")
-                .font(.system(size: size * 0.22, weight: .black))
-                .foregroundStyle(Color.teaCream)
-                .offset(x: -1)
-        }
-        .frame(width: size, height: size)
-        .shadow(color: Color.teaAccent.opacity(0.22), radius: 18, y: 8)
-        .accessibilityHidden(true)
+        Image("TeaStreamMark")
+            .resizable()
+            .scaledToFill()
+            .frame(width: size, height: size)
+            .clipShape(RoundedRectangle(cornerRadius: size * 0.28, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
+                    .stroke(Color.teaCream.opacity(0.24), lineWidth: max(1, size * 0.018))
+            }
+            .shadow(color: Color.teaAccent.opacity(0.18), radius: 16, y: 7)
+            .accessibilityHidden(true)
     }
 }
 

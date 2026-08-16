@@ -45,27 +45,17 @@ struct MacTeaStreamMark: View {
     var size: CGFloat = 42
 
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: size * 0.3, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [Color.macTeaAccentLight, Color.macTeaAccent],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                )
-            Image(systemName: "leaf.fill")
-                .font(.system(size: size * 0.58, weight: .semibold))
-                .foregroundStyle(Color.macTeaBackground)
-                .rotationEffect(.degrees(-18))
-            Image(systemName: "play.fill")
-                .font(.system(size: size * 0.22, weight: .black))
-                .foregroundStyle(Color.macTeaCream)
-                .offset(x: -1)
-        }
-        .frame(width: size, height: size)
-        .shadow(color: Color.macTeaAccent.opacity(0.2), radius: 12, y: 5)
-        .accessibilityHidden(true)
+        Image("TeaStreamMark")
+            .resizable()
+            .scaledToFill()
+            .frame(width: size, height: size)
+            .clipShape(RoundedRectangle(cornerRadius: size * 0.28, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
+                    .stroke(Color.macTeaCream.opacity(0.24), lineWidth: max(1, size * 0.018))
+            }
+            .shadow(color: Color.macTeaAccent.opacity(0.16), radius: 10, y: 4)
+            .accessibilityHidden(true)
     }
 }
 
