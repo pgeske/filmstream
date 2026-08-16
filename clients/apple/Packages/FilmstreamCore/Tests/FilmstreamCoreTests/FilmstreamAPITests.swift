@@ -17,16 +17,29 @@ import Testing
 
     try await api.prewarmPlayback(for: movie, startSeconds: 612.5)
     let playback = try await api.createPlayback(for: movie, startSeconds: 612.5)
+    let prepared = try await api.prepareNativePlaybackWithRetry(
+        playback,
+        for: movie,
+        startSeconds: 612.5
+    )
 
     #expect(playback.id == "playback-1")
-    #expect(recorder.paths == ["/v1/playbacks/prewarm", "/v1/playbacks"])
-    #expect(recorder.startSeconds == [612.5, 612.5])
+    #expect(prepared.id == "playback-2")
+    #expect(recorder.paths == [
+        "/v1/playbacks/prewarm",
+        "/v1/playbacks",
+        "/v1/playbacks/playback-1/hls",
+        "/v1/playbacks",
+        "/v1/playbacks/playback-2/hls",
+    ])
+    #expect(recorder.startSeconds == [612.5, 612.5, 612.5, 612.5, 612.5])
 }
 
 private final class APIRequestRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var recordedPaths: [String] = []
     private var recordedStartSeconds: [Double] = []
+    private var playbackCount = 0
 
     var paths: [String] {
         lock.withLock { recordedPaths }
@@ -40,14 +53,26 @@ private final class APIRequestRecorder: @unchecked Sendable {
         let path = request.url?.path ?? ""
         let body = requestBody(request).flatMap { try? JSONSerialization.jsonObject(with: $0) }
             as? [String: Any]
-        lock.withLock {
+        let currentPlaybackCount = lock.withLock {
             recordedPaths.append(path)
             recordedStartSeconds.append(body?["start_seconds"] as? Double ?? -1)
+            if path == "/v1/playbacks" {
+                playbackCount += 1
+            }
+            return playbackCount
         }
-        if path == "/v1/playbacks/prewarm" {
+        switch path {
+        case "/v1/playbacks/prewarm":
             return (202, Data(#"{"status":"prewarming"}"#.utf8))
+        case "/v1/playbacks":
+            let response = #"{"id":"playback-\#(currentPlaybackCount)","name":"The Movie","file_name":"movie.mkv","file_size":1000,"stream_url":"https://filmstream.test/v1/playbacks/playback-\#(currentPlaybackCount)/stream"}"#
+            return (201, Data(response.utf8))
+        case "/v1/playbacks/playback-1/hls":
+            return (502, Data(#"{"error":"probe playback media: exit status 1"}"#.utf8))
+        default:
+            let response = #"{"playback_id":"playback-2","playlist_url":"https://filmstream.test/v1/playbacks/playback-2/hls/index.m3u8","start_seconds":612.5,"video_codec":"h264"}"#
+            return (201, Data(response.utf8))
         }
-        return (201, Data(#"{"id":"playback-1","name":"The Movie","file_name":"movie.mkv","file_size":1000,"stream_url":"https://filmstream.test/v1/playbacks/playback-1/stream"}"#.utf8))
     }
 
     private func requestBody(_ request: URLRequest) -> Data? {

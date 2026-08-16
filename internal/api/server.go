@@ -1016,7 +1016,9 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 	s.playbackRequests[session.ID] = request
 	s.playbackResponses[session.ID] = response
 	s.mu.Unlock()
-	s.logger.Info("created playback", "id", session.ID, "source", session.Source, "name", session.Name, "file", session.FileName)
+	s.logger.Info("created playback", "id", session.ID, "source", session.Source,
+		"media_id", request.MediaID, "season", request.SeasonNumber, "episode", request.EpisodeNumber,
+		"name", session.Name, "file", session.FileName)
 	writeJSON(w, http.StatusCreated, response)
 }
 
@@ -1255,12 +1257,17 @@ func (s *Server) invalidateCachedPlayback(id string) {
 	}
 	s.mu.RLock()
 	key, ok := s.playbackCacheKeys[id]
+	selected, hasSelection := s.selected[id]
+	request := s.playbackRequests[id]
 	s.mu.RUnlock()
 	if !ok {
 		return
 	}
 	var err error
 	if key.source == catalog.ProtocolUsenet {
+		if hasSelection {
+			s.markUsenetCandidateFailed(selected.Candidate, playbackFileHint(request))
+		}
 		err = s.playbackCache.RemoveUsenet(key.mediaID, key.title, key.year)
 	} else {
 		err = s.playbackCache.Remove(key.mediaID, key.title, key.year)

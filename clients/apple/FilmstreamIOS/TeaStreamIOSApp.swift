@@ -94,7 +94,11 @@ final class IOSAppModel {
         onStage(.findingRelease)
         let playback = try await api.createPlayback(for: movie, startSeconds: startSeconds)
         onStage(.bufferingVideo)
-        return try await api.prepareNativePlayback(playback, startSeconds: startSeconds)
+        return try await api.prepareNativePlaybackWithRetry(
+            playback,
+            for: movie,
+            startSeconds: startSeconds
+        )
     }
 
     func ratings(for movie: Movie) -> MovieRatings? {

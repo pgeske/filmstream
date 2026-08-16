@@ -59,8 +59,6 @@ struct MovieDetailView: View {
             VStack(alignment: .leading, spacing: 20) {
                 Spacer(minLength: 36)
 
-                TeaStreamMark(size: 48)
-
                 Text(movie.title)
                     .font(.system(size: 62, weight: .black, design: .rounded))
                     .foregroundStyle(Color.teaCream)
@@ -71,11 +69,11 @@ struct MovieDetailView: View {
 
                 if let overview = movie.overview, !overview.isEmpty {
                     Text(overview)
-                        .font(.title3)
-                        .foregroundStyle(Color.teaCream.opacity(0.9))
-                        .lineSpacing(4)
-                        .lineLimit(4)
-                        .frame(maxWidth: 760, alignment: .leading)
+                        .font(.system(size: 26, weight: .regular, design: .rounded))
+                        .foregroundStyle(Color.teaCream.opacity(0.86))
+                        .lineSpacing(3)
+                        .lineLimit(5)
+                        .frame(maxWidth: 800, alignment: .leading)
                 }
 
                 if let errorMessage {

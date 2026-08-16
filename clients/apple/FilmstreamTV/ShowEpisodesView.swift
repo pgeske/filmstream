@@ -70,10 +70,9 @@ struct ShowEpisodesView: View {
                         seasonButton(season)
                     }
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
             }
-            .scrollClipDisabled()
         }
     }
 

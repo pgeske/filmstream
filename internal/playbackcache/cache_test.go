@@ -151,6 +151,77 @@ func TestLookupFallsBackToTitleAndYear(t *testing.T) {
 	}
 }
 
+func TestDistinctMediaIDsDoNotShareCachedPlayback(t *testing.T) {
+	store := New(t.TempDir())
+	const title = "It's Always Sunny in Philadelphia"
+	const episodeOne = "tmdb-tv:2710:s1:e1"
+	const episodeThree = "tmdb-tv:2710:s9:e3"
+
+	first, err := store.Save(
+		episodeOne, title, 2005,
+		catalog.RankedCandidate{Candidate: catalog.Candidate{Name: "Sunny S01E01"}},
+		[]byte("episode one torrent"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.Lookup(episodeThree, title, 2005); err != nil || found {
+		t.Fatalf("different episode cache found = %v, error = %v", found, err)
+	}
+	third, err := store.Save(
+		episodeThree, title, 2005,
+		catalog.RankedCandidate{Candidate: catalog.Candidate{Name: "Sunny S09E03"}},
+		[]byte("episode three torrent"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID == third.ID {
+		t.Fatalf("episode caches share ID %q", first.ID)
+	}
+	for mediaID, want := range map[string]string{
+		episodeOne: "Sunny S01E01", episodeThree: "Sunny S09E03",
+	} {
+		cached, found, err := store.Lookup(mediaID, title, 2005)
+		if err != nil || !found || cached.Selected.Candidate.Name != want {
+			t.Fatalf("cache for %s = %+v, found = %v, error = %v", mediaID, cached, found, err)
+		}
+	}
+}
+
+func TestDistinctMediaIDsDoNotShareCachedUsenetPlayback(t *testing.T) {
+	store := New(t.TempDir())
+	const title = "It's Always Sunny in Philadelphia"
+	const episodeOne = "tmdb-tv:2710:s1:e1"
+	const episodeThree = "tmdb-tv:2710:s9:e3"
+	candidate := func(name string) catalog.RankedCandidate {
+		return catalog.RankedCandidate{Candidate: catalog.Candidate{Name: name, Protocol: catalog.ProtocolUsenet}}
+	}
+
+	first, err := store.SaveUsenet(episodeOne, title, 2005, candidate("Sunny S01E01"), []byte("episode one nzb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.LookupUsenet(episodeThree, title, 2005); err != nil || found {
+		t.Fatalf("different episode cache found = %v, error = %v", found, err)
+	}
+	third, err := store.SaveUsenet(episodeThree, title, 2005, candidate("Sunny S09E03"), []byte("episode three nzb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID == third.ID {
+		t.Fatalf("episode caches share ID %q", first.ID)
+	}
+	for mediaID, want := range map[string]string{
+		episodeOne: "Sunny S01E01", episodeThree: "Sunny S09E03",
+	} {
+		cached, found, err := store.LookupUsenet(mediaID, title, 2005)
+		if err != nil || !found || cached.Selected.Candidate.Name != want {
+			t.Fatalf("cache for %s = %+v, found = %v, error = %v", mediaID, cached, found, err)
+		}
+	}
+}
+
 func TestRemoveDeletesCachedSelectionAndTorrent(t *testing.T) {
 	store := New(t.TempDir())
 	entry, err := store.Save("tmdb:1", "The Movie", 2001, catalog.RankedCandidate{}, []byte("torrent"))

@@ -173,6 +173,20 @@ public struct FilmstreamAPI: Sendable {
         return PreparedPlayback(playback: playback, hls: hls)
     }
 
+    public func prepareNativePlaybackWithRetry(
+        _ playback: Playback,
+        for movie: Movie,
+        startSeconds: Double
+    ) async throws -> PreparedPlayback {
+        do {
+            return try await prepareNativePlayback(playback, startSeconds: startSeconds)
+        } catch let error as FilmstreamError {
+            guard case let .server(status, _) = error, status == 502 else { throw error }
+            let replacement = try await createPlayback(for: movie, startSeconds: startSeconds)
+            return try await prepareNativePlayback(replacement, startSeconds: startSeconds)
+        }
+    }
+
     public func stopNativePlayback(_ playbackID: String) async throws {
         var request = URLRequest(url: baseURL.appendingPathComponent("v1/playbacks/\(playbackID)/hls"))
         request.httpMethod = "DELETE"

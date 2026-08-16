@@ -75,7 +75,8 @@ func (s *Store) Lookup(mediaID, title string, year int) (Entry, bool, error) {
 	}
 	if index < 0 {
 		for i := range entries {
-			if entries[i].Year == year && strings.EqualFold(entries[i].Title, title) {
+			if (mediaID == "" || entries[i].MediaID == "") &&
+				entries[i].Year == year && strings.EqualFold(entries[i].Title, title) {
 				index = i
 				break
 			}
@@ -109,8 +110,9 @@ func (s *Store) Remove(mediaID, title string, year int) error {
 	}
 	for i := range entries {
 		matchingMediaID := mediaID != "" && entries[i].MediaID == mediaID
-		matchingTitle := entries[i].Year == year && strings.EqualFold(entries[i].Title, title)
-		if !matchingMediaID && !matchingTitle {
+		matchingLegacyTitle := (mediaID == "" || entries[i].MediaID == "") &&
+			entries[i].Year == year && strings.EqualFold(entries[i].Title, title)
+		if !matchingMediaID && !matchingLegacyTitle {
 			continue
 		}
 		if validID(entries[i].ID) {
@@ -148,12 +150,13 @@ func (s *Store) Save(
 	if err != nil {
 		return Entry{}, err
 	}
-	id := cacheID(title, year)
+	id := cacheID(mediaID, title, year)
 	index := -1
 	for i := range entries {
 		matchingMediaID := mediaID != "" && entries[i].MediaID == mediaID
-		matchingTitle := entries[i].Year == year && strings.EqualFold(entries[i].Title, title)
-		if matchingMediaID || matchingTitle {
+		matchingLegacyTitle := (mediaID == "" || entries[i].MediaID == "") &&
+			entries[i].Year == year && strings.EqualFold(entries[i].Title, title)
+		if matchingMediaID || matchingLegacyTitle {
 			id = entries[i].ID
 			index = i
 			break
@@ -205,7 +208,8 @@ func (s *Store) LookupUsenet(mediaID, title string, year int) (UsenetEntry, bool
 	}
 	if index < 0 {
 		for i := range entries {
-			if entries[i].Year == year && strings.EqualFold(entries[i].Title, title) {
+			if (mediaID == "" || entries[i].MediaID == "") &&
+				entries[i].Year == year && strings.EqualFold(entries[i].Title, title) {
 				index = i
 				break
 			}
@@ -239,8 +243,9 @@ func (s *Store) RemoveUsenet(mediaID, title string, year int) error {
 	}
 	for i := range entries {
 		matchingMediaID := mediaID != "" && entries[i].MediaID == mediaID
-		matchingTitle := entries[i].Year == year && strings.EqualFold(entries[i].Title, title)
-		if !matchingMediaID && !matchingTitle {
+		matchingLegacyTitle := (mediaID == "" || entries[i].MediaID == "") &&
+			entries[i].Year == year && strings.EqualFold(entries[i].Title, title)
+		if !matchingMediaID && !matchingLegacyTitle {
 			continue
 		}
 		if validID(entries[i].ID) {
@@ -279,12 +284,13 @@ func (s *Store) SaveUsenet(
 	if err != nil {
 		return UsenetEntry{}, err
 	}
-	id := cacheID(title, year)
+	id := cacheID(mediaID, title, year)
 	index := -1
 	for i := range entries {
 		matchingMediaID := mediaID != "" && entries[i].MediaID == mediaID
-		matchingTitle := entries[i].Year == year && strings.EqualFold(entries[i].Title, title)
-		if matchingMediaID || matchingTitle {
+		matchingLegacyTitle := (mediaID == "" || entries[i].MediaID == "") &&
+			entries[i].Year == year && strings.EqualFold(entries[i].Title, title)
+		if matchingMediaID || matchingLegacyTitle {
 			id = entries[i].ID
 			index = i
 			break
@@ -473,9 +479,12 @@ func writePrivateFile(path string, contents []byte) error {
 	return os.Rename(temporaryPath, path)
 }
 
-func cacheID(title string, year int) string {
-	normalized := strings.ToLower(strings.Join(strings.Fields(title), " "))
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s/%d", normalized, year)))
+func cacheID(mediaID, title string, year int) string {
+	identity := strings.TrimSpace(mediaID)
+	if identity == "" {
+		identity = strings.ToLower(strings.Join(strings.Fields(title), " "))
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s/%d", identity, year)))
 	return hex.EncodeToString(sum[:8])
 }
 

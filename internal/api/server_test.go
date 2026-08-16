@@ -630,6 +630,43 @@ func TestUnavailableCachedUsenetReleaseIsRemoved(t *testing.T) {
 	}
 }
 
+func TestHLSFailureInvalidatesAndSkipsUsenetRelease(t *testing.T) {
+	store := playbackcache.New(t.TempDir())
+	candidate := catalog.RankedCandidate{Candidate: catalog.Candidate{
+		ID: "broken-release", Indexer: "usenet", Name: "Show.S09E03.1080p",
+		Protocol: catalog.ProtocolUsenet,
+	}}
+	if _, err := store.SaveUsenet(
+		"tmdb-tv:1:s9:e3", "Show", 2005, candidate, []byte("nzb"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{
+		playbackCache: store,
+		playbackCacheKeys: map[string]playbackCacheKey{
+			"broken-playback": {
+				mediaID: "tmdb-tv:1:s9:e3", title: "Show", year: 2005,
+				source: catalog.ProtocolUsenet,
+			},
+		},
+		selected: map[string]catalog.RankedCandidate{"broken-playback": candidate},
+		playbackRequests: map[string]CreatePlaybackRequest{
+			"broken-playback": {SeasonNumber: 9, EpisodeNumber: 3},
+		},
+		usenetFailures: make(map[string]time.Time),
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	server.invalidateCachedPlayback("broken-playback")
+
+	if _, found, err := store.LookupUsenet("tmdb-tv:1:s9:e3", "Show", 2005); err != nil || found {
+		t.Fatalf("cached Usenet playback found = %v, error = %v", found, err)
+	}
+	if !server.usenetCandidateRecentlyFailed(candidate.Candidate, "S09E03") {
+		t.Fatal("release that failed HLS packaging was not temporarily skipped")
+	}
+}
+
 func TestCreatePlaybackFallsBackToTorrent(t *testing.T) {
 	dataDir := t.TempDir()
 	torrentContents := createAPITestTorrent(t, dataDir)
