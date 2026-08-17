@@ -310,6 +310,7 @@ struct NetflixMovieShelf: View {
     var preferredEntryFocus: NetflixShelfFocus?
     var requestsInitialFocus = false
     var onFocus: (Movie) -> Void = { _ in }
+    var onHorizontalFocusChange: () -> Void = {}
     var onShelfFocusChange: (Bool) -> Void = { _ in }
 
     @State private var expandedMovieID: String?
@@ -404,6 +405,9 @@ struct NetflixMovieShelf: View {
         }
         guard focusedMovieID != expandedMovieID else { return }
         reveal(focusedMovieID, proxy: proxy)
+        if oldMovieID != nil {
+            onHorizontalFocusChange()
+        }
     }
 
     private func reveal(_ movieID: String, proxy: ScrollViewProxy) {

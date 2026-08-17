@@ -11,6 +11,7 @@ struct HomeView: View {
 
     private let homeTopID = "home-top"
     private let continueShelfID = "continue-watching"
+    private let finalShelfAlignmentSpace: CGFloat = 360
 
     var body: some View {
         NavigationStack {
@@ -34,7 +35,7 @@ struct HomeView: View {
                         }
                         .padding(.horizontal, 72)
                         .padding(.top, 54)
-                        .padding(.bottom, 110)
+                        .padding(.bottom, finalShelfAlignmentSpace)
                     }
                     .ignoresSafeArea(.container, edges: .horizontal)
                 }
@@ -123,6 +124,13 @@ struct HomeView: View {
                 preferredEntryFocus: searchReturnFocus,
                 requestsInitialFocus: true,
                 onFocus: loadRatings,
+                onHorizontalFocusChange: {
+                    alignShelf(
+                        continueShelfID,
+                        scrollProxy: scrollProxy,
+                        animated: false
+                    )
+                },
                 onShelfFocusChange: {
                     updateShelfFocus(
                         continueShelfID,
@@ -153,6 +161,13 @@ struct HomeView: View {
                 focusBinding: $focusedShelfItem,
                 preferredEntryFocus: searchReturnFocus,
                 onFocus: loadRatings,
+                onHorizontalFocusChange: {
+                    alignShelf(
+                        section.id,
+                        scrollProxy: scrollProxy,
+                        animated: false
+                    )
+                },
                 onShelfFocusChange: {
                     updateShelfFocus(
                         section.id,
@@ -182,13 +197,26 @@ struct HomeView: View {
         alignShelf(shelfID, scrollProxy: scrollProxy)
     }
 
-    private func alignShelf(_ shelfID: String, scrollProxy: ScrollViewProxy) {
+    private func alignShelf(
+        _ shelfID: String,
+        scrollProxy: ScrollViewProxy,
+        animated: Bool = true
+    ) {
         let targetID = shelfID == continueShelfID ? homeTopID : shelfID
         let anchor = shelfID == continueShelfID
             ? UnitPoint.top
             : UnitPoint(x: 0.5, y: 0.07)
-        withAnimation(.easeInOut(duration: 0.24)) {
-            scrollProxy.scrollTo(targetID, anchor: anchor)
+
+        if animated {
+            withAnimation(.easeInOut(duration: 0.24)) {
+                scrollProxy.scrollTo(targetID, anchor: anchor)
+            }
+        } else {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                scrollProxy.scrollTo(targetID, anchor: anchor)
+            }
         }
     }
 
