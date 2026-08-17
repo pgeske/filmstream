@@ -63,7 +63,8 @@ while :; do sleep 1; done
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stream.VideoCodec != "h264" || stream.DurationSeconds != 7200.5 || stream.StartSeconds != 118.5 || len(stream.Subtitles) != 1 {
+	if stream.VideoCodec != "h264" || stream.DurationSeconds != 7200.5 ||
+		stream.RequestedStartSeconds != 120 || stream.StartSeconds != 118.5 || len(stream.Subtitles) != 1 {
 		t.Fatalf("stream = %+v", stream)
 	}
 	path, err := manager.AssetPath(stream.PlaybackID, "index.m3u8")
@@ -122,12 +123,19 @@ cat > "$dir/index.m3u8" <<'PLAYLIST'
 #EXTINF:4.0,
 segment-000000.m4s
 PLAYLIST
+sleep 0.2
+printf 'segment' > "$dir/segment-000001.m4s"
+cat >> "$dir/index.m3u8" <<'PLAYLIST'
+#EXTINF:4.0,
+segment-000001.m4s
+PLAYLIST
 while :; do sleep 1; done
 `, packagerCount))
 	manager, err := New(Config{
 		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
 		SourceBaseURL: "http://127.0.0.1:8943", StartupTimeout: 5 * time.Second,
 		BufferSeconds: 4, ParkedTTL: 50 * time.Millisecond,
+		ParkedResumeTimeout: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -177,6 +185,62 @@ while :; do sleep 1; done
 			t.Fatalf("parked stream did not expire: %v", err)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestManagerRebuildsPreparedStreamWhenSourceDoesNotResume(t *testing.T) {
+	packagerCount := filepath.Join(t.TempDir(), "packager-count")
+	probeCount := filepath.Join(t.TempDir(), "probe-count")
+	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
+printf 'x\n' >> %q
+cat <<'JSON'
+{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]}],"format":{"duration":"7200"}}
+JSON
+`, probeCount))
+	ffmpeg := writeExecutable(t, "ffmpeg", fmt.Sprintf(`#!/bin/sh
+printf 'x\n' >> %q
+for last do :; done
+dir=$(dirname "$last")
+printf 'init' > "$dir/init.mp4"
+printf 'segment' > "$dir/segment-000000.m4s"
+cat > "$dir/index.m3u8" <<'PLAYLIST'
+#EXTM3U
+#EXTINF:4.0,
+segment-000000.m4s
+PLAYLIST
+while :; do sleep 1; done
+`, packagerCount))
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943", StartupTimeout: 5 * time.Second,
+		BufferSeconds: 4, ParkedResumeTimeout: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	first, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Park(t.Context(), first.PlaybackID, 4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Start(t.Context(), first.PlaybackID, 0, []string{"en"}); err != nil {
+		t.Fatal(err)
+	}
+
+	packagerCalls, err := os.ReadFile(packagerCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probeCalls, err := os.ReadFile(probeCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(packagerCalls), "x") != 2 || strings.Count(string(probeCalls), "x") != 2 {
+		t.Fatalf("packager calls = %q, probe calls = %q", packagerCalls, probeCalls)
 	}
 }
 
@@ -356,6 +420,29 @@ func TestPreferredAudioStreamUsesRequestedLanguageBeforeDefault(t *testing.T) {
 	fallback, found := preferredAudioStream(probe, nil)
 	if !found || fallback.Index != 1 {
 		t.Fatalf("fallback audio = %+v, found = %v", fallback, found)
+	}
+}
+
+func TestProbeTimelineStartBacksUpFromFutureTimestamp(t *testing.T) {
+	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
+case " $* " in
+  *" 569.000%+#1 "*) printf '632.382\n' ;;
+  *) printf '540.540\n' ;;
+esac
+`)
+	ffmpeg := writeExecutable(t, "ffmpeg", "#!/bin/sh\nexit 0\n")
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	start, err := manager.probeTimelineStart(t.Context(), "http://source", 569)
+	if err != nil || start != 540.54 {
+		t.Fatalf("timeline start = %v, error = %v", start, err)
 	}
 }
 

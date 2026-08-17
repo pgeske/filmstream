@@ -7,6 +7,7 @@ import UIKit
 
 struct PlayerView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
 
     let movie: Movie
     let prepared: PreparedPlayback
@@ -24,7 +25,7 @@ struct PlayerView: View {
         self.prepared = prepared
         self.api = api
         _controller = StateObject(
-            wrappedValue: NativePlaybackController(prepared: prepared, api: api)
+            wrappedValue: NativePlaybackController(movie: movie, prepared: prepared, api: api)
         )
     }
 
@@ -113,6 +114,16 @@ struct PlayerView: View {
         .onDisappear {
             chromeAutoHideTask?.cancel()
             closePlayback()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .active:
+                Task { await controller.reconnectAfterInterruption() }
+            case .inactive, .background:
+                controller.markInterrupted()
+            @unknown default:
+                break
+            }
         }
         .onTapGesture {
             guard !isSubtitlePickerPresented else { return }
@@ -290,7 +301,7 @@ struct PlayerView: View {
                     durationSeconds: duration
                 )
             }
-            try? await api.stopNativePlayback(prepared.playback.id)
+            try? await api.stopNativePlayback(controller.playbackID)
         }
     }
 
@@ -548,13 +559,16 @@ private final class NativePlaybackController: ObservableObject {
     @Published private(set) var activeSubtitleText: String?
 
     private let api: FilmstreamAPI
-    private let playback: Playback
+    private let movie: Movie
+    private var playback: Playback
+    private var requestedStreamStartSeconds: Double
     private var streamStartSeconds: Double
     private var timeObserver: Any?
     private var statusObservation: NSKeyValueObservation?
     private var playbackObservation: NSKeyValueObservation?
     private var seekTask: Task<Void, Never>?
     private var subtitleTask: Task<Void, Never>?
+    private var bufferingRecoveryTask: Task<Void, Never>?
     private var subtitleCues: [SubtitleCue] = []
     private var seekGeneration = 0
     private var seekOriginSeconds: Double
@@ -562,20 +576,37 @@ private final class NativePlaybackController: ObservableObject {
     private var resumeAfterSeek = true
     private var wantsToPlay = false
     private var stopped = false
+    private var wasInterrupted = false
+    private var isRecovering = false
 
-    init(prepared: PreparedPlayback, api: FilmstreamAPI) {
+    var playbackID: String { playback.id }
+
+    init(movie: Movie, prepared: PreparedPlayback, api: FilmstreamAPI) {
         self.api = api
+        self.movie = movie
         playback = prepared.playback
+        requestedStreamStartSeconds = max(
+            0,
+            prepared.hls.requestedStartSeconds ?? prepared.hls.startSeconds
+        )
         streamStartSeconds = max(0, prepared.hls.startSeconds)
-        positionSeconds = max(0, prepared.hls.startSeconds)
+        positionSeconds = requestedStreamStartSeconds
         durationSeconds = max(0, prepared.hls.durationSeconds ?? 0)
-        seekOriginSeconds = max(0, prepared.hls.startSeconds)
+        seekOriginSeconds = requestedStreamStartSeconds
         subtitleOptions = prepared.hls.subtitles ?? []
         selectedSubtitle = Self.preferredSubtitle(in: subtitleOptions)
 
         player.automaticallyWaitsToMinimizeStalling = true
         player.actionAtItemEnd = .pause
         installItem(url: prepared.hls.playlistURL)
+        let initialOffset = max(0, requestedStreamStartSeconds - streamStartSeconds)
+        if initialOffset > 0 {
+            player.seek(
+                to: CMTime(seconds: initialOffset, preferredTimescale: 600),
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            )
+        }
 
         timeObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
@@ -601,17 +632,22 @@ private final class NativePlaybackController: ObservableObject {
                 guard let self, !self.stopped, !self.isSeeking else { return }
                 switch player.timeControlStatus {
                 case .playing:
+                    self.bufferingRecoveryTask?.cancel()
+                    self.bufferingRecoveryTask = nil
                     self.isPlaying = true
                     self.isWaiting = false
                     self.stateLabel = "Playing"
                 case .waitingToPlayAtSpecifiedRate:
                     self.isPlaying = self.wantsToPlay
                     self.isWaiting = true
-                    self.stateLabel = "Buffering…"
+                    self.stateLabel = self.isRecovering ? "Reconnecting…" : "Buffering…"
+                    self.scheduleBufferingRecovery()
                 case .paused:
+                    self.bufferingRecoveryTask?.cancel()
+                    self.bufferingRecoveryTask = nil
                     self.isPlaying = false
-                    self.isWaiting = false
-                    self.stateLabel = "Paused"
+                    self.isWaiting = self.isRecovering
+                    self.stateLabel = self.isRecovering ? "Reconnecting…" : "Paused"
                 @unknown default:
                     self.isWaiting = true
                     self.stateLabel = "Preparing Stream…"
@@ -643,10 +679,127 @@ private final class NativePlaybackController: ObservableObject {
         }
     }
 
+    func markInterrupted() {
+        guard !stopped else { return }
+        wasInterrupted = true
+        wantsToPlay = false
+        isPlaying = false
+        isWaiting = false
+        stateLabel = "Paused"
+        bufferingRecoveryTask?.cancel()
+        bufferingRecoveryTask = nil
+        player.pause()
+    }
+
+    func reconnectAfterInterruption() async {
+        guard wasInterrupted else { return }
+        await recoverPlayback(reusePreparedStream: true)
+    }
+
     func jump(by seconds: Double) {
         guard !stopped, durationSeconds > 0 else { return }
         let origin = pendingSeekSeconds ?? positionSeconds
         seek(to: origin + seconds)
+    }
+
+    private func scheduleBufferingRecovery() {
+        bufferingRecoveryTask?.cancel()
+        bufferingRecoveryTask = nil
+        guard wantsToPlay, !isRecovering, !isSeeking, !wasInterrupted else { return }
+        bufferingRecoveryTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(12))
+            } catch {
+                return
+            }
+            guard let self,
+                  !self.stopped,
+                  self.wantsToPlay,
+                  !self.isSeeking,
+                  self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate else {
+                return
+            }
+            await self.recoverPlayback(reusePreparedStream: false)
+        }
+    }
+
+    private func recoverPlayback(reusePreparedStream: Bool) async {
+        guard !stopped, !isRecovering else { return }
+        isRecovering = true
+        wasInterrupted = false
+        bufferingRecoveryTask?.cancel()
+        bufferingRecoveryTask = nil
+        isWaiting = true
+        stateLabel = "Reconnecting…"
+        errorMessage = nil
+        player.pause()
+
+        let resumePosition = max(0, positionSeconds)
+        var requestedStart = reusePreparedStream ? requestedStreamStartSeconds : resumePosition
+        do {
+            let refreshed: PreparedPlayback
+            do {
+                refreshed = try await api.prepareNativePlayback(
+                    playback,
+                    startSeconds: requestedStart
+                )
+            } catch {
+                requestedStart = resumePosition
+                let replacement = try await api.createPlayback(
+                    for: movie,
+                    startSeconds: requestedStart
+                )
+                refreshed = try await api.prepareNativePlaybackWithRetry(
+                    replacement,
+                    for: movie,
+                    startSeconds: requestedStart
+                )
+            }
+            guard !stopped else { return }
+
+            playback = refreshed.playback
+            requestedStreamStartSeconds = max(
+                0,
+                refreshed.hls.requestedStartSeconds ?? requestedStart
+            )
+            streamStartSeconds = max(0, refreshed.hls.startSeconds)
+            updateSubtitleOptions(refreshed.hls.subtitles ?? [])
+            if let duration = refreshed.hls.durationSeconds, duration > 0 {
+                durationSeconds = duration
+            }
+            positionSeconds = resumePosition
+            installItem(url: cacheBusted(refreshed.hls.playlistURL))
+
+            let localPosition = max(0, resumePosition - streamStartSeconds)
+            let time = CMTime(seconds: localPosition, preferredTimescale: 600)
+            player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+                Task { @MainActor in
+                    guard let self, !self.stopped else { return }
+                    self.isRecovering = false
+                    self.isWaiting = false
+                    if !finished {
+                        self.wantsToPlay = false
+                        self.isPlaying = false
+                        self.stateLabel = "Paused"
+                        return
+                    }
+                    if self.wantsToPlay {
+                        self.play()
+                    } else {
+                        self.isPlaying = false
+                        self.stateLabel = "Paused"
+                    }
+                }
+            }
+        } catch {
+            guard !stopped else { return }
+            isRecovering = false
+            isWaiting = false
+            isPlaying = false
+            wantsToPlay = false
+            stateLabel = "Unable to Reconnect"
+            errorMessage = error.localizedDescription
+        }
     }
 
     func selectSubtitle(_ track: HLSSubtitleTrack?) {
@@ -666,6 +819,8 @@ private final class NativePlaybackController: ObservableObject {
         seekTask = nil
         subtitleTask?.cancel()
         subtitleTask = nil
+        bufferingRecoveryTask?.cancel()
+        bufferingRecoveryTask = nil
         player.pause()
         player.isMuted = true
         player.replaceCurrentItem(with: nil)
@@ -724,14 +879,25 @@ private final class NativePlaybackController: ObservableObject {
         do {
             let prepared = try await api.prepareNativePlayback(playback, startSeconds: target)
             guard !Task.isCancelled, generation == seekGeneration, !stopped else { return }
+            requestedStreamStartSeconds = max(
+                0,
+                prepared.hls.requestedStartSeconds ?? target
+            )
             streamStartSeconds = max(0, prepared.hls.startSeconds)
             updateSubtitleOptions(prepared.hls.subtitles ?? [])
             if let duration = prepared.hls.durationSeconds, duration > 0 {
                 durationSeconds = duration
             }
-            positionSeconds = streamStartSeconds
+            positionSeconds = target
             installItem(url: cacheBusted(prepared.hls.playlistURL))
-            finishSeek(generation: generation)
+            let localPosition = max(0, target - streamStartSeconds)
+            let time = CMTime(seconds: localPosition, preferredTimescale: 600)
+            player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+                Task { @MainActor in
+                    guard finished else { return }
+                    self?.finishSeek(generation: generation)
+                }
+            }
         } catch {
             guard generation == seekGeneration, !stopped else { return }
             pendingSeekSeconds = nil

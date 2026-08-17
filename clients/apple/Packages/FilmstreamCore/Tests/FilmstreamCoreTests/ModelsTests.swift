@@ -45,9 +45,10 @@ import Testing
 }
 
 @Test func decodesNativeHLSPlayback() throws {
-    let data = Data(#"{"playback_id":"abc123","playlist_url":"https://filmstream.example/v1/playbacks/abc123/hls/index.m3u8","start_seconds":120,"duration_seconds":7200,"video_codec":"h264","subtitles":[{"index":6,"language":"en","title":"SDH"}]}"#.utf8)
+    let data = Data(#"{"playback_id":"abc123","playlist_url":"https://filmstream.example/v1/playbacks/abc123/hls/index.m3u8","requested_start_seconds":125,"start_seconds":120,"duration_seconds":7200,"video_codec":"h264","subtitles":[{"index":6,"language":"en","title":"SDH"}]}"#.utf8)
     let playback = try JSONDecoder().decode(HLSPlayback.self, from: data)
     #expect(playback.id == "abc123")
+    #expect(playback.requestedStartSeconds == 125)
     #expect(playback.startSeconds == 120)
     #expect(playback.durationSeconds == 7200)
     #expect(playback.playlistURL.pathExtension == "m3u8")

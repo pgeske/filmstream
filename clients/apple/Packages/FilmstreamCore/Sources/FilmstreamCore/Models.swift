@@ -383,6 +383,7 @@ public struct HLSPlayback: Codable, Hashable, Identifiable, Sendable {
     public var id: String { playbackID }
     public let playbackID: String
     public let playlistURL: URL
+    public let requestedStartSeconds: Double?
     public let startSeconds: Double
     public let durationSeconds: Double?
     public let videoCodec: String
@@ -391,6 +392,7 @@ public struct HLSPlayback: Codable, Hashable, Identifiable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case playbackID = "playback_id"
         case playlistURL = "playlist_url"
+        case requestedStartSeconds = "requested_start_seconds"
         case startSeconds = "start_seconds"
         case durationSeconds = "duration_seconds"
         case videoCodec = "video_codec"

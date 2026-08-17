@@ -23,27 +23,30 @@ const (
 	defaultReadRate             = 1.25
 	defaultSegmentSeconds       = 4
 	defaultParkedTTL            = 2 * time.Hour
+	defaultParkedResumeTimeout  = 6 * time.Second
 )
 
 type Config struct {
-	DataDir        string
-	FFmpegPath     string
-	FFprobePath    string
-	SourceBaseURL  string
-	StartupTimeout time.Duration
-	BufferSeconds  int
-	ReadRate       float64
-	SegmentSeconds int
-	ParkedTTL      time.Duration
-	Logger         *slog.Logger
+	DataDir             string
+	FFmpegPath          string
+	FFprobePath         string
+	SourceBaseURL       string
+	StartupTimeout      time.Duration
+	BufferSeconds       int
+	ReadRate            float64
+	SegmentSeconds      int
+	ParkedTTL           time.Duration
+	ParkedResumeTimeout time.Duration
+	Logger              *slog.Logger
 }
 
 type Stream struct {
-	PlaybackID      string          `json:"playback_id"`
-	StartSeconds    float64         `json:"start_seconds"`
-	DurationSeconds float64         `json:"duration_seconds,omitempty"`
-	VideoCodec      string          `json:"video_codec"`
-	Subtitles       []SubtitleTrack `json:"subtitles"`
+	PlaybackID            string          `json:"playback_id"`
+	RequestedStartSeconds float64         `json:"requested_start_seconds"`
+	StartSeconds          float64         `json:"start_seconds"`
+	DurationSeconds       float64         `json:"duration_seconds,omitempty"`
+	VideoCodec            string          `json:"video_codec"`
+	Subtitles             []SubtitleTrack `json:"subtitles"`
 }
 
 type SubtitleTrack struct {
@@ -55,16 +58,17 @@ type SubtitleTrack struct {
 }
 
 type Manager struct {
-	dataDir        string
-	ffmpegPath     string
-	ffprobePath    string
-	sourceBaseURL  string
-	startupTimeout time.Duration
-	bufferSeconds  int
-	readRate       float64
-	segmentSeconds int
-	parkedTTL      time.Duration
-	logger         *slog.Logger
+	dataDir             string
+	ffmpegPath          string
+	ffprobePath         string
+	sourceBaseURL       string
+	startupTimeout      time.Duration
+	bufferSeconds       int
+	readRate            float64
+	segmentSeconds      int
+	parkedTTL           time.Duration
+	parkedResumeTimeout time.Duration
+	logger              *slog.Logger
 
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -160,6 +164,9 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.ParkedTTL <= 0 {
 		cfg.ParkedTTL = defaultParkedTTL
 	}
+	if cfg.ParkedResumeTimeout <= 0 {
+		cfg.ParkedResumeTimeout = defaultParkedResumeTimeout
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
@@ -171,20 +178,21 @@ func New(cfg Config) (*Manager, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
-		dataDir:        cfg.DataDir,
-		ffmpegPath:     ffmpegPath,
-		ffprobePath:    ffprobePath,
-		sourceBaseURL:  strings.TrimRight(cfg.SourceBaseURL, "/"),
-		startupTimeout: cfg.StartupTimeout,
-		bufferSeconds:  cfg.BufferSeconds,
-		readRate:       cfg.ReadRate,
-		segmentSeconds: cfg.SegmentSeconds,
-		parkedTTL:      cfg.ParkedTTL,
-		logger:         cfg.Logger,
-		ctx:            ctx,
-		cancel:         cancel,
-		streams:        make(map[string]*runningStream),
-		startLocks:     make(map[string]*playbackStartLock),
+		dataDir:             cfg.DataDir,
+		ffmpegPath:          ffmpegPath,
+		ffprobePath:         ffprobePath,
+		sourceBaseURL:       strings.TrimRight(cfg.SourceBaseURL, "/"),
+		startupTimeout:      cfg.StartupTimeout,
+		bufferSeconds:       cfg.BufferSeconds,
+		readRate:            cfg.ReadRate,
+		segmentSeconds:      cfg.SegmentSeconds,
+		parkedTTL:           cfg.ParkedTTL,
+		parkedResumeTimeout: cfg.ParkedResumeTimeout,
+		logger:              cfg.Logger,
+		ctx:                 ctx,
+		cancel:              cancel,
+		streams:             make(map[string]*runningStream),
+		startLocks:          make(map[string]*playbackStartLock),
 	}, nil
 }
 
@@ -273,7 +281,7 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 	}
 
 	streamContext, cancel := context.WithCancel(m.ctx)
-	args := m.ffmpegArgs(sourceURL, dir, codec, startSeconds, audioIndex)
+	args := m.ffmpegArgs(sourceURL, dir, codec, timelineStart, audioIndex)
 	command := exec.CommandContext(streamContext, m.ffmpegPath, args...)
 	command.Stdout = logFile
 	command.Stderr = logFile
@@ -284,7 +292,8 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 	}
 	stream := &runningStream{
 		info: Stream{
-			PlaybackID: playbackID, StartSeconds: timelineStart, DurationSeconds: duration,
+			PlaybackID: playbackID, RequestedStartSeconds: startSeconds,
+			StartSeconds: timelineStart, DurationSeconds: duration,
 			VideoCodec: codec, Subtitles: subtitles,
 		},
 		dir:            dir,
@@ -353,11 +362,14 @@ func (m *Manager) resumePreparedStream(
 		stream.processMu.Unlock()
 		return Stream{}, false, nil
 	}
-	if stream.parked {
+	wasParked := stream.parked
+	bufferedSegments, _ := playlistStatus(stream.dir)
+	if wasParked {
 		if err := stream.command.Process.Signal(syscall.SIGCONT); err != nil {
 			stream.processMu.Unlock()
 			m.logger.Warn("resume prepared HLS stream", "playback_id", playbackID, "error", err)
-			return Stream{}, true, fmt.Errorf("resume prepared HLS stream: %w", err)
+			m.Stop(playbackID)
+			return Stream{}, false, nil
 		}
 		stream.parked = false
 		stream.parkedAt = time.Time{}
@@ -369,6 +381,15 @@ func (m *Manager) resumePreparedStream(
 			"start_seconds", stream.info.StartSeconds)
 	}
 	stream.processMu.Unlock()
+
+	if wasParked {
+		if err := m.waitForPlaylistGrowth(ctx, stream, bufferedSegments); err != nil {
+			m.logger.Warn("prepared HLS source did not resume; rebuilding stream",
+				"playback_id", playbackID, "error", err)
+			m.Stop(playbackID)
+			return Stream{}, false, nil
+		}
+	}
 
 	startupContext, cancel := context.WithTimeout(ctx, m.startupTimeout)
 	defer cancel()
@@ -630,9 +651,30 @@ func (m *Manager) probe(parent context.Context, sourceURL string) (mediaProbe, e
 }
 
 func (m *Manager) probeTimelineStart(parent context.Context, sourceURL string, requested float64) (float64, error) {
-	ctx, cancel := context.WithTimeout(parent, m.startupTimeout)
+	var lastErr error
+	minimumStart := math.Max(0, requested-60)
+	for _, lookback := range []float64{0, 5, 15, 30, 60} {
+		probeAt := math.Max(0, requested-lookback)
+		start, err := m.probeVideoTimestamp(parent, sourceURL, probeAt)
+		if err == nil && start >= minimumStart && start <= requested+0.5 {
+			return start, nil
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("invalid video keyframe timestamp %q", strconv.FormatFloat(start, 'f', 3, 64))
+		}
+		if probeAt == 0 {
+			break
+		}
+	}
+	return requested, lastErr
+}
+
+func (m *Manager) probeVideoTimestamp(parent context.Context, sourceURL string, startSeconds float64) (float64, error) {
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
-	interval := strconv.FormatFloat(requested, 'f', 3, 64) + "%+#1"
+	interval := strconv.FormatFloat(startSeconds, 'f', 3, 64) + "%+#1"
 	command := exec.CommandContext(ctx, m.ffprobePath,
 		"-v", "error",
 		"-read_intervals", interval,
@@ -643,17 +685,17 @@ func (m *Manager) probeTimelineStart(parent context.Context, sourceURL string, r
 	)
 	output, err := command.Output()
 	if err != nil {
-		return requested, fmt.Errorf("probe video keyframe: %w", err)
+		return 0, fmt.Errorf("probe video keyframe: %w", err)
 	}
 	fields := strings.Fields(string(output))
 	if len(fields) == 0 {
-		return requested, errors.New("probe video keyframe returned no timestamp")
+		return 0, errors.New("probe video keyframe returned no timestamp")
 	}
-	start, err := strconv.ParseFloat(fields[0], 64)
-	if err != nil || start < 0 || start > requested+0.5 {
-		return requested, fmt.Errorf("invalid video keyframe timestamp %q", fields[0])
+	timestamp, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid video keyframe timestamp %q", fields[0])
 	}
-	return start, nil
+	return timestamp, nil
 }
 
 func compatibleVideo(probe mediaProbe) (string, float64, error) {
@@ -880,6 +922,34 @@ func (m *Manager) waitUntilBuffered(ctx context.Context, stream *runningStream, 
 	}
 }
 
+func (m *Manager) waitForPlaylistGrowth(
+	parent context.Context,
+	stream *runningStream,
+	initialSegments int,
+) error {
+	ctx, cancel := context.WithTimeout(parent, m.parkedResumeTimeout)
+	defer cancel()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		segments, complete := playlistStatus(stream.dir)
+		if segments > initialSegments || complete {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-stream.done:
+			segments, complete = playlistStatus(stream.dir)
+			if segments > initialSegments || complete {
+				return nil
+			}
+			return errors.New("HLS packager stopped without extending the playlist")
+		case <-ticker.C:
+		}
+	}
+}
+
 func playlistReady(dir string, minimumSeconds int) bool {
 	playlist, err := os.ReadFile(filepath.Join(dir, "index.m3u8"))
 	if err != nil {
@@ -905,6 +975,22 @@ func playlistReady(dir string, minimumSeconds int) bool {
 	}
 	matches, _ := filepath.Glob(filepath.Join(dir, "segment-*.m4s"))
 	return len(matches) >= segmentCount
+}
+
+func playlistStatus(dir string) (segments int, complete bool) {
+	playlist, err := os.ReadFile(filepath.Join(dir, "index.m3u8"))
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(playlist), "\n") {
+		switch {
+		case strings.HasPrefix(line, "#EXTINF:"):
+			segments++
+		case line == "#EXT-X-ENDLIST":
+			complete = true
+		}
+	}
+	return segments, complete
 }
 
 func validPlaybackID(id string) bool {
