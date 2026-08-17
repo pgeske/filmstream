@@ -4,7 +4,10 @@ import SwiftUI
 struct HomeView: View {
     @Environment(AppModel.self) private var model
     @State private var activeShelfID: String?
+    @State private var lastFocusedShelfItem: NetflixShelfFocus?
+    @State private var searchReturnFocus: NetflixShelfFocus?
     @FocusState private var focusedShelfItem: NetflixShelfFocus?
+    @FocusState private var isSearchFocused: Bool
 
     private let homeTopID = "home-top"
     private let continueShelfID = "continue-watching"
@@ -46,6 +49,23 @@ struct HomeView: View {
             .task {
                 await model.loadHome()
             }
+            .onChange(of: focusedShelfItem) { _, newFocus in
+                guard let newFocus else { return }
+                lastFocusedShelfItem = newFocus
+                guard newFocus == searchReturnFocus, !isSearchFocused else { return }
+                Task { @MainActor in
+                    await Task.yield()
+                    guard focusedShelfItem == newFocus else { return }
+                    searchReturnFocus = nil
+                }
+            }
+            .onChange(of: isSearchFocused) { wasFocused, isFocused in
+                if isFocused {
+                    searchReturnFocus = lastFocusedShelfItem
+                } else if wasFocused, focusedShelfItem != nil, let searchReturnFocus {
+                    focusedShelfItem = searchReturnFocus
+                }
+            }
         }
     }
 
@@ -61,6 +81,7 @@ struct HomeView: View {
             }
             .buttonStyle(TeaActionButtonStyle())
             .focusEffectDisabled()
+            .focused($isSearchFocused)
         }
         .padding(.horizontal, 16)
         .focusSection()
@@ -99,6 +120,7 @@ struct HomeView: View {
                     )
                 },
                 focusBinding: $focusedShelfItem,
+                preferredEntryFocus: searchReturnFocus,
                 requestsInitialFocus: true,
                 onFocus: loadRatings,
                 onShelfFocusChange: {
@@ -129,6 +151,7 @@ struct HomeView: View {
                     )
                 },
                 focusBinding: $focusedShelfItem,
+                preferredEntryFocus: searchReturnFocus,
                 onFocus: loadRatings,
                 onShelfFocusChange: {
                     updateShelfFocus(

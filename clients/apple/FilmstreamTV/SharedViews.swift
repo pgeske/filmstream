@@ -307,6 +307,7 @@ struct NetflixMovieShelf: View {
     let title: String
     let items: [NetflixShelfItem]
     let focusBinding: FocusState<NetflixShelfFocus?>.Binding
+    var preferredEntryFocus: NetflixShelfFocus?
     var requestsInitialFocus = false
     var onFocus: (Movie) -> Void = { _ in }
     var onShelfFocusChange: (Bool) -> Void = { _ in }
@@ -389,6 +390,15 @@ struct NetflixMovieShelf: View {
         }
 
         guard items.contains(where: { $0.id == focusedMovieID }) else { return }
+        // Redirect before expanding the card tvOS chose by geometry under Search.
+        if oldMovieID == nil,
+           let preferredEntryFocus,
+           preferredEntryFocus.shelfID == shelfID,
+           preferredEntryFocus.movieID != focusedMovieID,
+           items.contains(where: { $0.id == preferredEntryFocus.movieID }) {
+            focusBinding.wrappedValue = preferredEntryFocus
+            return
+        }
         if oldMovieID == nil {
             onShelfFocusChange(true)
         }
