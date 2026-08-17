@@ -118,21 +118,40 @@ struct ShowDetailView: View {
     }
 
     private var metadataLine: some View {
-        HStack(spacing: 15) {
-            Text((details?.show ?? show).catalogMetadata)
-            if let contentRating = ratings?.contentRating {
-                Text("•")
-                Text(contentRating)
-            }
-            MovieRatingBadges(ratings: ratings)
-            if let selection = playbackSelection {
-                Text("•")
-                Text(selection.episode.label)
-                    .foregroundStyle(Color.teaAccentLight)
+        VStack(alignment: .leading, spacing: 10) {
+            Text(showMetadataSummary)
+
+            HStack(spacing: 15) {
+                if let contentRating = ratings?.contentRating {
+                    Text(contentRating)
+                }
+                MovieRatingBadges(ratings: ratings)
+                if let selection = playbackSelection {
+                    if ratings?.isEmpty == false {
+                        Text("•")
+                    }
+                    Text(selection.isResume ? "Resume \(selection.episode.label)" : "Play \(selection.episode.label)")
+                        .foregroundStyle(Color.teaAccentLight)
+                }
             }
         }
         .font(.headline)
         .foregroundStyle(Color.teaMuted)
+    }
+
+    private var showMetadataSummary: String {
+        let currentShow = details?.show ?? show
+        var values: [String] = []
+        if let genre = currentShow.primaryGenre {
+            values.append(genre)
+        }
+        if let year = currentShow.year {
+            values.append(String(year))
+        }
+        if let seasonCount = currentShow.seasonCountLabel {
+            values.append(seasonCount)
+        }
+        return values.isEmpty ? "Show" : values.joined(separator: " • ")
     }
 
     private var actionButtons: some View {

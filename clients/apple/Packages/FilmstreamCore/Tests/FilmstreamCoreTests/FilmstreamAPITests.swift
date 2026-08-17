@@ -13,7 +13,13 @@ import Testing
         baseURL: URL(string: "https://filmstream.test")!,
         session: URLSession(configuration: configuration)
     )
-    let movie = Movie(id: "tmdb:1", mediaType: .movie, title: "The Movie", year: 2020)
+    let movie = Movie(
+        id: "tmdb:1",
+        mediaType: .movie,
+        title: "The Movie",
+        originalLanguage: "ja",
+        year: 2020
+    )
 
     try await api.prewarmPlayback(for: movie, startSeconds: 612.5)
     let playback = try await api.createPlayback(for: movie, startSeconds: 612.5)
@@ -33,12 +39,20 @@ import Testing
         "/v1/playbacks/playback-2/hls",
     ])
     #expect(recorder.startSeconds == [612.5, 612.5, 612.5, 612.5, 612.5])
+    #expect(recorder.languages == [
+        ["ja", "en", "english"],
+        ["ja", "en", "english"],
+        [],
+        ["ja", "en", "english"],
+        [],
+    ])
 }
 
 private final class APIRequestRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var recordedPaths: [String] = []
     private var recordedStartSeconds: [Double] = []
+    private var recordedLanguages: [[String]] = []
     private var playbackCount = 0
 
     var paths: [String] {
@@ -49,6 +63,10 @@ private final class APIRequestRecorder: @unchecked Sendable {
         lock.withLock { recordedStartSeconds }
     }
 
+    var languages: [[String]] {
+        lock.withLock { recordedLanguages }
+    }
+
     func response(for request: URLRequest) -> (Int, Data) {
         let path = request.url?.path ?? ""
         let body = requestBody(request).flatMap { try? JSONSerialization.jsonObject(with: $0) }
@@ -56,6 +74,8 @@ private final class APIRequestRecorder: @unchecked Sendable {
         let currentPlaybackCount = lock.withLock {
             recordedPaths.append(path)
             recordedStartSeconds.append(body?["start_seconds"] as? Double ?? -1)
+            let preferences = body?["preferences"] as? [String: Any]
+            recordedLanguages.append(preferences?["languages"] as? [String] ?? [])
             if path == "/v1/playbacks" {
                 playbackCount += 1
             }

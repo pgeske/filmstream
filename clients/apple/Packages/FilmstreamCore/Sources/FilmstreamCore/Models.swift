@@ -10,6 +10,7 @@ public struct Movie: Codable, Hashable, Identifiable, Sendable {
     public let mediaType: MediaType?
     public let title: String
     public let originalTitle: String?
+    public let originalLanguage: String?
     public let year: Int?
     public let releaseDate: String?
     public let overview: String?
@@ -29,6 +30,7 @@ public struct Movie: Codable, Hashable, Identifiable, Sendable {
         mediaType: MediaType? = nil,
         title: String,
         originalTitle: String? = nil,
+        originalLanguage: String? = nil,
         year: Int? = nil,
         releaseDate: String? = nil,
         overview: String? = nil,
@@ -47,6 +49,7 @@ public struct Movie: Codable, Hashable, Identifiable, Sendable {
         self.mediaType = mediaType
         self.title = title
         self.originalTitle = originalTitle
+        self.originalLanguage = originalLanguage
         self.year = year
         self.releaseDate = releaseDate
         self.overview = overview
@@ -98,6 +101,7 @@ public struct Movie: Codable, Hashable, Identifiable, Sendable {
         case id, title, year, overview, genres
         case mediaType = "media_type"
         case originalTitle = "original_title"
+        case originalLanguage = "original_language"
         case releaseDate = "release_date"
         case posterURL = "poster_url"
         case backdropURL = "backdrop_url"
@@ -191,6 +195,7 @@ public struct Episode: Codable, Hashable, Identifiable, Sendable {
             mediaType: .show,
             title: show.title,
             originalTitle: show.originalTitle,
+            originalLanguage: show.originalLanguage,
             year: show.year,
             releaseDate: airDate,
             overview: overview,
@@ -309,6 +314,7 @@ public struct WatchHistoryEntry: Codable, Hashable, Identifiable, Sendable {
             mediaType: item.mediaType,
             title: item.title,
             originalTitle: item.originalTitle,
+            originalLanguage: item.originalLanguage,
             year: item.year,
             releaseDate: item.releaseDate,
             overview: item.overview,

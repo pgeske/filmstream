@@ -1860,6 +1860,22 @@ func (s *Server) serveHLSAsset(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case strings.HasSuffix(name, ".m3u8"):
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		playlist, err := os.ReadFile(path)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		contents := string(playlist)
+		if !strings.Contains(contents, "#EXT-X-START:") {
+			contents = strings.Replace(
+				contents,
+				"#EXTM3U\n",
+				"#EXTM3U\n#EXT-X-START:TIME-OFFSET=0,PRECISE=YES\n",
+				1,
+			)
+		}
+		_, _ = io.WriteString(w, contents)
+		return
 	case strings.HasSuffix(name, ".m4s"):
 		w.Header().Set("Content-Type", "video/iso.segment")
 	case strings.HasSuffix(name, ".mp4"):

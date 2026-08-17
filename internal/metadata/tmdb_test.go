@@ -18,8 +18,8 @@ func TestTMDBSearchReturnsMixedMoviesAndShows(t *testing.T) {
 				t.Errorf("query = %q", got)
 			}
 			_, _ = w.Write([]byte(`{"results":[
-				{"id":335984,"media_type":"movie","title":"Blade Runner 2049","original_title":"Blade Runner 2049","release_date":"2017-10-04","overview":"A young blade runner uncovers a secret.","poster_path":"/poster.jpg","backdrop_path":"/backdrop.jpg","vote_average":7.6,"genre_ids":[878,18]},
-				{"id":1399,"media_type":"tv","name":"Game of Thrones","original_name":"Game of Thrones","first_air_date":"2011-04-17","genre_ids":[10765,18]},
+				{"id":335984,"media_type":"movie","title":"Blade Runner 2049","original_title":"Blade Runner 2049","original_language":"en","release_date":"2017-10-04","overview":"A young blade runner uncovers a secret.","poster_path":"/poster.jpg","backdrop_path":"/backdrop.jpg","vote_average":7.6,"genre_ids":[878,18]},
+				{"id":1399,"media_type":"tv","name":"Game of Thrones","original_name":"Game of Thrones","original_language":"en","first_air_date":"2011-04-17","genre_ids":[10765,18]},
 				{"id":1,"media_type":"person","name":"Someone"}]}`))
 		case "/tv/1399":
 			_, _ = w.Write([]byte(`{"id":1399,"name":"Game of Thrones","first_air_date":"2011-04-17","number_of_seasons":8,"genres":[{"name":"Sci-Fi & Fantasy"}],"seasons":[{"season_number":1,"name":"Season 1","episode_count":10}]}`))
@@ -41,7 +41,7 @@ func TestTMDBSearchReturnsMixedMoviesAndShows(t *testing.T) {
 		t.Fatalf("items = %+v", items)
 	}
 	movie := items[0]
-	if movie.ID != "tmdb:335984" || movie.MediaType != MediaTypeMovie || movie.Year != 2017 {
+	if movie.ID != "tmdb:335984" || movie.MediaType != MediaTypeMovie || movie.Year != 2017 || movie.OriginalLanguage != "en" {
 		t.Fatalf("movie = %+v", movie)
 	}
 	if movie.PosterURL != posterBaseURL+"/poster.jpg" || movie.BackdropURL != backdropBaseURL+"/backdrop.jpg" {
@@ -157,7 +157,7 @@ func TestTMDBReturnsShowSeasonsAndEpisodes(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/tv/66732":
-			_, _ = w.Write([]byte(`{"id":66732,"name":"Stranger Things","original_name":"Stranger Things","first_air_date":"2016-07-15","overview":"A mystery unfolds.","poster_path":"/show.jpg","backdrop_path":"/show-bg.jpg","number_of_seasons":5,"genres":[{"name":"Drama"}],"seasons":[{"season_number":0,"name":"Specials","episode_count":2},{"season_number":1,"name":"Season 1","episode_count":8,"poster_path":"/s1.jpg"},{"season_number":2,"name":"Season 2","episode_count":9}]}`))
+			_, _ = w.Write([]byte(`{"id":66732,"name":"Stranger Things","original_name":"Stranger Things","original_language":"en","first_air_date":"2016-07-15","overview":"A mystery unfolds.","poster_path":"/show.jpg","backdrop_path":"/show-bg.jpg","number_of_seasons":5,"genres":[{"name":"Drama"}],"seasons":[{"season_number":0,"name":"Specials","episode_count":2},{"season_number":1,"name":"Season 1","episode_count":8,"poster_path":"/s1.jpg"},{"season_number":2,"name":"Season 2","episode_count":9}]}`))
 		case "/tv/66732/season/1":
 			_, _ = w.Write([]byte(`{"name":"Season 1","season_number":1,"episodes":[{"id":1,"name":"Chapter One: The Vanishing of Will Byers","overview":"Will disappears.","air_date":"2016-07-15","still_path":"/episode.jpg","runtime":49,"season_number":1,"episode_number":1},{"id":2,"name":"A Future Chapter","air_date":"2099-01-01","season_number":1,"episode_number":2}]}`))
 		default:
@@ -173,7 +173,7 @@ func TestTMDBReturnsShowSeasonsAndEpisodes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if show.MediaType != MediaTypeShow || len(show.Seasons) != 2 || show.Seasons[0].EpisodeCount != 8 {
+	if show.MediaType != MediaTypeShow || show.OriginalLanguage != "en" || len(show.Seasons) != 2 || show.Seasons[0].EpisodeCount != 8 {
 		t.Fatalf("show = %+v", show)
 	}
 	season, err := provider.Season(t.Context(), show.ID, 1)

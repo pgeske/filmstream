@@ -20,9 +20,10 @@ import Testing
 }
 
 @Test func decodesMixedShowMetadataAndEpisodes() throws {
-    let showData = Data(#"{"show":{"id":"tmdb-tv:66732","media_type":"show","title":"Stranger Things","year":2016,"genres":["Drama"],"number_of_seasons":5},"seasons":[{"number":1,"name":"Season 1","episode_count":8}]}"#.utf8)
+    let showData = Data(#"{"show":{"id":"tmdb-tv:66732","media_type":"show","title":"Stranger Things","original_language":"ja","year":2016,"genres":["Drama"],"number_of_seasons":5},"seasons":[{"number":1,"name":"Season 1","episode_count":8}]}"#.utf8)
     let details = try JSONDecoder().decode(SeriesDetails.self, from: showData)
     #expect(details.show.isShow)
+    #expect(details.show.originalLanguage == "ja")
     #expect(details.show.catalogMetadata == "Show • Drama • 2016 • 5 Seasons")
     #expect(details.seasons.first?.episodeCount == 8)
 
@@ -31,6 +32,7 @@ import Testing
     let episode = try #require(season.episodes.first)
     #expect(episode.label == "S1 E1")
     #expect(episode.playbackMovie(in: details.show).seriesID == details.show.id)
+    #expect(episode.playbackMovie(in: details.show).originalLanguage == "ja")
 }
 
 @Test func decodesExternalMovieRatings() throws {

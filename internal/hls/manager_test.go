@@ -340,7 +340,15 @@ func TestPreferredAudioStreamUsesRequestedLanguageBeforeDefault(t *testing.T) {
 			Language string `json:"language"`
 			Title    string `json:"title"`
 		}{Language: "eng", Title: "English"}},
+		{Index: 3, CodecType: "audio", Tags: struct {
+			Language string `json:"language"`
+			Title    string `json:"title"`
+		}{Language: "jpn", Title: "Japanese"}},
 	}}
+	japanese, found := preferredAudioStream(probe, []string{"ja", "en", "english"})
+	if !found || japanese.Index != 3 {
+		t.Fatalf("selected Japanese audio = %+v, found = %v", japanese, found)
+	}
 	selected, found := preferredAudioStream(probe, []string{"en", "english"})
 	if !found || selected.Index != 2 {
 		t.Fatalf("selected audio = %+v, found = %v", selected, found)

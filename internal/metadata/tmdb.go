@@ -49,22 +49,23 @@ type TMDB struct {
 }
 
 type tmdbMediaResult struct {
-	ID            int64   `json:"id"`
-	MediaType     string  `json:"media_type"`
-	Title         string  `json:"title"`
-	OriginalTitle string  `json:"original_title"`
-	ReleaseDate   string  `json:"release_date"`
-	Name          string  `json:"name"`
-	OriginalName  string  `json:"original_name"`
-	FirstAirDate  string  `json:"first_air_date"`
-	Overview      string  `json:"overview"`
-	PosterPath    string  `json:"poster_path"`
-	BackdropPath  string  `json:"backdrop_path"`
-	VoteAverage   float64 `json:"vote_average"`
-	VoteCount     int     `json:"vote_count"`
-	Popularity    float64 `json:"popularity"`
-	GenreIDs      []int   `json:"genre_ids"`
-	Adult         bool    `json:"adult"`
+	ID               int64   `json:"id"`
+	MediaType        string  `json:"media_type"`
+	Title            string  `json:"title"`
+	OriginalTitle    string  `json:"original_title"`
+	OriginalLanguage string  `json:"original_language"`
+	ReleaseDate      string  `json:"release_date"`
+	Name             string  `json:"name"`
+	OriginalName     string  `json:"original_name"`
+	FirstAirDate     string  `json:"first_air_date"`
+	Overview         string  `json:"overview"`
+	PosterPath       string  `json:"poster_path"`
+	BackdropPath     string  `json:"backdrop_path"`
+	VoteAverage      float64 `json:"vote_average"`
+	VoteCount        int     `json:"vote_count"`
+	Popularity       float64 `json:"popularity"`
+	GenreIDs         []int   `json:"genre_ids"`
+	Adult            bool    `json:"adult"`
 }
 
 func NewTMDB(baseURL, token, language string, client *http.Client) (*TMDB, error) {
@@ -221,18 +222,19 @@ func (t *TMDB) Show(ctx context.Context, mediaID string) (Show, error) {
 	}
 
 	var payload struct {
-		ID              int64   `json:"id"`
-		Name            string  `json:"name"`
-		OriginalName    string  `json:"original_name"`
-		FirstAirDate    string  `json:"first_air_date"`
-		Overview        string  `json:"overview"`
-		PosterPath      string  `json:"poster_path"`
-		BackdropPath    string  `json:"backdrop_path"`
-		VoteAverage     float64 `json:"vote_average"`
-		VoteCount       int     `json:"vote_count"`
-		Popularity      float64 `json:"popularity"`
-		NumberOfSeasons int     `json:"number_of_seasons"`
-		Genres          []struct {
+		ID               int64   `json:"id"`
+		Name             string  `json:"name"`
+		OriginalName     string  `json:"original_name"`
+		OriginalLanguage string  `json:"original_language"`
+		FirstAirDate     string  `json:"first_air_date"`
+		Overview         string  `json:"overview"`
+		PosterPath       string  `json:"poster_path"`
+		BackdropPath     string  `json:"backdrop_path"`
+		VoteAverage      float64 `json:"vote_average"`
+		VoteCount        int     `json:"vote_count"`
+		Popularity       float64 `json:"popularity"`
+		NumberOfSeasons  int     `json:"number_of_seasons"`
+		Genres           []struct {
 			Name string `json:"name"`
 		} `json:"genres"`
 		Seasons []struct {
@@ -248,7 +250,8 @@ func (t *TMDB) Show(ctx context.Context, mediaID string) (Show, error) {
 	}
 	show := Show{Movie: Movie{
 		ID: mediaID, MediaType: MediaTypeShow, Title: strings.TrimSpace(payload.Name),
-		OriginalTitle: strings.TrimSpace(payload.OriginalName), Year: releaseYear(payload.FirstAirDate),
+		OriginalTitle:    strings.TrimSpace(payload.OriginalName),
+		OriginalLanguage: strings.TrimSpace(payload.OriginalLanguage), Year: releaseYear(payload.FirstAirDate),
 		ReleaseDate: payload.FirstAirDate, Overview: strings.TrimSpace(payload.Overview),
 		VoteAverage: payload.VoteAverage, VoteCount: payload.VoteCount, Popularity: payload.Popularity,
 		NumberOfSeasons: payload.NumberOfSeasons,
@@ -486,7 +489,8 @@ func (t *TMDB) fetchMedia(ctx context.Context, path string, values url.Values, f
 		item := Movie{
 			ID: idPrefix + strconv.FormatInt(result.ID, 10), MediaType: itemType,
 			Title: title, OriginalTitle: strings.TrimSpace(originalTitle),
-			Year: releaseYear(releaseDate), ReleaseDate: releaseDate,
+			OriginalLanguage: strings.TrimSpace(result.OriginalLanguage),
+			Year:             releaseYear(releaseDate), ReleaseDate: releaseDate,
 			Overview: strings.TrimSpace(result.Overview), VoteAverage: result.VoteAverage,
 			VoteCount: result.VoteCount, Popularity: result.Popularity,
 			Genres: genreNames(result.GenreIDs, genreMap),

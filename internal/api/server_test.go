@@ -201,7 +201,7 @@ func (fakeMetadata) Show(_ context.Context, id string) (metadata.Show, error) {
 	return metadata.Show{
 		Movie: metadata.Movie{
 			ID: id, MediaType: metadata.MediaTypeShow, Title: "Top Rated Show",
-			Year: 2020, NumberOfSeasons: 3,
+			OriginalLanguage: "ja", Year: 2020, NumberOfSeasons: 3,
 		},
 		Seasons: []metadata.SeasonSummary{{Number: 1, Name: "Season 1", EpisodeCount: 8}},
 	}, nil
@@ -544,6 +544,17 @@ func TestClaimPrewarmedPlaybackCancelsPendingPark(t *testing.T) {
 	response, ok := server.claimPrewarmedPlayback(t.Context(), request)
 	if !ok || response.ID != "warm-playback" || !parkCanceled.Load() {
 		t.Fatalf("response = %+v, claimed = %v, park canceled = %v", response, ok, parkCanceled.Load())
+	}
+}
+
+func TestHistoryPrewarmPrefersOriginalShowAudio(t *testing.T) {
+	server := &Server{metadataProvider: fakeMetadata{}}
+	target := server.prewarmTargetForHistory(t.Context(), history.Entry{
+		MediaID: "tmdb-tv:3:s1:e1", MediaType: "show", Title: "Top Rated Show",
+		SeriesID: "tmdb-tv:3", SeriesTitle: "Top Rated Show", SeasonNumber: 1, EpisodeNumber: 1,
+	})
+	if !slices.Equal(target.request.Preferences.Languages, []string{"ja", "en", "english"}) {
+		t.Fatalf("languages = %v", target.request.Preferences.Languages)
 	}
 }
 
@@ -1112,6 +1123,9 @@ func TestHLSAssetsAndCleanup(t *testing.T) {
 	}
 	if response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("playlist cache control = %q", response.Header().Get("Cache-Control"))
+	}
+	if !strings.Contains(response.Body.String(), "#EXT-X-START:TIME-OFFSET=0,PRECISE=YES") {
+		t.Fatalf("playlist = %q", response.Body.String())
 	}
 
 	request = httptest.NewRequest(http.MethodGet, "/v1/playbacks/abc/hls/segment-000000.m4s", nil)

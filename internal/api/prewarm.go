@@ -437,12 +437,12 @@ func (s *Server) syncHistoryPrewarming(ctx context.Context) {
 	continueEntries := s.continueWatchHistory(ctx, entries)
 	targets := make(map[string]playbackPrewarmTarget)
 	for _, entry := range continueEntries {
-		target := s.prewarmTargetForHistory(entry)
+		target := s.prewarmTargetForHistory(ctx, entry)
 		if key := playbackPrewarmKey(target.request); key != "" {
 			targets[key] = target
 		}
 		if next, ok := s.nextEpisodeForPrewarming(ctx, entry); ok {
-			nextTarget := s.prewarmTargetForHistory(next)
+			nextTarget := s.prewarmTargetForHistory(ctx, next)
 			if key := playbackPrewarmKey(nextTarget.request); key != "" {
 				targets[key] = nextTarget
 			}
@@ -471,7 +471,7 @@ func (s *Server) syncHistoryPrewarming(ctx context.Context) {
 	}
 }
 
-func (s *Server) prewarmTargetForHistory(entry history.Entry) playbackPrewarmTarget {
+func (s *Server) prewarmTargetForHistory(ctx context.Context, entry history.Entry) playbackPrewarmTarget {
 	query := entry.Title
 	if entry.SeriesTitle != "" {
 		query = entry.SeriesTitle
@@ -483,9 +483,31 @@ func (s *Server) prewarmTargetForHistory(entry history.Entry) playbackPrewarmTar
 			SeriesID: entry.SeriesID, SeriesTitle: entry.SeriesTitle,
 			SeasonNumber: entry.SeasonNumber, EpisodeNumber: entry.EpisodeNumber,
 			EpisodeTitle: entry.EpisodeTitle, StartSeconds: entry.ResumePosition(),
-			Preferences: catalog.Preferences{StreamingOptimized: true, PreferTextSubtitles: true},
+			Preferences: catalog.Preferences{
+				Languages:          s.originalAudioLanguages(ctx, entry.SeriesID),
+				StreamingOptimized: true, PreferTextSubtitles: true,
+			},
 		},
 	}
+}
+
+func (s *Server) originalAudioLanguages(ctx context.Context, seriesID string) []string {
+	languages := []string{"en", "english"}
+	if strings.TrimSpace(seriesID) == "" {
+		return languages
+	}
+	s.metadataMu.RLock()
+	provider, ok := s.metadataProvider.(metadata.ShowProvider)
+	s.metadataMu.RUnlock()
+	if !ok {
+		return languages
+	}
+	show, err := provider.Show(ctx, seriesID)
+	language := strings.ToLower(strings.TrimSpace(show.OriginalLanguage))
+	if err == nil && language != "" && language != "en" {
+		languages = append([]string{language}, languages...)
+	}
+	return languages
 }
 
 func (s *Server) queueNextEpisodePrewarm(current history.Entry) {
@@ -498,7 +520,7 @@ func (s *Server) queueNextEpisodePrewarm(current history.Entry) {
 	lookupContext, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if next, ok := s.nextEpisodeForPrewarming(lookupContext, current); ok {
-		s.queuePlaybackPrewarm(s.prewarmTargetForHistory(next))
+		s.queuePlaybackPrewarm(s.prewarmTargetForHistory(lookupContext, next))
 	}
 }
 

@@ -265,7 +265,7 @@ public struct FilmstreamAPI: Sendable {
             episodeNumber: movie.episodeNumber,
             episodeTitle: movie.episodeTitle,
             startSeconds: max(0, startSeconds),
-            preferences: .appleTV
+            preferences: .appleTV(originalLanguage: movie.originalLanguage)
         )
     }
 
@@ -392,14 +392,21 @@ private struct PlaybackPreferences: Encodable {
     let streamingOptimized: Bool
     let preferTextSubtitles: Bool
 
-    static let appleTV = PlaybackPreferences(
-        resolution: "1080p",
-        codecs: ["h264", "h265"],
-        languages: ["en", "english"],
-        maxSizeBytes: 50 * 1_073_741_824,
-        streamingOptimized: true,
-        preferTextSubtitles: true
-    )
+    static func appleTV(originalLanguage: String?) -> PlaybackPreferences {
+        let language = originalLanguage?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var languages = ["en", "english"]
+        if let language, !language.isEmpty, language != "en" {
+            languages.insert(language, at: 0)
+        }
+        return PlaybackPreferences(
+            resolution: "1080p",
+            codecs: ["h264", "h265"],
+            languages: languages,
+            maxSizeBytes: 50 * 1_073_741_824,
+            streamingOptimized: true,
+            preferTextSubtitles: true
+        )
+    }
 
     private enum CodingKeys: String, CodingKey {
         case resolution, codecs, languages
