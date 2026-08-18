@@ -296,44 +296,50 @@ func TestCreatePlaybackPrefersUsenetCandidate(t *testing.T) {
 	}
 }
 
-func TestCreateEpisodePlaybackUsesTVSearchAndFileHint(t *testing.T) {
+func TestCreateEpisodePlaybackUsesTorrentSeasonPack(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentContents := createAPITestTorrentForFile(t, dataDir, "Original.Show.S01E02.mp4")
 	var tvSearchQuery string
 	indexerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/download/season" {
+			w.Header().Set("Content-Type", "application/x-bittorrent")
+			_, _ = w.Write(torrentContents)
+			return
+		}
 		switch r.URL.Query().Get("t") {
 		case "caps":
 			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><tv-search available="yes" supportedParams="q,season,ep"/></searching></caps>`)
 		case "tvsearch":
 			tvSearchQuery = r.URL.RawQuery
 			if r.URL.Query().Get("q") == "Original Show" {
-				fmt.Fprint(w, `<?xml version="1.0"?><rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel><item><title>Original.Show.S01E02.1080p.WEB.H264-GROUP</title><guid>episode-2</guid><enclosure url="/download/episode-2" length="607836000" type="application/x-nzb"/></item></channel></rss>`)
+				fmt.Fprint(w, `<?xml version="1.0"?><rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel><item><title>Original.Show.S01.Complete.1080p.WEB.H264-GROUP</title><guid>season-1</guid><enclosure url="/download/season" length="607836000" type="application/x-bittorrent"/></item></channel></rss>`)
 			} else {
-				fmt.Fprint(w, `<?xml version="1.0"?><rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel/></rss>`)
+				fmt.Fprint(w, `<?xml version="1.0"?><rss><channel/></rss>`)
 			}
 		case "search":
-			fmt.Fprint(w, `<?xml version="1.0"?><rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel/></rss>`)
+			fmt.Fprint(w, `<?xml version="1.0"?><rss><channel/></rss>`)
 		default:
 			http.Error(w, "unsupported", http.StatusBadRequest)
 		}
 	}))
 	defer indexerServer.Close()
 	registry, err := indexer.NewRegistry([]config.Indexer{{
-		Name: "usenet", Type: "torznab", Endpoint: indexerServer.URL + "/api", APIKey: "secret",
+		Name: "torrent", Type: "torznab", Endpoint: indexerServer.URL + "/api", APIKey: "secret",
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	torrentEngine, err := torrentstream.New(torrentstream.Config{
-		DataDir: t.TempDir(), MetadataTimeout: time.Second, CleanOnClose: true,
+		DataDir: dataDir, MetadataTimeout: time.Second, CleanOnClose: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer torrentEngine.Close()
 	server := New(registry, torrentEngine, catalog.Preferences{Codecs: []string{"h264"}}, slog.Default())
-	fakeUsenet := &fakeUsenetPlaybackEngine{session: &usenetstream.Session{
-		ID: "episode-playback", Name: "Top Rated Show", FileName: "Top.Rated.Show.S01E02.mkv",
-	}}
+	fakeUsenet := &fakeUsenetPlaybackEngine{session: &usenetstream.Session{ID: "should-not-be-used"}}
 	server.usenetEngine = fakeUsenet
+	server.playbackSourceMode = config.PlaybackSourceUsenetOnly
 
 	body := `{"media_id":"tmdb-tv:3:s1:e2","media_type":"show","query":"Localized Name","original_title":"Original Show","year":2020,"series_id":"tmdb-tv:3","series_title":"Localized Name","season_number":1,"episode_number":2,"episode_title":"Second","preferences":{"codecs":["h264"]}}`
 	response := httptest.NewRecorder()
@@ -341,11 +347,56 @@ func TestCreateEpisodePlaybackUsesTVSearchAndFileHint(t *testing.T) {
 	if response.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
-	if !strings.Contains(tvSearchQuery, "season=1") || !strings.Contains(tvSearchQuery, "ep=2") || !strings.Contains(tvSearchQuery, "q=Original+Show") {
+	var payload CreatePlaybackResponse
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Source != catalog.ProtocolTorrent || payload.FileName != "Original.Show.S01E02.mp4" {
+		t.Fatalf("payload = %+v", payload)
+	}
+	if fakeUsenet.createdSource != (usenetstream.Source{}) {
+		t.Fatalf("Usenet source was used: %+v", fakeUsenet.createdSource)
+	}
+	if !strings.Contains(tvSearchQuery, "season=1") || strings.Contains(tvSearchQuery, "ep=2") || !strings.Contains(tvSearchQuery, "q=Original+Show") {
 		t.Fatalf("TV search query = %q", tvSearchQuery)
 	}
-	if fakeUsenet.createdSource.FileHint != "S01E02" {
-		t.Fatalf("source = %+v", fakeUsenet.createdSource)
+	if got := server.playbackCacheKeys[payload.ID].mediaID; got != "tmdb-tv:3:s1" {
+		t.Fatalf("playback cache media ID = %q", got)
+	}
+}
+
+func TestTorrentPlaybackCacheIsSharedAcrossSeason(t *testing.T) {
+	store := playbackcache.New(t.TempDir())
+	firstEpisode := CreatePlaybackRequest{
+		MediaID: "tmdb-tv:3:s1:e2", SeriesID: "tmdb-tv:3", SeasonNumber: 1,
+		Query: "Top Rated Show", Year: 2020,
+	}
+	nextEpisode := firstEpisode
+	nextEpisode.MediaID = "tmdb-tv:3:s1:e3"
+	selected := catalog.RankedCandidate{
+		Candidate: catalog.Candidate{
+			Name: "Top.Rated.Show.S01.Complete.1080p", Protocol: catalog.ProtocolTorrent,
+		},
+		Reasons: []string{"season pack"},
+	}
+	cacheID := playbackCacheMediaID(firstEpisode, catalog.ProtocolTorrent, &selected)
+	if _, err := store.Save(cacheID, firstEpisode.Query, firstEpisode.Year, selected, []byte("torrent")); err != nil {
+		t.Fatal(err)
+	}
+	cached, found, err := store.Lookup(
+		playbackCacheMediaID(nextEpisode, catalog.ProtocolTorrent, &selected),
+		nextEpisode.Query,
+		nextEpisode.Year,
+	)
+	if err != nil || !found || cached.Selected.Candidate.Name != selected.Candidate.Name {
+		t.Fatalf("cached = %+v, found = %v, error = %v", cached, found, err)
+	}
+
+	individual := selected
+	individual.Reasons = []string{"exact episode"}
+	if firstID, nextID := playbackCacheMediaID(firstEpisode, catalog.ProtocolTorrent, &individual),
+		playbackCacheMediaID(nextEpisode, catalog.ProtocolTorrent, &individual); firstID == nextID {
+		t.Fatalf("individual episode releases share cache ID %q", firstID)
 	}
 }
 
@@ -695,6 +746,36 @@ func TestUnavailableCachedUsenetReleaseIsRemoved(t *testing.T) {
 	}
 }
 
+func TestTransientCachedUsenetFailureKeepsKnownGoodRelease(t *testing.T) {
+	store := playbackcache.New(t.TempDir())
+	candidate := catalog.RankedCandidate{Candidate: catalog.Candidate{
+		ID: "release-1", Indexer: "usenet", Name: "Movie.1080p", Protocol: catalog.ProtocolUsenet,
+	}}
+	if _, err := store.SaveUsenet("tmdb:1", "Movie", 2001, candidate, []byte("nzb")); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{
+		usenetEngine: &fakeUsenetPlaybackEngine{
+			createErr: fmt.Errorf("browse prepared release: %w", context.DeadlineExceeded),
+		},
+		playbackCache:  store,
+		usenetFailures: make(map[string]time.Time),
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	session, selected := server.createCachedUsenetPlayback(t.Context(), CreatePlaybackRequest{
+		MediaID: "tmdb:1", Query: "Movie", Year: 2001,
+	}, catalog.Preferences{})
+	if session != nil || selected != nil {
+		t.Fatalf("session = %+v, selected = %+v", session, selected)
+	}
+	if _, found, err := store.LookupUsenet("tmdb:1", "Movie", 2001); err != nil || !found {
+		t.Fatalf("cached Usenet playback found = %v, error = %v", found, err)
+	}
+	if server.usenetCandidateRecentlyFailed(candidate.Candidate) {
+		t.Fatal("transient failure quarantined a known-good release")
+	}
+}
+
 func TestHLSFailureInvalidatesAndSkipsUsenetRelease(t *testing.T) {
 	store := playbackcache.New(t.TempDir())
 	candidate := catalog.RankedCandidate{Candidate: catalog.Candidate{
@@ -801,11 +882,16 @@ func TestCreatePlaybackFallsBackToTorrent(t *testing.T) {
 
 func createAPITestTorrent(t *testing.T, dataDir string) []byte {
 	t.Helper()
+	return createAPITestTorrentForFile(t, dataDir, "Sintel.mp4")
+}
+
+func createAPITestTorrentForFile(t *testing.T, dataDir, fileName string) []byte {
+	t.Helper()
 	torrentDataDir := filepath.Join(dataDir, "torrents")
 	if err := os.MkdirAll(torrentDataDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	videoPath := filepath.Join(torrentDataDir, "Sintel.mp4")
+	videoPath := filepath.Join(torrentDataDir, fileName)
 	if err := os.WriteFile(videoPath, bytes.Repeat([]byte("filmstream-test"), 4096), 0o644); err != nil {
 		t.Fatal(err)
 	}

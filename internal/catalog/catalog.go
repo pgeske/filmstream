@@ -11,12 +11,13 @@ import (
 )
 
 type SearchRequest struct {
-	Query         string      `json:"query"`
-	Year          int         `json:"year,omitempty"`
-	MediaType     string      `json:"media_type,omitempty"`
-	SeasonNumber  int         `json:"season_number,omitempty"`
-	EpisodeNumber int         `json:"episode_number,omitempty"`
-	Preferences   Preferences `json:"preferences"`
+	Query            string      `json:"query"`
+	Year             int         `json:"year,omitempty"`
+	MediaType        string      `json:"media_type,omitempty"`
+	SeasonNumber     int         `json:"season_number,omitempty"`
+	EpisodeNumber    int         `json:"episode_number,omitempty"`
+	PreferSeasonPack bool        `json:"prefer_season_pack,omitempty"`
+	Preferences      Preferences `json:"preferences"`
 }
 
 type Preferences struct {
@@ -260,10 +261,30 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 		ranked = append(ranked, RankedCandidate{Candidate: candidate, Score: score, Reasons: reasons})
 	}
 
+	if request.PreferSeasonPack && request.SeasonNumber > 0 {
+		seasonPacks := make([]RankedCandidate, 0, len(ranked))
+		for _, candidate := range ranked {
+			if isSeasonPack(candidate.Candidate.Name, request.SeasonNumber) {
+				seasonPacks = append(seasonPacks, candidate)
+			}
+		}
+		if len(seasonPacks) > 0 {
+			ranked = seasonPacks
+		}
+	}
+
 	sort.SliceStable(ranked, func(i, j int) bool {
 		return ranked[i].Score > ranked[j].Score
 	})
 	return ranked
+}
+
+func isSeasonPack(name string, seasonNumber int) bool {
+	if _, _, hasEpisode := releaseEpisode(name); hasEpisode {
+		return false
+	}
+	season, hasSeason := releaseSeason(name)
+	return hasSeason && season == seasonNumber
 }
 
 func titleSimilarity(query, candidate string) float64 {

@@ -129,30 +129,44 @@ func (t *Torznab) Search(ctx context.Context, request catalog.SearchRequest) ([]
 		"t": "search", "q": torznabQuery(request.Query), "limit": "100",
 	}
 	if request.MediaType == "show" && request.SeasonNumber > 0 && request.EpisodeNumber > 0 {
+		seasonQuery := fmt.Sprintf("%s S%02d", torznabQuery(request.Query), request.SeasonNumber)
 		episodeQuery := fmt.Sprintf("%s S%02dE%02d", torznabQuery(request.Query), request.SeasonNumber, request.EpisodeNumber)
-		fallbackParameters := map[string]string{"t": "search", "q": episodeQuery, "limit": "100"}
-		if !capabilities.TVSearchAvailable {
-			return t.search(ctx, fallbackParameters)
-		}
-		tvParameters := map[string]string{"t": "tvsearch", "q": torznabQuery(request.Query), "limit": "100"}
-		if capabilities.TVSearchParams["season"] {
-			tvParameters["season"] = strconv.Itoa(request.SeasonNumber)
-		}
-		if capabilities.TVSearchParams["ep"] {
-			tvParameters["ep"] = strconv.Itoa(request.EpisodeNumber)
-		}
-		tvCandidates, tvErr := t.search(ctx, tvParameters)
-		if tvErr == nil && len(tvCandidates) >= 20 {
-			return tvCandidates, nil
-		}
-		basicCandidates, basicErr := t.search(ctx, fallbackParameters)
-		if basicErr != nil {
-			if tvErr != nil {
-				return nil, errors.Join(tvErr, basicErr)
+		seasonParameters := map[string]string{"t": "search", "q": seasonQuery, "limit": "100"}
+		episodeParameters := map[string]string{"t": "search", "q": episodeQuery, "limit": "100"}
+
+		var candidates []catalog.Candidate
+		var failures []error
+		if capabilities.TVSearchAvailable {
+			tvParameters := map[string]string{"t": "tvsearch", "q": torznabQuery(request.Query), "limit": "100"}
+			if capabilities.TVSearchParams["season"] {
+				tvParameters["season"] = strconv.Itoa(request.SeasonNumber)
+			} else {
+				tvParameters["q"] = seasonQuery
 			}
-			return tvCandidates, nil
+			tvCandidates, tvErr := t.search(ctx, tvParameters)
+			if tvErr != nil {
+				failures = append(failures, tvErr)
+			} else {
+				candidates = append(candidates, tvCandidates...)
+			}
 		}
-		return mergeCandidates(tvCandidates, basicCandidates), nil
+		seasonCandidates, seasonErr := t.search(ctx, seasonParameters)
+		if seasonErr != nil {
+			failures = append(failures, seasonErr)
+		} else {
+			candidates = append(candidates, seasonCandidates...)
+		}
+		episodeCandidates, episodeErr := t.search(ctx, episodeParameters)
+		if episodeErr != nil {
+			failures = append(failures, episodeErr)
+		} else {
+			candidates = append(candidates, episodeCandidates...)
+		}
+		candidates = mergeCandidates(candidates)
+		if len(candidates) == 0 && len(failures) > 0 {
+			return nil, errors.Join(failures...)
+		}
+		return candidates, nil
 	}
 	if !capabilities.MovieSearchAvailable {
 		return t.search(ctx, basicParameters)

@@ -107,8 +107,6 @@ func runServer(args []string) error {
 		MaxSeedSessions: cfg.MaxSeedSessions,
 		IdleGrace:       time.Duration(cfg.IdleGraceSeconds) * time.Second,
 		SeedMaxAge:      time.Duration(cfg.SeedMaxHours) * time.Hour,
-		CleanOnStart:    true,
-		CleanOnClose:    true,
 		Logger:          logger,
 	})
 	if err != nil {

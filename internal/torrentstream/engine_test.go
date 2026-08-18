@@ -46,18 +46,18 @@ func TestEngineServesRangesWithoutRequestingTheWholeFile(t *testing.T) {
 	}
 }
 
-func TestCleanupProtectsActiveStreamsThenRemovesIdleCache(t *testing.T) {
+func TestCleanupProtectsTorrentUntilSeedingRequirementIsMet(t *testing.T) {
 	dataDir := t.TempDir()
 	torrentPath, videoPath, _ := createTestTorrent(t, dataDir)
 	engine := newTestEngine(t, dataDir, Config{
 		CacheLimitBytes: 1,
 		IdleGrace:       time.Millisecond,
-		SeedMaxAge:      time.Hour,
+		SeedMaxAge:      3 * time.Hour,
 		CleanupInterval: time.Hour,
 	})
 	defer engine.Close()
 
-	session, err := engine.Create(context.Background(), Source{TorrentPath: torrentPath})
+	session, err := engine.Create(t.Context(), Source{TorrentPath: torrentPath})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,17 +68,23 @@ func TestCleanupProtectsActiveStreamsThenRemovesIdleCache(t *testing.T) {
 	if _, ok := engine.beginStream(session.ID, true); !ok {
 		t.Fatal("could not mark stream active")
 	}
-	engine.cleanup(time.Now().UTC().Add(2 * time.Hour))
+	now := time.Now().UTC()
+	engine.cleanup(now.Add(2 * time.Hour))
 	if _, ok := engine.Get(session.ID); !ok {
 		t.Fatal("active stream was cleaned up")
 	}
 
 	engine.endStream(session.ID)
-	engine.cleanup(time.Now().UTC().Add(time.Second))
-	if _, ok := engine.Get(session.ID); ok {
-		t.Fatal("idle over-quota stream was not cleaned up")
+	engine.cleanup(now.Add(2*time.Hour + time.Second))
+	if _, ok := engine.Get(session.ID); !ok {
+		t.Fatal("torrent was evicted before its seeding requirement was met")
 	}
-	if cleanupID != session.ID || cleanupReason != "cache-limit" {
+
+	engine.cleanup(now.Add(4 * time.Hour))
+	if _, ok := engine.Get(session.ID); ok {
+		t.Fatal("torrent was not retired after its seeding requirement was met")
+	}
+	if cleanupID != session.ID || cleanupReason != "seed-time-target" {
 		t.Fatalf("cleanup = %q, %q", cleanupID, cleanupReason)
 	}
 	if _, err := os.Stat(videoPath); !errors.Is(err, os.ErrNotExist) {
@@ -131,6 +137,34 @@ func TestDropRemovesInactivePlayback(t *testing.T) {
 	}
 	if _, err := os.Stat(videoPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("dropped playback data still exists: %v", err)
+	}
+}
+
+func TestDropRetainsStartedTorrentForSeeding(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentPath, videoPath, _ := createTestTorrent(t, dataDir)
+	engine := newTestEngine(t, dataDir, Config{SeedMaxAge: 3 * time.Hour})
+	defer engine.Close()
+
+	session, err := engine.Create(t.Context(), Source{TorrentPath: torrentPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := engine.beginStream(session.ID, true); !ok {
+		t.Fatal("could not mark stream active")
+	}
+	engine.endStream(session.ID)
+	if err := engine.Drop(session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := engine.Get(session.ID); ok {
+		t.Fatal("rejected playback ID is still available")
+	}
+	if len(engine.sessions) != 1 || len(engine.managed) != 1 {
+		t.Fatalf("retained sessions = %d, managed torrents = %d", len(engine.sessions), len(engine.managed))
+	}
+	if _, err := os.Stat(videoPath); err != nil {
+		t.Fatalf("started torrent data was removed: %v", err)
 	}
 }
 
@@ -241,6 +275,35 @@ func TestRatioTargetRequiresDownloadedData(t *testing.T) {
 	}
 	if !ratioTargetMet(100, 1, 1) {
 		t.Fatal("1:1 transfer did not satisfy the ratio target")
+	}
+}
+
+func TestEngineRestoresManagedTorrentForSeeding(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentPath, _, _ := createTestTorrent(t, dataDir)
+	first := newTestEngine(t, dataDir, Config{})
+	session, err := first.Create(t.Context(), Source{TorrentPath: torrentPath, FileHint: "sample"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := first.beginStream(session.ID, true); !ok {
+		t.Fatal("could not mark torrent started")
+	}
+	first.endStream(session.ID)
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	second := newTestEngine(t, dataDir, Config{})
+	defer second.Close()
+	if len(second.sessions) != 1 || len(second.managed) != 1 {
+		t.Fatalf("restored sessions = %d, managed torrents = %d", len(second.sessions), len(second.managed))
+	}
+	for _, restored := range second.sessions {
+		status, ok := second.Status(restored.ID)
+		if !ok || status.State != "seeding" {
+			t.Fatalf("restored status = %+v, found = %v", status, ok)
+		}
 	}
 }
 

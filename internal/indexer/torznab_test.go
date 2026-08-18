@@ -106,6 +106,45 @@ func TestTorznabAugmentsSparseMovieResultsWithBasicSearch(t *testing.T) {
 	}
 }
 
+func TestTorznabTVSearchIncludesSeasonPacksAndEpisodeFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("t") {
+		case "caps":
+			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><tv-search available="yes" supportedParams="q,season,ep"/></searching></caps>`)
+		case "tvsearch":
+			if r.URL.Query().Get("season") != "1" || r.URL.Query().Get("ep") != "" {
+				t.Errorf("TV search query = %q", r.URL.RawQuery)
+			}
+			fmt.Fprint(w, `<?xml version="1.0"?><rss><channel><item><title>Example.Show.S01.Complete.1080p</title><guid>pack</guid><enclosure url="/pack" length="1000" type="application/x-bittorrent"/></item></channel></rss>`)
+		case "search":
+			title := "Example.Show.S01E02.1080p"
+			guid := "episode"
+			if r.URL.Query().Get("q") == "Example Show S01" {
+				title = "Example.Show.S01.Complete.1080p"
+				guid = "pack"
+			}
+			fmt.Fprintf(w, `<?xml version="1.0"?><rss><channel><item><title>%s</title><guid>%s</guid><enclosure url="/%s" length="1000" type="application/x-bittorrent"/></item></channel></rss>`, title, guid, guid)
+		default:
+			http.Error(w, "unsupported", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	configured, err := NewTorznab("test", server.URL+"/api", "", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := configured.Search(t.Context(), catalog.SearchRequest{
+		Query: "Example Show", MediaType: "show", SeasonNumber: 1, EpisodeNumber: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 2 || candidates[0].ID != "pack" || candidates[1].ID != "episode" {
+		t.Fatalf("candidates = %+v", candidates)
+	}
+}
+
 func TestTorznabRecognizesUsenetEnclosure(t *testing.T) {
 	configured, err := NewTorznab("test", "https://indexer.example/6/api", "secret", http.DefaultClient)
 	if err != nil {

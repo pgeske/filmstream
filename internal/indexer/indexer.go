@@ -114,6 +114,24 @@ func (r *Registry) Search(ctx context.Context, request catalog.SearchRequest) ([
 	return candidates, nil
 }
 
+func (r *Registry) SearchProtocol(
+	ctx context.Context,
+	request catalog.SearchRequest,
+	protocol string,
+) ([]catalog.Candidate, error) {
+	candidates, err := r.Search(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	matches := make([]catalog.Candidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.Protocol == protocol {
+			matches = append(matches, candidate)
+		}
+	}
+	return matches, nil
+}
+
 func (r *Registry) SearchFirstProtocol(
 	ctx context.Context,
 	request catalog.SearchRequest,

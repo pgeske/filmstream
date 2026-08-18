@@ -884,13 +884,15 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 	var session *playbackSession
 	var selected *catalog.RankedCandidate
 	if request.Query != "" {
+		isShow := request.MediaType == "show"
 		search := catalog.SearchRequest{
 			Query: request.Query, Year: request.Year, MediaType: request.MediaType,
 			SeasonNumber: request.SeasonNumber, EpisodeNumber: request.EpisodeNumber,
-			Preferences: preferences,
+			PreferSeasonPack: isShow,
+			Preferences:      preferences,
 		}
-		allowUsenet := s.playbackSourceMode != config.PlaybackSourceTorrentOnly
-		allowTorrent := s.playbackSourceMode != config.PlaybackSourceUsenetOnly
+		allowUsenet := !isShow && s.playbackSourceMode != config.PlaybackSourceTorrentOnly
+		allowTorrent := isShow || s.playbackSourceMode != config.PlaybackSourceUsenetOnly
 		var ranked []catalog.RankedCandidate
 		var searchErr error
 		var usenetErr error
@@ -947,7 +949,11 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 		}
 		if session == nil {
 			if ranked == nil && searchErr == nil {
-				ranked, searchErr = s.searchAndRank(r.Context(), search, request.OriginalTitle, "")
+				protocol := ""
+				if isShow {
+					protocol = catalog.ProtocolTorrent
+				}
+				ranked, searchErr = s.searchAndRank(r.Context(), search, request.OriginalTitle, protocol)
 			}
 			if searchErr != nil {
 				writeError(w, http.StatusBadGateway, searchErr.Error())
@@ -997,7 +1003,7 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 		s.selected[session.ID] = public
 		if request.Query != "" {
 			s.playbackCacheKeys[session.ID] = playbackCacheKey{
-				mediaID: request.MediaID,
+				mediaID: playbackCacheMediaID(request, session.Source, selected),
 				title:   request.Query,
 				year:    request.Year,
 				source:  session.Source,
@@ -1046,6 +1052,8 @@ func (s *Server) searchAndRank(
 		var err error
 		if protocol == "" {
 			candidates, err = s.indexers.Search(ctx, search)
+		} else if search.MediaType == "show" && protocol == catalog.ProtocolTorrent {
+			candidates, err = s.indexers.SearchProtocol(ctx, search, protocol)
 		} else {
 			candidates, err = s.indexers.SearchFirstProtocol(ctx, search, protocol)
 		}
@@ -1124,11 +1132,14 @@ func (s *Server) createCachedUsenetPlayback(
 		FileHint: playbackFileHint(request),
 	})
 	if err != nil {
-		if ctx.Err() == nil {
+		transient := transientPlaybackFailure(err)
+		if ctx.Err() == nil && !transient {
 			s.markUsenetCandidateFailed(cached.Selected.Candidate, playbackFileHint(request))
 		}
-		if removeErr := s.playbackCache.RemoveUsenet(request.MediaID, request.Query, request.Year); removeErr != nil {
-			s.logger.Warn("remove unusable cached NZB", "title", request.Query, "error", removeErr)
+		if !transient {
+			if removeErr := s.playbackCache.RemoveUsenet(request.MediaID, request.Query, request.Year); removeErr != nil {
+				s.logger.Warn("remove unusable cached NZB", "title", request.Query, "error", removeErr)
+			}
 		}
 		s.logger.Warn("cached Usenet playback is unavailable; searching again",
 			"title", request.Query, "name", cached.Selected.Candidate.Name, "error", err)
@@ -1138,9 +1149,11 @@ func (s *Server) createCachedUsenetPlayback(
 		hasTextSubtitles, probeErr := s.playbackHasTextSubtitles(preparationContext, session.ID)
 		if probeErr != nil {
 			_ = s.usenetEngine.Drop(session.ID)
-			s.markUsenetCandidateFailed(cached.Selected.Candidate, playbackFileHint(request))
-			if removeErr := s.playbackCache.RemoveUsenet(request.MediaID, request.Query, request.Year); removeErr != nil {
-				s.logger.Warn("remove cached NZB that failed media probing", "title", request.Query, "error", removeErr)
+			if !transientPlaybackFailure(probeErr) {
+				s.markUsenetCandidateFailed(cached.Selected.Candidate, playbackFileHint(request))
+				if removeErr := s.playbackCache.RemoveUsenet(request.MediaID, request.Query, request.Year); removeErr != nil {
+					s.logger.Warn("remove cached NZB that failed media probing", "title", request.Query, "error", removeErr)
+				}
 			}
 			s.logger.Warn("cached Usenet playback failed media probing; searching again",
 				"title", request.Query, "name", cached.Selected.Candidate.Name, "error", probeErr)
@@ -1170,12 +1183,25 @@ func (s *Server) createCachedPlayback(
 	if s.playbackCache == nil {
 		return nil, nil, nil
 	}
-	cached, found, err := s.playbackCache.Lookup(request.MediaID, request.Query, request.Year)
-	if err != nil {
-		s.logger.Warn("load cached playback selection", "title", request.Query, "error", err)
-		return nil, nil, nil
+	cacheMediaIDs := []string{request.MediaID}
+	if seasonMediaID := seasonPlaybackCacheMediaID(request); seasonMediaID != "" && seasonMediaID != request.MediaID {
+		cacheMediaIDs = append([]string{seasonMediaID}, cacheMediaIDs...)
 	}
-	if !found {
+	var cached playbackcache.Entry
+	cacheMediaID := ""
+	for _, mediaID := range cacheMediaIDs {
+		entry, found, err := s.playbackCache.Lookup(mediaID, request.Query, request.Year)
+		if err != nil {
+			s.logger.Warn("load cached playback selection", "title", request.Query, "error", err)
+			return nil, nil, nil
+		}
+		if found {
+			cached = entry
+			cacheMediaID = mediaID
+			break
+		}
+	}
+	if cacheMediaID == "" {
 		return nil, nil, nil
 	}
 	session, err := s.engine.Create(ctx, torrentstream.Source{
@@ -1186,7 +1212,7 @@ func (s *Server) createCachedPlayback(
 			return nil, nil, ctx.Err()
 		}
 		s.logger.Warn("start cached playback selection", "title", request.Query, "error", err)
-		if removeErr := s.playbackCache.Remove(request.MediaID, request.Query, request.Year); removeErr != nil {
+		if removeErr := s.playbackCache.Remove(cacheMediaID, request.Query, request.Year); removeErr != nil {
 			s.logger.Warn("remove unusable playback cache", "title", request.Query, "error", removeErr)
 		}
 		return nil, nil, nil
@@ -1199,7 +1225,7 @@ func (s *Server) createCachedPlayback(
 	}
 	if strong < 0 {
 		_ = s.engine.Drop(session.ID)
-		if removeErr := s.playbackCache.Remove(request.MediaID, request.Query, request.Year); removeErr != nil {
+		if removeErr := s.playbackCache.Remove(cacheMediaID, request.Query, request.Year); removeErr != nil {
 			s.logger.Warn("remove unavailable playback cache", "title", request.Query, "error", removeErr)
 		}
 		s.logger.Warn("cached playback swarm is unavailable; searching again",
@@ -1212,7 +1238,7 @@ func (s *Server) createCachedPlayback(
 			s.logger.Warn("probe cached playback subtitles", "title", request.Query, "error", probeErr)
 		} else if !hasTextSubtitles {
 			_ = s.engine.Drop(session.ID)
-			if removeErr := s.playbackCache.Remove(request.MediaID, request.Query, request.Year); removeErr != nil {
+			if removeErr := s.playbackCache.Remove(cacheMediaID, request.Query, request.Year); removeErr != nil {
 				s.logger.Warn("remove cached playback without text subtitles", "title", request.Query, "error", removeErr)
 			}
 			s.logger.Info("cached playback lacks text subtitles; searching again", "title", request.Query)
@@ -1330,7 +1356,9 @@ func (s *Server) createRankedUsenetPlayback(
 				hasTextSubtitles, probeErr := s.playbackHasTextSubtitles(preparationContext, session.ID)
 				if probeErr != nil {
 					_ = s.usenetEngine.Drop(session.ID)
-					s.markUsenetCandidateFailed(candidate.Candidate, fileHint)
+					if !transientPlaybackFailure(probeErr) {
+						s.markUsenetCandidateFailed(candidate.Candidate, fileHint)
+					}
 					failures = append(failures, fmt.Sprintf("%s: probe media: %v", candidate.Candidate.Name, probeErr))
 					s.logger.Warn("reject Usenet playback that failed media probing", "id", session.ID,
 						"name", candidate.Candidate.Name, "error", probeErr)
@@ -1366,7 +1394,9 @@ func (s *Server) createRankedUsenetPlayback(
 			}
 			return nil, nil, fmt.Errorf("Usenet preparation exceeded %s", maxUsenetPreparation)
 		}
-		s.markUsenetCandidateFailed(candidate.Candidate, fileHint)
+		if !transientPlaybackFailure(err) {
+			s.markUsenetCandidateFailed(candidate.Candidate, fileHint)
+		}
 		failures = append(failures, fmt.Sprintf("%s: %v", candidate.Candidate.Name, err))
 	}
 	if fallbackSession != nil {
@@ -1378,6 +1408,10 @@ func (s *Server) createRankedUsenetPlayback(
 		return nil, nil, errors.New(strings.Join(failures, "; "))
 	}
 	return nil, nil, nil
+}
+
+func transientPlaybackFailure(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func (s *Server) usenetCandidateRecentlyFailed(candidate catalog.Candidate, fileHint ...string) bool {
@@ -1884,6 +1918,30 @@ func (s *Server) serveHLSAsset(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	}
 	http.ServeFile(w, r, path)
+}
+
+func playbackCacheMediaID(
+	request CreatePlaybackRequest,
+	source string,
+	selected *catalog.RankedCandidate,
+) string {
+	if source == catalog.ProtocolTorrent && selected != nil {
+		for _, reason := range selected.Reasons {
+			if reason == "season pack" {
+				if mediaID := seasonPlaybackCacheMediaID(request); mediaID != "" {
+					return mediaID
+				}
+			}
+		}
+	}
+	return request.MediaID
+}
+
+func seasonPlaybackCacheMediaID(request CreatePlaybackRequest) string {
+	if request.SeriesID == "" || request.SeasonNumber <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s:s%d", request.SeriesID, request.SeasonNumber)
 }
 
 func playbackFileHint(request CreatePlaybackRequest) string {

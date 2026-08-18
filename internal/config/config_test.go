@@ -17,7 +17,7 @@ func TestDefaultsMatchLocalMVP(t *testing.T) {
 	if cfg.SeedRatioTarget != 1 {
 		t.Fatalf("ratio = %f", cfg.SeedRatioTarget)
 	}
-	if cfg.CacheLimitGiB != 20 || cfg.MaxSeedSessions != 20 || cfg.SeedMaxHours != 24 || cfg.IdleGraceSeconds != 120 {
+	if cfg.CacheLimitGiB != 20 || cfg.MaxSeedSessions != 20 || cfg.SeedMaxHours != 168 || cfg.IdleGraceSeconds != 120 {
 		t.Fatalf("smart streaming defaults = cache %d GiB, sessions %d, seed %d hours, grace %d seconds",
 			cfg.CacheLimitGiB, cfg.MaxSeedSessions, cfg.SeedMaxHours, cfg.IdleGraceSeconds)
 	}

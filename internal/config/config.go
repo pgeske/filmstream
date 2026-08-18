@@ -18,7 +18,7 @@ const (
 	defaultReadaheadMiB      = 32
 	defaultCacheLimitGiB     = 20
 	defaultMaxSeedSessions   = 20
-	defaultSeedMaxHours      = 24
+	defaultSeedMaxHours      = 168
 	defaultIdleGraceSeconds  = 120
 	defaultHLSStartupSeconds = 90
 	defaultHLSBufferSeconds  = 24

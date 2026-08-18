@@ -18,10 +18,11 @@ Use it only with media you are authorized to access, download, or share.
 - Release ranking by title, year or episode, resolution, language, codec, size, seeders, and leechers
 - Direct magnet and `.torrent` playback
 - HTTP Range streaming with seeking and 32 MiB read-ahead
-- Demand-driven smart sampling plus a small tail prefetch for container metadata
-- Automatic best-effort seeding toward a visible 1.0 ratio target
-- Automatic retirement, a 20 GiB cache safety limit, and ephemeral shutdown cleanup
-- Episode-aware file selection for season packs, with largest-video fallback for direct and movie sources
+- Demand-driven smart sampling without downloading payload data from rejected candidates
+- Durable seeding until either a 1.0 ratio or 168 hours of active seeding is reached
+- Automatic retirement and a 20 GiB cache target that never evicts torrents with outstanding seeding obligations
+- Torrent-only TV playback that prefers full-season packs, reuses one release across the season, and falls back to individual episodes only when no pack is available
+- Episode-aware file selection within season packs, with largest-video fallback for direct and movie sources
 
 ## Install
 
@@ -135,7 +136,7 @@ The optional configuration file is `~/.config/filmstream/config.json`:
   "seed_ratio_target": 1.0,
   "cache_limit_gib": 20,
   "max_seed_sessions": 20,
-  "seed_max_hours": 24,
+  "seed_max_hours": 168,
   "idle_grace_seconds": 120,
   "preferred_resolution": "1080p",
   "preferred_languages": ["en", "english"],
@@ -181,13 +182,15 @@ The optional configuration file is `~/.config/filmstream/config.json`:
 
 Set `FILMSTREAM_CONFIG` to use another path or `FILMSTREAM_SERVER` to use an already-running backend. Set `OMDB_API_KEY` to enable the optional `GET /v1/catalog/ratings` endpoint. When a client opens media details, the server resolves a supplied TMDB movie or show ID to its IMDb ID, queries OMDb, and caches successful results in memory. This avoids misses caused by localized or alternate titles, and the API key never leaves the server.
 
-Temporary torrent data is stored beneath `<data_dir>/torrents`, and temporary native-player segments are stored beneath `<hls_dir>`. Filmstream owns and clears both locations on clean startup and shutdown; do not place unrelated files there. Durable watch progress and private selected-torrent metadata are stored separately beneath `<state_dir>` with owner-only permissions.
+Managed torrent data is stored beneath `<data_dir>/torrents`, with private resume metadata beside it so required seeding survives normal server restarts. Temporary native-player segments are stored beneath `<hls_dir>` and may be discarded between sessions. Do not place unrelated files in either location. Durable watch progress and private selected-release metadata are stored separately beneath `<state_dir>` with owner-only permissions.
 
 ## Usenet streaming
 
 Filmstream delegates NNTP article retrieval, yEnc decoding, archive mapping, and provider failover to an internal InfiniDysk service. Filmstream downloads the selected NZB from its Torznab endpoint, submits it through the SABnzbd-compatible API, waits for the virtual media tree, selects the largest supported video, and proxies authenticated WebDAV range requests through the existing playback URL. FFprobe and FFmpeg therefore use the same seekable HTTP contract for either source.
 
-`playback_source_mode` controls automatic query playback. `hybrid` strongly prefers compatible Usenet releases and falls back to cached or newly ranked torrents. `usenet_only` tries only NZBs and deliberately bypasses cached torrent selections, including when resuming Continue Watching. `torrent_only` skips Usenet and retains the existing cached-torrent and live-swarm path. Explicit `--magnet` and `--torrent` inputs remain direct overrides.
+`playback_source_mode` controls movie playback. `hybrid` strongly prefers compatible Usenet releases and falls back to cached or newly ranked torrents. `usenet_only` uses only NZBs for movies, while TV episodes still use torrents. `torrent_only` skips Usenet entirely. Explicit `--magnet` and `--torrent` inputs remain direct overrides.
+
+TV playback searches every torrent indexer for the requested season, uses only full-season packs when at least one valid pack is available, and falls back to the exact individual episode only when no season pack exists. Successful torrent metadata is cached under a season identity rather than an episode identity, so subsequent and prefetched episodes reuse the same release and select their own `SxxExx` file from that torrent.
 
 After HLS starts successfully, Filmstream stores the selected NZB and sanitized release metadata privately under `state_dir`. Later playback tries that NZB before contacting an indexer. Missing articles, invalid archives, unsupported files, or changed subtitle requirements invalidate the cached release and resume the normal ranked search. Filmstream otherwise tries ranked NZBs within one 30-second preparation budget, up to ten candidates when failures are detected quickly; only `hybrid` continues to torrent fallback afterward.
 
@@ -259,20 +262,19 @@ The config file is written with mode `0600` because it contains API keys. The CL
 
 ## Smart streaming, cleanup, and ratio behavior
 
-Filmstream only requests the pieces needed by MPV's current HTTP Range request, a 32 MiB read-ahead window, and small samples used to validate container metadata. Native HLS prepares `hls_startup_buffer_seconds` of media before opening the player, then packages at `hls_read_rate` times playback speed to build resilience against brief source stalls without racing through the full movie immediately. Closing either player closes its readers and removes temporary HLS segments.
+Filmstream only requests the pieces needed by MPV's current HTTP Range request, a 32 MiB read-ahead window, and samples used to validate container metadata. It does not prefetch payload bytes while merely evaluating torrent candidates. Native HLS prepares `hls_startup_buffer_seconds` of media before opening the player, then packages at `hls_read_rate` times playback speed to build resilience against brief source stalls without racing through the full movie immediately. Closing either player closes its readers and removes temporary HLS segments.
 
 MPV waits for a two-second initial cache before playback to avoid startup jitter. Native Windows MPV uses its D3D11 hardware-decoding and GPU-rendering path. Linux MPV on WSL uses `gpu-next` with `nvdec-copy` when supported and retains `wlshm` as a compatibility fallback; other environments keep MPV's portable automatic output and software-decoding fallback. Apple clients request streaming-optimized H.264/H.265 releases, avoid known-incompatible Dolby Vision releases, copy video without quality loss, and transcode only audio for AVPlayer compatibility. Streaming ranking prioritizes reported swarm popularity, uses file size only as a light tie-breaker, and keeps a specific remux penalty. Filmstream checks ranked candidates progressively and accepts the first high-ranked release that proves it has a strong live swarm, avoiding unnecessary torrent initialization while still falling through to alternatives for stale indexer results.
 
-Every verified piece remains available for upload while the session is retained. After playback becomes idle, Filmstream manages the lifecycle automatically:
+Every verified piece remains available for upload while the torrent is retained. After playback becomes idle, Filmstream manages the lifecycle automatically:
 
-1. Keep seeding the downloaded pieces toward `seed_ratio_target`.
-2. Retire the torrent after the target is met and the two-minute idle grace expires.
-3. Retire it after `seed_max_hours` even when peer demand cannot reach the target.
-4. Keep at most `max_seed_sessions` retained torrents and retire the oldest inactive ones first.
-5. Retire the oldest inactive sessions early if completed pieces exceed `cache_limit_gib`.
-6. Clear managed torrent data on server startup and shutdown, so crashes or restarts do not leave an unmanaged cache indefinitely.
+1. Keep seeding downloaded pieces until either `seed_ratio_target` is reached or `seed_max_hours` of active seeding has accumulated.
+2. Persist torrent metainfo, transfer counters, and accumulated seeding time so normal restarts resume the obligation.
+3. Retire an eligible torrent after the two-minute idle grace expires.
+4. Apply `max_seed_sessions` and `cache_limit_gib` only to torrents that have no outstanding seeding obligation; protected torrents are never deleted early to satisfy a local cache target.
+5. Remove unused candidates that never downloaded playback payload after the idle grace.
 
-Active playback is never evicted, even if it temporarily exceeds the cache limit. A full torrent watch may naturally download the full selected video, but its data is still retired by the same policy. Usenet sessions fetch only article ranges requested by the player; their virtual release metadata is deleted after the idle grace period and has no seeding lifecycle.
+Active playback is never evicted. A full episode watch may naturally download the selected file from a season pack, and the same torrent can serve and prefetch later episodes without selecting another release. Usenet sessions fetch only article ranges requested by the player; their virtual release metadata is deleted after the idle grace period and has no seeding lifecycle.
 
 Inspect an active session with:
 
@@ -280,7 +282,7 @@ Inspect an active session with:
 filmstream status PLAYBACK_ID
 ```
 
-A 1.0 ratio means one uploaded byte per downloaded byte. This is necessarily best effort: Filmstream cannot upload bytes unless another peer requests them, and the hard time/space safety limits take precedence over waiting forever. Filmstream does not bypass or guarantee compliance with tracker-specific minimum-time, completion, or hit-and-run rules.
+A 1.0 ratio means one uploaded byte per downloaded byte. Filmstream cannot force peers to request data, so the 168-hour path remains necessary when ratio cannot be reached. Configure both values to match the tracker whose releases are being used; the local session and cache targets do not override them.
 
 ## API
 

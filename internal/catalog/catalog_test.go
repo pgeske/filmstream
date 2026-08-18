@@ -215,6 +215,36 @@ func TestRankSelectsExactEpisodeAndAllowsSeasonPackFallback(t *testing.T) {
 	}
 }
 
+func TestRankUsesOnlySeasonPacksWhenAvailable(t *testing.T) {
+	ranked := Rank(SearchRequest{
+		Query: "Top Rated Show", MediaType: "show", SeasonNumber: 1, EpisodeNumber: 2,
+		PreferSeasonPack: true,
+	}, []Candidate{
+		{Name: "Top.Rated.Show.S01E02.1080p.WEB.H264"},
+		{Name: "Top.Rated.Show.S01.Complete.1080p.WEB.H264"},
+		{Name: "Top.Rated.Show.S01E03.1080p.WEB.H264"},
+	})
+	if len(ranked) != 1 || ranked[0].Candidate.Name != "Top.Rated.Show.S01.Complete.1080p.WEB.H264" {
+		t.Fatalf("ranked = %+v", ranked)
+	}
+	if !slices.Contains(ranked[0].Reasons, "season pack") {
+		t.Fatalf("reasons = %v", ranked[0].Reasons)
+	}
+}
+
+func TestRankFallsBackToIndividualEpisodeWithoutSeasonPack(t *testing.T) {
+	ranked := Rank(SearchRequest{
+		Query: "Top Rated Show", MediaType: "show", SeasonNumber: 1, EpisodeNumber: 2,
+		PreferSeasonPack: true,
+	}, []Candidate{
+		{Name: "Top.Rated.Show.S01E02.1080p.WEB.H264"},
+		{Name: "Top.Rated.Show.S01E03.1080p.WEB.H264"},
+	})
+	if len(ranked) != 1 || ranked[0].Candidate.Name != "Top.Rated.Show.S01E02.1080p.WEB.H264" {
+		t.Fatalf("ranked = %+v", ranked)
+	}
+}
+
 func TestRankRejectsDifferentSeriesSharingOnlyStopWords(t *testing.T) {
 	ranked := Rank(SearchRequest{
 		Query: "House of the Dragon", MediaType: "show", SeasonNumber: 1, EpisodeNumber: 1,

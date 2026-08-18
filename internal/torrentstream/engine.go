@@ -29,7 +29,7 @@ const (
 	defaultCacheLimit      = int64(20 << 30)
 	defaultMaxSeedSessions = 20
 	defaultIdleGrace       = 2 * time.Minute
-	defaultSeedMaxAge      = 24 * time.Hour
+	defaultSeedMaxAge      = 168 * time.Hour
 	defaultCleanupInterval = 30 * time.Second
 )
 
@@ -58,28 +58,30 @@ type Source struct {
 }
 
 type Engine struct {
-	client          *torrent.Client
-	httpClient      *http.Client
-	dataDir         string
-	maxTorrentBytes int64
-	readaheadBytes  int64
-	metadataTimeout time.Duration
-	seedRatioTarget float64
-	cacheLimitBytes int64
-	maxSeedSessions int
-	idleGrace       time.Duration
-	seedMaxAge      time.Duration
-	cleanupInterval time.Duration
-	cleanOnClose    bool
-	logger          *slog.Logger
-	lockFile        *os.File
+	client           *torrent.Client
+	httpClient       *http.Client
+	dataDir          string
+	managedDir       string
+	managedStatePath string
+	maxTorrentBytes  int64
+	readaheadBytes   int64
+	metadataTimeout  time.Duration
+	seedRatioTarget  float64
+	cacheLimitBytes  int64
+	maxSeedSessions  int
+	idleGrace        time.Duration
+	seedMaxAge       time.Duration
+	cleanupInterval  time.Duration
+	cleanOnClose     bool
+	logger           *slog.Logger
+	lockFile         *os.File
 
 	lifecycleMu sync.Mutex
 	mu          sync.RWMutex
 	sessions    map[string]*Session
+	managed     map[*torrent.Torrent]*managedTorrent
 	onCleanup   func(string, string)
 
-	backgroundCtx context.Context
 	cleanupCancel context.CancelFunc
 	cleanupWG     sync.WaitGroup
 	closeOnce     sync.Once
@@ -158,10 +160,14 @@ func New(cfg Config) (*Engine, error) {
 	}
 
 	torrentDataDir := filepath.Join(cfg.DataDir, "torrents")
+	managedDir := filepath.Join(cfg.DataDir, "managed-torrents")
+	managedStatePath := filepath.Join(cfg.DataDir, "managed-torrents.json")
 	if cfg.CleanOnStart {
-		if err := os.RemoveAll(torrentDataDir); err != nil {
-			unlock()
-			return nil, fmt.Errorf("clear stale torrent cache: %w", err)
+		for _, path := range []string{torrentDataDir, managedDir, managedStatePath} {
+			if err := os.RemoveAll(path); err != nil {
+				unlock()
+				return nil, fmt.Errorf("clear stale torrent cache: %w", err)
+			}
 		}
 	}
 	if err := os.MkdirAll(torrentDataDir, 0o755); err != nil {
@@ -183,25 +189,32 @@ func New(cfg Config) (*Engine, error) {
 	httpTransport := http.DefaultTransport.(*http.Transport).Clone()
 	httpTransport.TLSHandshakeTimeout = 30 * time.Second
 	engine := &Engine{
-		client:          client,
-		httpClient:      &http.Client{Timeout: cfg.MetadataTimeout, Transport: httpTransport},
-		dataDir:         torrentDataDir,
-		maxTorrentBytes: cfg.MaxTorrentBytes,
-		readaheadBytes:  cfg.ReadaheadBytes,
-		metadataTimeout: cfg.MetadataTimeout,
-		seedRatioTarget: cfg.SeedRatioTarget,
-		cacheLimitBytes: cfg.CacheLimitBytes,
-		maxSeedSessions: cfg.MaxSeedSessions,
-		idleGrace:       cfg.IdleGrace,
-		seedMaxAge:      cfg.SeedMaxAge,
-		cleanupInterval: cfg.CleanupInterval,
-		cleanOnClose:    cfg.CleanOnClose,
-		logger:          cfg.Logger,
-		lockFile:        lockFile,
-		sessions:        make(map[string]*Session),
+		client:           client,
+		httpClient:       &http.Client{Timeout: cfg.MetadataTimeout, Transport: httpTransport},
+		dataDir:          torrentDataDir,
+		managedDir:       managedDir,
+		managedStatePath: managedStatePath,
+		maxTorrentBytes:  cfg.MaxTorrentBytes,
+		readaheadBytes:   cfg.ReadaheadBytes,
+		metadataTimeout:  cfg.MetadataTimeout,
+		seedRatioTarget:  cfg.SeedRatioTarget,
+		cacheLimitBytes:  cfg.CacheLimitBytes,
+		maxSeedSessions:  cfg.MaxSeedSessions,
+		idleGrace:        cfg.IdleGrace,
+		seedMaxAge:       cfg.SeedMaxAge,
+		cleanupInterval:  cfg.CleanupInterval,
+		cleanOnClose:     cfg.CleanOnClose,
+		logger:           cfg.Logger,
+		lockFile:         lockFile,
+		sessions:         make(map[string]*Session),
+		managed:          make(map[*torrent.Torrent]*managedTorrent),
+	}
+	if err := engine.restoreManagedTorrents(); err != nil {
+		client.Close()
+		unlock()
+		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	engine.backgroundCtx = ctx
 	engine.cleanupCancel = cancel
 	engine.cleanupWG.Add(1)
 	go engine.runJanitor(ctx)
@@ -229,10 +242,21 @@ func (e *Engine) Close() error {
 		e.cleanupCancel()
 		e.cleanupWG.Wait()
 		e.lifecycleMu.Lock()
+		e.mu.Lock()
+		now := time.Now().UTC()
+		for torrent := range e.managed {
+			e.accountManagedTorrentLocked(torrent, now)
+		}
+		if err := e.persistManagedTorrentsLocked(); err != nil {
+			e.logger.Warn("could not save managed torrent state during shutdown", "error", err)
+		}
+		e.mu.Unlock()
 		e.client.Close()
 		if e.cleanOnClose {
-			if err := os.RemoveAll(e.dataDir); err != nil {
-				e.logger.Warn("could not clear torrent cache during shutdown", "error", err)
+			for _, path := range []string{e.dataDir, e.managedDir, e.managedStatePath} {
+				if err := os.RemoveAll(path); err != nil {
+					e.logger.Warn("could not clear torrent cache during shutdown", "error", err)
+				}
 			}
 		}
 		e.lifecycleMu.Unlock()
@@ -307,16 +331,16 @@ func (e *Engine) Create(ctx context.Context, source Source) (*Session, error) {
 		torrent: t, file: file, lastActivity: now,
 	}
 	e.mu.Lock()
+	if err := e.ensureManagedTorrentLocked(t, source.FileHint, now); err != nil {
+		e.mu.Unlock()
+		t.Drop()
+		return nil, err
+	}
 	e.sessions[id] = session
 	e.mu.Unlock()
 
-	// Readers request only the playback window. There is deliberately no File.Download call:
-	// closing the player must not turn a quick sample into a full background download.
-	e.cleanupWG.Add(1)
-	go func() {
-		defer e.cleanupWG.Done()
-		e.prefetchTail(e.backgroundCtx, session)
-	}()
+	// Readers request only the selected playback window. Candidate validation deliberately
+	// avoids prefetching payload data so rejected private-tracker releases cannot become HnRs.
 	return session, nil
 }
 
@@ -363,16 +387,38 @@ func (e *Engine) Drop(id string) error {
 			break
 		}
 	}
+	retainForSeeding := false
+	if state := e.managed[session.torrent]; !shared && state != nil && state.Started {
+		retainedID, err := randomID()
+		if err != nil {
+			e.mu.Unlock()
+			return err
+		}
+		retained := *session
+		retained.ID = retainedID
+		retained.activeStreams = 0
+		retained.started = true
+		e.sessions[retainedID] = &retained
+		retainForSeeding = true
+	}
 	delete(e.sessions, id)
+	if !shared && !retainForSeeding {
+		e.removeManagedTorrentLocked(session.torrent)
+		if err := e.persistManagedTorrentsLocked(); err != nil {
+			e.logger.Warn("could not save managed torrent state", "error", err)
+		}
+	}
 	handler := e.onCleanup
 	e.mu.Unlock()
 
-	if !shared {
+	if !shared && !retainForSeeding {
 		paths := e.torrentDataPaths(session.torrent)
 		session.torrent.Drop()
 		if err := e.removeTorrentData(paths); err != nil {
 			e.logger.Warn("could not fully remove rejected torrent cache", "error", err)
 		}
+	} else if retainForSeeding {
+		e.logger.Info("retained rejected torrent to satisfy seeding requirement", "name", session.Name)
 	}
 	if handler != nil {
 		handler(id, "rejected")
@@ -402,13 +448,13 @@ func (e *Engine) Status(id string) (Status, bool) {
 		ID: session.ID, Name: session.Name, FileName: session.FileName, FileSize: session.FileSize,
 		State: state, ActiveStreams: activeStreams, LastActivity: lastActivity,
 	}
+	downloaded, uploaded, seededFor := e.managedTransferTotalsLocked(t, time.Now().UTC())
 	if started && activeStreams == 0 {
-		deadline := lastActivity.Add(e.seedMaxAge)
+		remaining := max(0, e.seedMaxAge-seededFor)
+		deadline := time.Now().UTC().Add(remaining)
 		status.SeedDeadline = &deadline
 	}
 	stats := t.Stats()
-	downloaded := stats.BytesReadData.Int64()
-	uploaded := stats.BytesWrittenData.Int64()
 	ratio := transferRatio(downloaded, uploaded)
 	status.BytesComplete = file.BytesCompleted()
 	status.TorrentBytes = t.Length()
@@ -454,11 +500,19 @@ func (e *Engine) beginStream(id string, markStarted bool) (*Session, bool) {
 	if !ok {
 		return nil, false
 	}
+	now := time.Now().UTC()
 	session.activeStreams++
 	if markStarted {
 		session.started = true
+		e.markManagedTorrentStartedLocked(session.torrent, now)
 	}
-	session.lastActivity = time.Now().UTC()
+	session.lastActivity = now
+	e.updateManagedTorrentActivityLocked(session.torrent, now)
+	if markStarted {
+		if err := e.persistManagedTorrentsLocked(); err != nil {
+			e.logger.Warn("could not save managed torrent state", "error", err)
+		}
+	}
 	return session, true
 }
 
@@ -469,7 +523,9 @@ func (e *Engine) endStream(id string) {
 		if session.activeStreams > 0 {
 			session.activeStreams--
 		}
-		session.lastActivity = time.Now().UTC()
+		now := time.Now().UTC()
+		session.lastActivity = now
+		e.updateManagedTorrentActivityLocked(session.torrent, now)
 	}
 }
 
@@ -498,6 +554,7 @@ type torrentGroup struct {
 	uploaded     int64
 	ratio        float64
 	ratioMet     bool
+	seededFor    time.Duration
 }
 
 func (e *Engine) cleanup(now time.Time) {
@@ -509,14 +566,16 @@ func (e *Engine) cleanup(now time.Time) {
 	for _, session := range e.sessions {
 		group := groupsByTorrent[session.torrent]
 		if group == nil {
-			stats := session.torrent.Stats()
-			downloaded := stats.BytesReadData.Int64()
-			uploaded := stats.BytesWrittenData.Int64()
+			state := e.accountManagedTorrentLocked(session.torrent, now)
+			downloaded, uploaded, seededFor := e.managedTransferTotalsLocked(session.torrent, now)
 			ratio := transferRatio(downloaded, uploaded)
 			group = &torrentGroup{
 				torrent: session.torrent, complete: session.torrent.BytesCompleted(),
 				downloaded: downloaded, uploaded: uploaded, ratio: ratio,
-				ratioMet: ratioTargetMet(downloaded, ratio, e.seedRatioTarget),
+				ratioMet: ratioTargetMet(downloaded, ratio, e.seedRatioTarget), seededFor: seededFor,
+			}
+			if state != nil {
+				group.started = state.Started
 			}
 			groupsByTorrent[session.torrent] = group
 		}
@@ -545,8 +604,8 @@ func (e *Engine) cleanup(now time.Time) {
 			selected[group] = "unused"
 		case group.started && idle >= e.idleGrace && group.ratioMet:
 			selected[group] = "ratio-target"
-		case group.started && idle >= e.seedMaxAge:
-			selected[group] = "seed-time-limit"
+		case group.started && idle >= e.idleGrace && group.seededFor >= e.seedMaxAge:
+			selected[group] = "seed-time-target"
 		}
 	}
 	for group := range selected {
@@ -554,7 +613,7 @@ func (e *Engine) cleanup(now time.Time) {
 	}
 	remainingGroups := len(groups) - len(selected)
 	if remainingGroups > e.maxSeedSessions {
-		candidates := cleanupCandidates(groups, selected, now, e.idleGrace)
+		candidates := cleanupCandidates(groups, selected, now, e.idleGrace, e.seedMaxAge)
 		for _, group := range candidates {
 			if remainingGroups <= e.maxSeedSessions {
 				break
@@ -565,7 +624,7 @@ func (e *Engine) cleanup(now time.Time) {
 		}
 	}
 	if totalComplete > e.cacheLimitBytes {
-		for _, group := range cleanupCandidates(groups, selected, now, e.idleGrace) {
+		for _, group := range cleanupCandidates(groups, selected, now, e.idleGrace, e.seedMaxAge) {
 			if totalComplete <= e.cacheLimitBytes {
 				break
 			}
@@ -586,7 +645,11 @@ func (e *Engine) cleanup(now time.Time) {
 			delete(e.sessions, session.ID)
 			item.ids = append(item.ids, session.ID)
 		}
+		e.removeManagedTorrentLocked(group.torrent)
 		items = append(items, item)
+	}
+	if err := e.persistManagedTorrentsLocked(); err != nil {
+		e.logger.Warn("could not save managed torrent state", "error", err)
 	}
 	handler := e.onCleanup
 	e.mu.Unlock()
@@ -612,10 +675,19 @@ func (e *Engine) cleanup(now time.Time) {
 	}
 }
 
-func cleanupCandidates(groups []*torrentGroup, selected map[*torrentGroup]string, now time.Time, idleGrace time.Duration) []*torrentGroup {
+func cleanupCandidates(
+	groups []*torrentGroup,
+	selected map[*torrentGroup]string,
+	now time.Time,
+	idleGrace time.Duration,
+	seedMaxAge time.Duration,
+) []*torrentGroup {
 	var candidates []*torrentGroup
 	for _, group := range groups {
 		if _, alreadySelected := selected[group]; alreadySelected || group.active > 0 {
+			continue
+		}
+		if group.started && !group.ratioMet && group.seededFor < seedMaxAge {
 			continue
 		}
 		if now.Sub(group.lastActivity) < idleGrace {
@@ -749,25 +821,6 @@ func (e *Engine) downloadMetainfo(ctx context.Context, torrentURL string) (*meta
 		}
 	}
 	return nil, fmt.Errorf("download torrent file: %w", lastErr)
-}
-
-func (e *Engine) prefetchTail(parent context.Context, session *Session) {
-	const tailBytes = int64(4 << 20)
-	start := session.FileSize - tailBytes
-	if start <= 0 {
-		return
-	}
-	ctx, cancel := context.WithTimeout(parent, 45*time.Second)
-	defer cancel()
-	reader := session.file.NewReader()
-	defer reader.Close()
-	reader.SetContext(ctx)
-	reader.SetResponsive()
-	reader.SetReadahead(tailBytes)
-	if _, err := reader.Seek(start, io.SeekStart); err != nil {
-		return
-	}
-	_, _ = io.CopyN(io.Discard, reader, tailBytes)
 }
 
 func selectVideoFile(files []*torrent.File, fileHint string) (*torrent.File, error) {
