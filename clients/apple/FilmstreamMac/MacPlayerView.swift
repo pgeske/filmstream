@@ -13,6 +13,7 @@ struct MacPlayerView: View {
     let onClose: () -> Void
 
     @StateObject private var controller: MacPlaybackController
+    @StateObject private var pictureInPicture = MacPictureInPictureController()
     @State private var didClose = false
     @State private var scrubPosition: Double?
     @State private var isFullScreen = false
@@ -41,6 +42,7 @@ struct MacPlayerView: View {
 
             MacAVPlayerView(
                 player: controller.player,
+                pictureInPicture: pictureInPicture,
                 onPointerActivity: revealControls
             )
             .ignoresSafeArea()
@@ -134,6 +136,19 @@ struct MacPlayerView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { _ in
             isFullScreen = false
         }
+        .alert(
+            "Unable to Start Picture in Picture",
+            isPresented: Binding(
+                get: { pictureInPicture.errorMessage != nil },
+                set: { if !$0 { pictureInPicture.clearError() } }
+            )
+        ) {
+            Button("OK") {
+                pictureInPicture.clearError()
+            }
+        } message: {
+            Text(pictureInPicture.errorMessage ?? "Picture in Picture is unavailable.")
+        }
         .task {
             while !Task.isCancelled {
                 do {
@@ -188,6 +203,23 @@ struct MacPlayerView: View {
                 .menuStyle(.borderlessButton)
                 .fixedSize()
             }
+
+            Button {
+                revealControls()
+                pictureInPicture.toggle()
+            } label: {
+                Label(
+                    pictureInPicture.isActive ? "Exit Picture in Picture" : "Picture in Picture",
+                    systemImage: pictureInPicture.isActive ? "pip.exit" : "pip.enter"
+                )
+            }
+            .buttonStyle(.borderless)
+            .disabled(!pictureInPicture.isPossible && !pictureInPicture.isActive)
+            .help(
+                pictureInPicture.isPossible || pictureInPicture.isActive
+                    ? "Picture in Picture"
+                    : "Picture in Picture becomes available when the video is ready"
+            )
 
             Button {
                 revealControls()
@@ -446,14 +478,15 @@ struct MacPlayerView: View {
 // TeaStream supplies movie controls because growing HLS playlists otherwise appear live to AVKit.
 private struct MacAVPlayerView: NSViewRepresentable {
     let player: AVPlayer
+    let pictureInPicture: MacPictureInPictureController
     let onPointerActivity: () -> Void
 
     func makeNSView(context: Context) -> MacInteractivePlayerView {
         let playerView = MacInteractivePlayerView()
         playerView.player = player
-        playerView.controlsStyle = .none
-        playerView.videoGravity = .resizeAspect
+        playerView.pictureInPicture = pictureInPicture
         playerView.onPointerActivity = onPointerActivity
+        pictureInPicture.attach(to: playerView.playerLayer)
         return playerView
     }
 
@@ -461,21 +494,40 @@ private struct MacAVPlayerView: NSViewRepresentable {
         if playerView.player !== player {
             playerView.player = player
         }
+        playerView.pictureInPicture = pictureInPicture
         playerView.onPointerActivity = onPointerActivity
+        pictureInPicture.attach(to: playerView.playerLayer)
     }
 
     static func dismantleNSView(_ playerView: MacInteractivePlayerView, coordinator: Void) {
+        playerView.pictureInPicture?.detach(from: playerView.playerLayer)
         playerView.player = nil
+        playerView.pictureInPicture = nil
         playerView.onPointerActivity = nil
     }
 }
 
-private final class MacInteractivePlayerView: AVPlayerView {
+private final class MacInteractivePlayerView: NSView {
     var onPointerActivity: (() -> Void)?
+    weak var pictureInPicture: MacPictureInPictureController?
     private var pointerTrackingArea: NSTrackingArea?
+
+    var playerLayer: AVPlayerLayer {
+        guard let playerLayer = layer as? AVPlayerLayer else {
+            preconditionFailure("MacInteractivePlayerView must use AVPlayerLayer")
+        }
+        return playerLayer
+    }
+
+    var player: AVPlayer? {
+        get { playerLayer.player }
+        set { playerLayer.player = newValue }
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        wantsLayer = true
+        playerLayer.videoGravity = .resizeAspect
         let doubleClickRecognizer = NSClickGestureRecognizer(
             target: self,
             action: #selector(handleDoubleClick)
@@ -487,6 +539,15 @@ private final class MacInteractivePlayerView: AVPlayerView {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    override func makeBackingLayer() -> CALayer {
+        AVPlayerLayer()
+    }
+
+    override func layout() {
+        super.layout()
+        playerLayer.frame = bounds
     }
 
     override func viewDidMoveToWindow() {
@@ -526,6 +587,101 @@ private final class MacInteractivePlayerView: AVPlayerView {
     @objc private func handleDoubleClick() {
         onPointerActivity?()
         window?.toggleFullScreen(nil)
+    }
+}
+
+@MainActor
+private final class MacPictureInPictureController: NSObject, ObservableObject {
+    @Published private(set) var isPossible = false
+    @Published private(set) var isActive = false
+    @Published private(set) var errorMessage: String?
+
+    private weak var playerLayer: AVPlayerLayer?
+    private var controller: AVPictureInPictureController?
+    private var possibleObservation: NSKeyValueObservation?
+
+    func attach(to playerLayer: AVPlayerLayer) {
+        guard self.playerLayer !== playerLayer else { return }
+        detach()
+        self.playerLayer = playerLayer
+
+        guard AVPictureInPictureController.isPictureInPictureSupported() else {
+            isPossible = false
+            return
+        }
+
+        let contentSource = AVPictureInPictureController.ContentSource(playerLayer: playerLayer)
+        let controller = AVPictureInPictureController(contentSource: contentSource)
+        controller.delegate = self
+        self.controller = controller
+        possibleObservation = controller.observe(
+            \.isPictureInPicturePossible,
+            options: [.initial, .new]
+        ) { [weak self] controller, _ in
+            let isPossible = controller.isPictureInPicturePossible
+            Task { @MainActor in
+                self?.isPossible = isPossible
+            }
+        }
+    }
+
+    func toggle() {
+        guard let controller else { return }
+        errorMessage = nil
+        if controller.isPictureInPictureActive {
+            controller.stopPictureInPicture()
+        } else if controller.isPictureInPicturePossible {
+            controller.startPictureInPicture()
+        }
+    }
+
+    func detach(from playerLayer: AVPlayerLayer? = nil) {
+        guard playerLayer == nil || self.playerLayer === playerLayer else { return }
+        if controller?.isPictureInPictureActive == true {
+            controller?.stopPictureInPicture()
+        }
+        possibleObservation?.invalidate()
+        possibleObservation = nil
+        controller?.delegate = nil
+        controller?.contentSource = nil
+        controller = nil
+        self.playerLayer = nil
+        isPossible = false
+        isActive = false
+    }
+
+    func clearError() {
+        errorMessage = nil
+    }
+}
+
+extension MacPictureInPictureController: @preconcurrency AVPictureInPictureControllerDelegate {
+    func pictureInPictureControllerDidStartPictureInPicture(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) {
+        isActive = true
+    }
+
+    func pictureInPictureControllerDidStopPictureInPicture(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) {
+        isActive = false
+    }
+
+    func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
+        failedToStartPictureInPictureWithError error: any Error
+    ) {
+        isActive = false
+        errorMessage = error.localizedDescription
+    }
+
+    func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
+        restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
+    ) {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        completionHandler(true)
     }
 }
 
