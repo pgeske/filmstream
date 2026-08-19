@@ -18,17 +18,17 @@ import (
 
 const (
 	prewarmRequestHeader = "X-Filmstream-Prewarm"
-	prewarmBufferSeconds = 60
-	prewarmRefresh       = 10 * time.Minute
+	prewarmBufferSeconds = 30
 	prewarmMaxAge        = 20 * time.Minute
 	prewarmHintTTL       = 30 * time.Minute
 )
 
 type playbackPrewarmTarget struct {
-	request  CreatePlaybackRequest
-	source   string
-	priority bool
-	seed     *CreatePlaybackResponse
+	request     CreatePlaybackRequest
+	source      string
+	priority    bool
+	bufferVideo bool
+	seed        *CreatePlaybackResponse
 }
 
 type playbackPrewarmState struct {
@@ -57,31 +57,9 @@ func (s *Server) StartPlaybackPrewarmer(ctx context.Context, baseURL string) {
 	s.prewarmMu.Unlock()
 
 	go func() {
-		initial := time.NewTimer(time.Second)
-		ticker := time.NewTicker(prewarmRefresh)
-		defer initial.Stop()
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				s.cancelPlaybackPrewarming()
-				return
-			case <-initial.C:
-				s.syncHistoryPrewarming(ctx)
-			case <-ticker.C:
-				s.syncHistoryPrewarming(ctx)
-			case <-s.prewarmTrigger:
-				s.syncHistoryPrewarming(ctx)
-			}
-		}
+		<-ctx.Done()
+		s.cancelPlaybackPrewarming()
 	}()
-}
-
-func (s *Server) triggerPlaybackPrewarming() {
-	select {
-	case s.prewarmTrigger <- struct{}{}:
-	default:
-	}
 }
 
 func (s *Server) prewarmPlayback(w http.ResponseWriter, r *http.Request) {
@@ -102,7 +80,15 @@ func (s *Server) prewarmPlayback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	request.Preferences = mergePreferences(s.defaults, request.Preferences)
-	s.queuePlaybackPrewarm(playbackPrewarmTarget{request: request, source: "hint", priority: true})
+	bufferVideo := request.MediaType != string(metadata.MediaTypeShow)
+	if !bufferVideo {
+		// A show detail hint resolves and mounts the season release without downloading
+		// episode payload. Active playback separately warms only the next episode.
+		request.Preferences.PreferTextSubtitles = false
+	}
+	s.queuePlaybackPrewarm(playbackPrewarmTarget{
+		request: request, source: "hint", priority: true, bufferVideo: bufferVideo,
+	})
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "prewarming"})
 }
 
@@ -221,6 +207,10 @@ func (s *Server) runPlaybackPrewarm(ctx context.Context, key string, state *play
 		}
 		return
 	}
+	if !state.target.bufferVideo {
+		time.AfterFunc(prewarmHintTTL, func() { s.expireUnusedPrewarm(key, state) })
+		return
+	}
 
 	s.prewarmMu.Lock()
 	claimed := state.claimed
@@ -279,14 +269,14 @@ func (s *Server) runPlaybackPrewarm(ctx context.Context, key string, state *play
 		s.failReadyPlaybackPrewarm(key, state, err)
 		return
 	}
-	if err == nil && state.target.source == "hint" {
-		time.AfterFunc(prewarmHintTTL, func() { s.expireHintPrewarm(key, state) })
+	if err == nil {
+		time.AfterFunc(prewarmHintTTL, func() { s.expireUnusedPrewarm(key, state) })
 	}
 }
 
-func (s *Server) expireHintPrewarm(key string, state *playbackPrewarmState) {
+func (s *Server) expireUnusedPrewarm(key string, state *playbackPrewarmState) {
 	s.prewarmMu.Lock()
-	if s.prewarmStates[key] != state || state.claimed || state.target.source != "hint" {
+	if s.prewarmStates[key] != state || state.claimed {
 		s.prewarmMu.Unlock()
 		return
 	}
@@ -425,52 +415,6 @@ func (s *Server) prewarmJSON(
 	return nil
 }
 
-func (s *Server) syncHistoryPrewarming(ctx context.Context) {
-	if s.historyStore == nil {
-		return
-	}
-	entries, err := s.historyStore.List()
-	if err != nil {
-		s.logger.Warn("load history for playback prewarming", "error", err)
-		return
-	}
-	continueEntries := s.continueWatchHistory(ctx, entries)
-	targets := make(map[string]playbackPrewarmTarget)
-	for _, entry := range continueEntries {
-		target := s.prewarmTargetForHistory(ctx, entry)
-		if key := playbackPrewarmKey(target.request); key != "" {
-			targets[key] = target
-		}
-		if next, ok := s.nextEpisodeForPrewarming(ctx, entry); ok {
-			nextTarget := s.prewarmTargetForHistory(ctx, next)
-			if key := playbackPrewarmKey(nextTarget.request); key != "" {
-				targets[key] = nextTarget
-			}
-		}
-	}
-	for _, target := range targets {
-		s.queuePlaybackPrewarm(target)
-	}
-
-	var stalePlaybackIDs []string
-	s.prewarmMu.Lock()
-	for key, state := range s.prewarmStates {
-		_, wanted := targets[key]
-		if state.target.source != "history" || wanted {
-			continue
-		}
-		delete(s.prewarmStates, key)
-		state.cancel()
-		if state.response.ID != "" {
-			stalePlaybackIDs = append(stalePlaybackIDs, state.response.ID)
-		}
-	}
-	s.prewarmMu.Unlock()
-	for _, playbackID := range stalePlaybackIDs {
-		s.stopPreparedPlayback(playbackID)
-	}
-}
-
 func (s *Server) prewarmTargetForHistory(ctx context.Context, entry history.Entry) playbackPrewarmTarget {
 	query := entry.Title
 	if entry.SeriesTitle != "" {
@@ -520,7 +464,10 @@ func (s *Server) queueNextEpisodePrewarm(current history.Entry) {
 	lookupContext, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if next, ok := s.nextEpisodeForPrewarming(lookupContext, current); ok {
-		s.queuePlaybackPrewarm(s.prewarmTargetForHistory(lookupContext, next))
+		target := s.prewarmTargetForHistory(lookupContext, next)
+		target.priority = true
+		target.bufferVideo = true
+		s.queuePlaybackPrewarm(target)
 	}
 }
 
@@ -566,7 +513,7 @@ func (s *Server) queuePlaybackHandoff(playbackID string) bool {
 	request, hasRequest := s.playbackRequests[playbackID]
 	response, hasResponse := s.playbackResponses[playbackID]
 	s.mu.RUnlock()
-	if !hasRequest || !hasResponse || s.historyStore == nil {
+	if !hasRequest || !hasResponse || s.historyStore == nil || request.MediaType == string(metadata.MediaTypeShow) {
 		return false
 	}
 	entries, err := s.historyStore.List()
@@ -579,7 +526,7 @@ func (s *Server) queuePlaybackHandoff(playbackID string) bool {
 		}
 		request.StartSeconds = entry.ResumePosition()
 		target := playbackPrewarmTarget{
-			request: request, source: "history", priority: true, seed: &response,
+			request: request, source: "history", priority: true, bufferVideo: true, seed: &response,
 		}
 		s.queuePlaybackPrewarm(target)
 		return true

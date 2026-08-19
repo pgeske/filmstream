@@ -84,6 +84,7 @@ type Engine struct {
 
 	cleanupCancel context.CancelFunc
 	cleanupWG     sync.WaitGroup
+	restoreWG     sync.WaitGroup
 	closeOnce     sync.Once
 }
 
@@ -209,11 +210,13 @@ func New(cfg Config) (*Engine, error) {
 		sessions:         make(map[string]*Session),
 		managed:          make(map[*torrent.Torrent]*managedTorrent),
 	}
-	if err := engine.restoreManagedTorrents(); err != nil {
-		client.Close()
-		unlock()
-		return nil, err
-	}
+	engine.restoreWG.Add(1)
+	go func() {
+		defer engine.restoreWG.Done()
+		if err := engine.restoreManagedTorrents(); err != nil {
+			engine.logger.Error("could not restore managed torrents", "error", err)
+		}
+	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	engine.cleanupCancel = cancel
 	engine.cleanupWG.Add(1)
@@ -241,6 +244,7 @@ func (e *Engine) Close() error {
 	e.closeOnce.Do(func() {
 		e.cleanupCancel()
 		e.cleanupWG.Wait()
+		e.restoreWG.Wait()
 		e.lifecycleMu.Lock()
 		e.mu.Lock()
 		now := time.Now().UTC()

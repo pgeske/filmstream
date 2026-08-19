@@ -2,6 +2,7 @@ import AVFoundation
 import Combine
 import FilmstreamCore
 import Foundation
+import MediaPlayer
 import SwiftUI
 import UIKit
 
@@ -12,18 +13,35 @@ struct PlayerView: View {
     let movie: Movie
     let prepared: PreparedPlayback
     let api: FilmstreamAPI
+    let nextEpisode: Episode?
+    let onPlayNext: (@MainActor (Episode) async throws -> Void)?
 
     @StateObject private var controller: NativePlaybackController
     @State private var didClose = false
     @State private var isPlaybackChromeVisible = true
     @State private var isSubtitlePickerPresented = false
+    @State private var isStartingNextEpisode = false
+    @State private var nextEpisodeError: String?
     @State private var chromeAutoHideTask: Task<Void, Never>?
     @FocusState private var receivesRemoteCommands: Bool
+    @FocusState private var focusedPlaybackAction: PlaybackAction?
 
-    init(movie: Movie, prepared: PreparedPlayback, api: FilmstreamAPI) {
+    private enum PlaybackAction: Hashable {
+        case nextEpisode
+    }
+
+    init(
+        movie: Movie,
+        prepared: PreparedPlayback,
+        api: FilmstreamAPI,
+        nextEpisode: Episode? = nil,
+        onPlayNext: (@MainActor (Episode) async throws -> Void)? = nil
+    ) {
         self.movie = movie
         self.prepared = prepared
         self.api = api
+        self.nextEpisode = nextEpisode
+        self.onPlayNext = onPlayNext
         _controller = StateObject(
             wrappedValue: NativePlaybackController(movie: movie, prepared: prepared, api: api)
         )
@@ -69,17 +87,27 @@ struct PlayerView: View {
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
 
-            if let errorMessage = controller.errorMessage {
+            if let errorMessage = nextEpisodeError ?? controller.errorMessage {
                 VStack(spacing: 18) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.largeTitle)
                         .foregroundStyle(Color.teaAmber)
-                    Text("Unable to Play")
+                    Text(nextEpisodeError == nil ? "Unable to Play" : "Unable to Start Next Episode")
                         .font(.headline)
                     Text(errorMessage)
                         .font(.footnote)
                         .foregroundStyle(Color.teaMuted)
                         .lineLimit(2)
+                }
+                .padding(30)
+                .background(.black.opacity(0.76), in: RoundedRectangle(cornerRadius: 20))
+                .allowsHitTesting(false)
+            } else if isStartingNextEpisode {
+                VStack(spacing: 18) {
+                    PlaybackLoadingIndicator()
+                    Text("Starting \(nextEpisode?.label ?? "Next Episode")…")
+                        .font(.headline.weight(.semibold))
+                        .foregroundStyle(Color.teaCream)
                 }
                 .padding(30)
                 .background(.black.opacity(0.76), in: RoundedRectangle(cornerRadius: 20))
@@ -109,6 +137,7 @@ struct PlayerView: View {
         .focused($receivesRemoteCommands)
         .onAppear {
             receivesRemoteCommands = true
+            controller.activateMediaSession()
             controller.play()
         }
         .onDisappear {
@@ -146,7 +175,7 @@ struct PlayerView: View {
             case .right:
                 revealPlaybackChrome(autoHide: false)
                 controller.jump(by: 30)
-            case .up, .down:
+            case .up:
                 guard !controller.subtitleOptions.isEmpty else {
                     revealPlaybackChrome()
                     return
@@ -156,6 +185,14 @@ struct PlayerView: View {
                 withAnimation(.easeOut(duration: 0.2)) {
                     isSubtitlePickerPresented = true
                 }
+            case .down:
+                guard nextEpisode != nil, onPlayNext != nil else {
+                    revealPlaybackChrome()
+                    return
+                }
+                revealPlaybackChrome(autoHide: false)
+                receivesRemoteCommands = false
+                focusedPlaybackAction = .nextEpisode
             default:
                 break
             }
@@ -168,6 +205,19 @@ struct PlayerView: View {
         }
         .onChange(of: controller.isSeeking) { _, _ in
             synchronizePlaybackChrome()
+        }
+        .onChange(of: controller.didReachEnd) { _, didReachEnd in
+            if didReachEnd, nextEpisode != nil, onPlayNext != nil {
+                startNextEpisode()
+            }
+        }
+        .onChange(of: focusedPlaybackAction) { _, action in
+            if action == nil, !isSubtitlePickerPresented {
+                receivesRemoteCommands = true
+                schedulePlaybackChromeAutoHide()
+            } else {
+                revealPlaybackChrome(autoHide: false)
+            }
         }
         .onExitCommand {
             if isSubtitlePickerPresented {
@@ -199,6 +249,44 @@ struct PlayerView: View {
                 Text(movie.title)
                     .font(.title2.weight(.bold))
                 Spacer()
+                if let nextEpisode, onPlayNext != nil {
+                    Button {
+                        startNextEpisode()
+                    } label: {
+                        Label("Next \(nextEpisode.label)", systemImage: "forward.end.fill")
+                            .font(.headline.weight(.bold))
+                            .foregroundStyle(Color.teaCream)
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 12)
+                            .background(
+                                focusedPlaybackAction == .nextEpisode
+                                    ? Color.teaAccent
+                                    : Color.teaPanelElevated,
+                                in: Capsule()
+                            )
+                            .overlay {
+                                Capsule()
+                                    .stroke(Color.teaAccentLight.opacity(0.5), lineWidth: 1)
+                            }
+                    }
+                    .buttonStyle(.plain)
+                    .focusEffectDisabled()
+                    .focused($focusedPlaybackAction, equals: .nextEpisode)
+                    .disabled(isStartingNextEpisode)
+                    .onMoveCommand { direction in
+                        switch direction {
+                        case .up:
+                            focusedPlaybackAction = nil
+                            receivesRemoteCommands = true
+                        case .left:
+                            controller.jump(by: -30)
+                        case .right:
+                            controller.jump(by: 30)
+                        default:
+                            break
+                        }
+                    }
+                }
                 VStack(alignment: .trailing, spacing: 7) {
                     Label(
                         controller.stateLabel,
@@ -245,6 +333,8 @@ struct PlayerView: View {
         chromeAutoHideTask = nil
         guard isPlaybackChromeVisible,
               !isSubtitlePickerPresented,
+              focusedPlaybackAction == nil,
+              !isStartingNextEpisode,
               controller.isPlaying,
               !controller.isWaiting,
               !controller.isSeeking else {
@@ -259,7 +349,9 @@ struct PlayerView: View {
             guard controller.isPlaying,
                   !controller.isWaiting,
                   !controller.isSeeking,
-                  !isSubtitlePickerPresented else {
+                  !isSubtitlePickerPresented,
+                  focusedPlaybackAction == nil,
+                  !isStartingNextEpisode else {
                 return
             }
             withAnimation(.easeOut(duration: 0.28)) {
@@ -274,6 +366,32 @@ struct PlayerView: View {
             revealPlaybackChrome(autoHide: false)
         } else if isPlaybackChromeVisible {
             schedulePlaybackChromeAutoHide()
+        }
+    }
+
+    private func startNextEpisode() {
+        guard !isStartingNextEpisode,
+              let nextEpisode,
+              let onPlayNext else {
+            return
+        }
+        isStartingNextEpisode = true
+        nextEpisodeError = nil
+        focusedPlaybackAction = nil
+        controller.pause()
+        revealPlaybackChrome(autoHide: false)
+
+        Task { @MainActor in
+            await reportProgress()
+            do {
+                try await onPlayNext(nextEpisode)
+            } catch {
+                isStartingNextEpisode = false
+                nextEpisodeError = error.localizedDescription
+                if !controller.didReachEnd {
+                    controller.play()
+                }
+            }
         }
     }
 
@@ -545,6 +663,8 @@ private final class PlayerViewSurface: UIView {
 
 @MainActor
 private final class NativePlaybackController: ObservableObject {
+    private static var activeMediaSessionID: String?
+
     let player = AVPlayer()
 
     @Published private(set) var positionSeconds: Double
@@ -552,6 +672,7 @@ private final class NativePlaybackController: ObservableObject {
     @Published private(set) var isPlaying = false
     @Published private(set) var isSeeking = false
     @Published private(set) var isWaiting = true
+    @Published private(set) var didReachEnd = false
     @Published private(set) var stateLabel = "Preparing Stream…"
     @Published private(set) var errorMessage: String?
     @Published private(set) var subtitleOptions: [HLSSubtitleTrack]
@@ -566,6 +687,8 @@ private final class NativePlaybackController: ObservableObject {
     private var timeObserver: Any?
     private var statusObservation: NSKeyValueObservation?
     private var playbackObservation: NSKeyValueObservation?
+    private var itemEndObserver: NSObjectProtocol?
+    private var remoteCommandTargets: [(MPRemoteCommand, Any)] = []
     private var seekTask: Task<Void, Never>?
     private var subtitleTask: Task<Void, Never>?
     private var bufferingRecoveryTask: Task<Void, Never>?
@@ -578,6 +701,9 @@ private final class NativePlaybackController: ObservableObject {
     private var stopped = false
     private var wasInterrupted = false
     private var isRecovering = false
+    private var mediaSessionIsActive = false
+    private var mediaSessionID: String?
+    private var lastNowPlayingSecond = -1
 
     var playbackID: String { playback.id }
 
@@ -621,6 +747,11 @@ private final class NativePlaybackController: ObservableObject {
                         self.durationSeconds > 0 ? self.durationSeconds : .greatestFiniteMagnitude
                     )
                     self.updateActiveSubtitle()
+                    let elapsedSecond = Int(self.positionSeconds)
+                    if elapsedSecond / 5 != self.lastNowPlayingSecond / 5 {
+                        self.lastNowPlayingSecond = elapsedSecond
+                        self.publishNowPlayingInfo()
+                    }
                 }
             }
         }
@@ -652,6 +783,7 @@ private final class NativePlaybackController: ObservableObject {
                     self.isWaiting = true
                     self.stateLabel = "Preparing Stream…"
                 }
+                self.publishNowPlayingInfo()
             }
         }
     }
@@ -660,7 +792,51 @@ private final class NativePlaybackController: ObservableObject {
         guard !stopped else { return }
         wantsToPlay = true
         isPlaying = true
+        didReachEnd = false
         player.play()
+        publishNowPlayingInfo()
+    }
+
+    func pause() {
+        guard !stopped else { return }
+        wantsToPlay = false
+        isPlaying = false
+        player.pause()
+        publishNowPlayingInfo()
+    }
+
+    func activateMediaSession() {
+        guard !mediaSessionIsActive else { return }
+        let audioSession = AVAudioSession.sharedInstance()
+        try? audioSession.setCategory(.playback, mode: .moviePlayback)
+        try? audioSession.setActive(true)
+
+        let commands = MPRemoteCommandCenter.shared()
+        commands.playCommand.isEnabled = true
+        commands.pauseCommand.isEnabled = true
+        commands.togglePlayPauseCommand.isEnabled = true
+        let playTarget = commands.playCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.play() }
+            return .success
+        }
+        let pauseTarget = commands.pauseCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.pause() }
+            return .success
+        }
+        let toggleTarget = commands.togglePlayPauseCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.togglePlayback() }
+            return .success
+        }
+        remoteCommandTargets = [
+            (commands.playCommand, playTarget),
+            (commands.pauseCommand, pauseTarget),
+            (commands.togglePlayPauseCommand, toggleTarget),
+        ]
+        let sessionID = UUID().uuidString
+        mediaSessionID = sessionID
+        Self.activeMediaSessionID = sessionID
+        mediaSessionIsActive = true
+        publishNowPlayingInfo()
     }
 
     func togglePlayback() {
@@ -671,12 +847,56 @@ private final class NativePlaybackController: ObservableObject {
             return
         }
         if wantsToPlay {
-            wantsToPlay = false
-            isPlaying = false
-            player.pause()
+            pause()
         } else {
             play()
         }
+    }
+
+    private func publishNowPlayingInfo() {
+        guard mediaSessionIsActive else { return }
+        var info: [String: Any] = [
+            MPMediaItemPropertyTitle: movie.episodeTitle ?? movie.title,
+            MPNowPlayingInfoPropertyExternalContentIdentifier: mediaSessionID ?? playback.id,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: positionSeconds,
+            MPNowPlayingInfoPropertyPlaybackRate: wantsToPlay ? 1.0 : 0.0,
+        ]
+        if let seriesTitle = movie.seriesTitle {
+            info[MPMediaItemPropertyAlbumTitle] = seriesTitle
+        }
+        if let episodeLabel = movie.episodeLabel {
+            info[MPMediaItemPropertyArtist] = episodeLabel
+        }
+        if durationSeconds > 0 {
+            info[MPMediaItemPropertyPlaybackDuration] = durationSeconds
+        }
+        let center = MPNowPlayingInfoCenter.default()
+        center.nowPlayingInfo = info
+        center.playbackState = wantsToPlay ? .playing : .paused
+    }
+
+    private func deactivateMediaSession() {
+        guard mediaSessionIsActive else { return }
+        for (command, target) in remoteCommandTargets {
+            command.removeTarget(target)
+        }
+        remoteCommandTargets.removeAll()
+        mediaSessionIsActive = false
+        let sessionID = mediaSessionID
+        mediaSessionID = nil
+        guard Self.activeMediaSessionID == sessionID else { return }
+        Self.activeMediaSessionID = nil
+        let commands = MPRemoteCommandCenter.shared()
+        commands.playCommand.isEnabled = false
+        commands.pauseCommand.isEnabled = false
+        commands.togglePlayPauseCommand.isEnabled = false
+        let center = MPNowPlayingInfoCenter.default()
+        center.nowPlayingInfo = nil
+        center.playbackState = .stopped
+        try? AVAudioSession.sharedInstance().setActive(
+            false,
+            options: .notifyOthersOnDeactivation
+        )
     }
 
     func markInterrupted() {
@@ -821,6 +1041,11 @@ private final class NativePlaybackController: ObservableObject {
         subtitleTask = nil
         bufferingRecoveryTask?.cancel()
         bufferingRecoveryTask = nil
+        deactivateMediaSession()
+        if let itemEndObserver {
+            NotificationCenter.default.removeObserver(itemEndObserver)
+            self.itemEndObserver = nil
+        }
         player.pause()
         player.isMuted = true
         player.replaceCurrentItem(with: nil)
@@ -1015,6 +1240,11 @@ private final class NativePlaybackController: ObservableObject {
 
     private func installItem(url: URL) {
         statusObservation?.invalidate()
+        if let itemEndObserver {
+            NotificationCenter.default.removeObserver(itemEndObserver)
+            self.itemEndObserver = nil
+        }
+        didReachEnd = false
         let item = AVPlayerItem(url: url)
         item.preferredForwardBufferDuration = 30
         statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
@@ -1027,6 +1257,22 @@ private final class NativePlaybackController: ObservableObject {
                     self.stateLabel = "Unable to Play Stream"
                     self.errorMessage = item.error?.localizedDescription ?? "The HLS stream could not be opened."
                 }
+            }
+        }
+        itemEndObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, !self.stopped else { return }
+                self.positionSeconds = max(self.positionSeconds, self.durationSeconds)
+                self.wantsToPlay = false
+                self.isPlaying = false
+                self.isWaiting = false
+                self.didReachEnd = true
+                self.stateLabel = "Episode Finished"
+                self.publishNowPlayingInfo()
             }
         }
         player.replaceCurrentItem(with: item)

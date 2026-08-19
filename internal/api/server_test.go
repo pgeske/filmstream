@@ -566,6 +566,67 @@ func TestCreatePlaybackJoinsInProgressPrewarm(t *testing.T) {
 	}
 }
 
+func TestShowPrewarmResolvesReleaseWithoutBufferingVideo(t *testing.T) {
+	var createRequests atomic.Int32
+	var hlsRequests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/playbacks":
+			createRequests.Add(1)
+			var request CreatePlaybackRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Error(err)
+			}
+			if request.Preferences.PreferTextSubtitles {
+				t.Error("show release prewarm unexpectedly requested a subtitle media probe")
+			}
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{"id":"show-release","name":"The Show S01","file_name":"episode.mkv","file_size":1000,"source":"torrent","stream_url":"http://127.0.0.1/stream"}`)
+		case "/v1/playbacks/show-release/hls":
+			hlsRequests.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	server := &Server{
+		defaults:      catalog.Preferences{},
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		prewarmStates: make(map[string]*playbackPrewarmState),
+		prewarmSlots:  make(chan struct{}, 1),
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	server.prewarmContext = ctx
+	server.prewarmBaseURL = upstream.URL
+	server.prewarmClient = upstream.Client()
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/playbacks/prewarm", strings.NewReader(
+		`{"media_id":"tmdb-tv:3:s1:e1","media_type":"show","query":"The Show","series_id":"tmdb-tv:3","season_number":1,"episode_number":1,"preferences":{"prefer_text_subtitles":true}}`,
+	))
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for createRequests.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if createRequests.Load() != 1 {
+		t.Fatalf("create requests = %d, want 1", createRequests.Load())
+	}
+	time.Sleep(25 * time.Millisecond)
+	if hlsRequests.Load() != 0 {
+		t.Fatalf("HLS requests = %d, want 0", hlsRequests.Load())
+	}
+}
+
 func TestClaimPrewarmedPlaybackCancelsPendingPark(t *testing.T) {
 	registry, err := indexer.NewRegistry(nil)
 	if err != nil {

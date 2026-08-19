@@ -138,7 +138,6 @@ type Server struct {
 	prewarmMu      sync.Mutex
 	prewarmStates  map[string]*playbackPrewarmState
 	prewarmSlots   chan struct{}
-	prewarmTrigger chan struct{}
 	prewarmBaseURL string
 	prewarmClient  *http.Client
 	prewarmContext context.Context
@@ -159,7 +158,6 @@ func New(indexers *indexer.Registry, engine *torrentstream.Engine, defaults cata
 		usenetFailures:     make(map[string]time.Time),
 		prewarmStates:      make(map[string]*playbackPrewarmState),
 		prewarmSlots:       make(chan struct{}, 2),
-		prewarmTrigger:     make(chan struct{}, 1),
 	}
 	engine.SetCleanupHandler(func(id, _ string) {
 		server.cleanupPlayback(id)
@@ -740,7 +738,6 @@ func (s *Server) removeWatchHistory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.triggerPlaybackPrewarming()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -938,7 +935,7 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 
 		if session == nil {
 			var err error
-			session, selected, err = s.createCachedPlayback(r.Context(), request, preferences)
+			session, selected, err = s.createCachedPlayback(r.Context(), request)
 			if err != nil {
 				writeError(w, http.StatusBadGateway, err.Error())
 				return
@@ -1178,7 +1175,6 @@ func (s *Server) createCachedUsenetPlayback(
 func (s *Server) createCachedPlayback(
 	ctx context.Context,
 	request CreatePlaybackRequest,
-	preferences catalog.Preferences,
 ) (*playbackSession, *catalog.RankedCandidate, error) {
 	if s.playbackCache == nil {
 		return nil, nil, nil
@@ -1232,19 +1228,9 @@ func (s *Server) createCachedPlayback(
 			"title", request.Query, "live_peers", options[0].peers)
 		return nil, nil, nil
 	}
-	if preferences.PreferTextSubtitles {
-		hasTextSubtitles, probeErr := s.playbackHasTextSubtitles(ctx, session.ID)
-		if probeErr != nil {
-			s.logger.Warn("probe cached playback subtitles", "title", request.Query, "error", probeErr)
-		} else if !hasTextSubtitles {
-			_ = s.engine.Drop(session.ID)
-			if removeErr := s.playbackCache.Remove(cacheMediaID, request.Query, request.Year); removeErr != nil {
-				s.logger.Warn("remove cached playback without text subtitles", "title", request.Query, "error", removeErr)
-			}
-			s.logger.Info("cached playback lacks text subtitles; searching again", "title", request.Query)
-			return nil, nil, nil
-		}
-	}
+	// A cached release has already produced a valid HLS stream. Re-probing it here
+	// downloads media before playback and turns every background lookup into torrent
+	// payload work. The HLS startup probe will expose this episode's actual tracks.
 	s.logger.Info("reused cached playback selection", "id", session.ID,
 		"name", cached.Selected.Candidate.Name, "live_peers", options[strong].peers)
 	selected := cached.Selected
@@ -1866,9 +1852,7 @@ func (s *Server) stopHLSPlayback(w http.ResponseWriter, r *http.Request) {
 	if manager != nil {
 		manager.Stop(playbackID)
 	}
-	if !s.queuePlaybackHandoff(playbackID) {
-		s.triggerPlaybackPrewarming()
-	}
+	s.queuePlaybackHandoff(playbackID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 

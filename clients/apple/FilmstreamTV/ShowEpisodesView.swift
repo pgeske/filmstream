@@ -10,6 +10,7 @@ struct ShowEpisodesView: View {
     @State private var activePlayback: TVEpisodeBrowserPlaybackSession?
     @State private var isLoading = false
     @State private var preparingEpisodeID: String?
+    @State private var preparationStage: PlaybackPreparationStage?
     @State private var errorMessage: String?
     @FocusState private var focusedSeasonNumber: Int?
     @FocusState private var focusedEpisodeID: String?
@@ -47,7 +48,16 @@ struct ShowEpisodesView: View {
                 Task { await model.loadContinueWatching() }
             }
         ) { session in
-            PlayerView(movie: session.movie, prepared: session.prepared, api: model.api)
+            PlayerView(
+                movie: session.movie,
+                prepared: session.prepared,
+                api: model.api,
+                nextEpisode: session.nextEpisode,
+                onPlayNext: { episode in
+                    try await advancePlayback(to: episode)
+                }
+            )
+            .id(session.id)
         }
     }
 
@@ -143,6 +153,14 @@ struct ShowEpisodesView: View {
                 if isLoading {
                     ProgressView()
                         .tint(Color.teaAccent)
+                } else if let preparationStage {
+                    HStack(spacing: 12) {
+                        ProgressView()
+                            .tint(Color.teaAccent)
+                        Text(preparationStageLabel(preparationStage))
+                            .font(.headline.weight(.semibold))
+                            .foregroundStyle(Color.teaAccentLight)
+                    }
                 }
             }
 
@@ -273,24 +291,62 @@ struct ShowEpisodesView: View {
         }
     }
 
+    private func preparationStageLabel(_ stage: PlaybackPreparationStage) -> String {
+        switch stage {
+        case .findingRelease:
+            "Finding Season Release…"
+        case .bufferingVideo:
+            "Buffering Episode…"
+        }
+    }
+
     private func preparePlayback(for episode: Episode) async {
         preparingEpisodeID = episode.id
-        defer { preparingEpisodeID = nil }
+        defer {
+            preparingEpisodeID = nil
+            preparationStage = nil
+        }
         let movie = episode.playbackMovie(in: details.show)
         let startSeconds = history(for: episode).flatMap {
             !$0.completed && $0.positionSeconds >= 30 ? $0.positionSeconds : nil
         } ?? 0
         do {
+            let nextEpisodeTask = Task {
+                try? await model.api.nextEpisode(after: episode, in: details)
+            }
             let prepared = try await model.preparePlayback(
                 for: movie,
                 startSeconds: startSeconds,
-                onStage: { _ in }
+                onStage: { preparationStage = $0 }
             )
-            activePlayback = TVEpisodeBrowserPlaybackSession(movie: movie, prepared: prepared)
+            let nextEpisode = await nextEpisodeTask.value
+            activePlayback = TVEpisodeBrowserPlaybackSession(
+                movie: movie,
+                prepared: prepared,
+                nextEpisode: nextEpisode
+            )
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    private func advancePlayback(to episode: Episode) async throws {
+        let movie = episode.playbackMovie(in: details.show)
+        let nextEpisodeTask = Task {
+            try? await model.api.nextEpisode(after: episode, in: details)
+        }
+        let prepared = try await model.preparePlayback(
+            for: movie,
+            startSeconds: 0,
+            onStage: { _ in }
+        )
+        let nextEpisode = await nextEpisodeTask.value
+        activePlayback = TVEpisodeBrowserPlaybackSession(
+            movie: movie,
+            prepared: prepared,
+            nextEpisode: nextEpisode
+        )
     }
 }
 
@@ -332,6 +388,7 @@ private struct EpisodeStillImage: View {
 private struct TVEpisodeBrowserPlaybackSession: Identifiable {
     let movie: Movie
     let prepared: PreparedPlayback
+    let nextEpisode: Episode?
 
     var id: String { prepared.id }
 }

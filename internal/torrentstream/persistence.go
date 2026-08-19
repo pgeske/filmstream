@@ -52,7 +52,6 @@ func (e *Engine) restoreManagedTorrents() error {
 		return fmt.Errorf("unsupported managed torrent state version %d", payload.Version)
 	}
 
-	now := time.Now().UTC()
 	for _, state := range payload.Torrents {
 		if state == nil {
 			return errors.New("managed torrent state contains a null entry")
@@ -60,48 +59,70 @@ func (e *Engine) restoreManagedTorrents() error {
 		if !validInfoHash(state.InfoHash) {
 			return fmt.Errorf("managed torrent state contains invalid info hash %q", state.InfoHash)
 		}
-		meta, err := metainfo.LoadFromFile(e.managedMetainfoPath(state.InfoHash))
+		e.lifecycleMu.Lock()
+		err := e.restoreManagedTorrent(state, time.Now().UTC())
+		e.lifecycleMu.Unlock()
 		if err != nil {
-			return fmt.Errorf("load managed torrent %s: %w", state.InfoHash, err)
-		}
-		t, err := e.client.AddTorrent(meta)
-		if err != nil {
-			return fmt.Errorf("restore managed torrent %s: %w", state.InfoHash, err)
-		}
-		if t.InfoHash().HexString() != state.InfoHash {
-			t.Drop()
-			return fmt.Errorf("managed torrent %s has mismatched metainfo", state.InfoHash)
-		}
-		file, err := selectVideoFile(t.Files(), state.FileHint)
-		if err != nil && state.FileHint != "" {
-			file, err = selectVideoFile(t.Files(), "")
-		}
-		if err != nil {
-			t.Drop()
-			return fmt.Errorf("restore managed torrent %s: %w", state.InfoHash, err)
-		}
-		id, err := randomID()
-		if err != nil {
-			t.Drop()
 			return err
 		}
-		if state.LastActivity.IsZero() {
-			state.LastActivity = now
-		}
-		stats := t.Stats()
-		state.runtimeDownloaded = stats.BytesReadData.Int64()
-		state.runtimeUploaded = stats.BytesWrittenData.Int64()
-		if state.Started {
-			state.lastCountedAt = now
-		}
-		e.managed[t] = state
-		e.sessions[id] = &Session{
-			ID: id, Name: t.Name(), FileName: file.DisplayPath(), FileSize: file.Length(), CreatedAt: now,
-			torrent: t, file: file, started: state.Started, lastActivity: state.LastActivity,
-		}
-		e.logger.Info("restored managed torrent for seeding", "name", t.Name(),
-			"seeded_hours", state.SeededSeconds/3600)
 	}
+	return nil
+}
+
+func (e *Engine) restoreManagedTorrent(state *managedTorrent, now time.Time) error {
+	meta, err := metainfo.LoadFromFile(e.managedMetainfoPath(state.InfoHash))
+	if err != nil {
+		return fmt.Errorf("load managed torrent %s: %w", state.InfoHash, err)
+	}
+	t, err := e.client.AddTorrent(meta)
+	if err != nil {
+		return fmt.Errorf("restore managed torrent %s: %w", state.InfoHash, err)
+	}
+	if t.InfoHash().HexString() != state.InfoHash {
+		t.Drop()
+		return fmt.Errorf("managed torrent %s has mismatched metainfo", state.InfoHash)
+	}
+	file, err := selectVideoFile(t.Files(), state.FileHint)
+	if err != nil && state.FileHint != "" {
+		file, err = selectVideoFile(t.Files(), "")
+	}
+	if err != nil {
+		t.Drop()
+		return fmt.Errorf("restore managed torrent %s: %w", state.InfoHash, err)
+	}
+	id, err := randomID()
+	if err != nil {
+		t.Drop()
+		return err
+	}
+	if state.LastActivity.IsZero() {
+		state.LastActivity = now
+	}
+	stats := t.Stats()
+	state.runtimeDownloaded = stats.BytesReadData.Int64()
+	state.runtimeUploaded = stats.BytesWrittenData.Int64()
+	if state.Started {
+		state.lastCountedAt = now
+	}
+
+	e.mu.Lock()
+	e.managed[t] = state
+	for _, session := range e.sessions {
+		if session.torrent == t {
+			session.started = session.started || state.Started
+			e.mu.Unlock()
+			e.logger.Info("restored managed torrent state", "name", t.Name(),
+				"seeded_hours", state.SeededSeconds/3600)
+			return nil
+		}
+	}
+	e.sessions[id] = &Session{
+		ID: id, Name: t.Name(), FileName: file.DisplayPath(), FileSize: file.Length(), CreatedAt: now,
+		torrent: t, file: file, started: state.Started, lastActivity: state.LastActivity,
+	}
+	e.mu.Unlock()
+	e.logger.Info("restored managed torrent for seeding", "name", t.Name(),
+		"seeded_hours", state.SeededSeconds/3600)
 	return nil
 }
 

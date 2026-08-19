@@ -296,6 +296,7 @@ func TestEngineRestoresManagedTorrentForSeeding(t *testing.T) {
 
 	second := newTestEngine(t, dataDir, Config{})
 	defer second.Close()
+	second.restoreWG.Wait()
 	if len(second.sessions) != 1 || len(second.managed) != 1 {
 		t.Fatalf("restored sessions = %d, managed torrents = %d", len(second.sessions), len(second.managed))
 	}

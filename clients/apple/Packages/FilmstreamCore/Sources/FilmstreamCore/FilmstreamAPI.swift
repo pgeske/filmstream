@@ -89,6 +89,28 @@ public struct FilmstreamAPI: Sendable {
         return EpisodePlaybackSelection(episode: firstEpisode, startSeconds: 0)
     }
 
+    public func nextEpisode(
+        after episode: Episode,
+        in details: SeriesDetails
+    ) async throws -> Episode? {
+        for summary in details.seasons.sorted(by: { $0.number < $1.number })
+        where summary.number >= episode.seasonNumber {
+            let showSeason = try await season(summary.number, for: details.show.id)
+            if summary.number == episode.seasonNumber {
+                if let next = showSeason.episodes.first(where: {
+                    $0.episodeNumber > episode.episodeNumber
+                }) {
+                    return next
+                }
+                continue
+            }
+            if let first = showSeason.episodes.first {
+                return first
+            }
+        }
+        return nil
+    }
+
     public func ratings(for movie: Movie) async throws -> MovieRatings {
         var components = URLComponents(
             url: baseURL.appendingPathComponent("v1/catalog/ratings"),
