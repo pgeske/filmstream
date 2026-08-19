@@ -247,12 +247,20 @@ struct MacShowDetailView: View {
         }
         let movie = playbackSelection.episode.playbackMovie(in: details.show)
         do {
+            let nextEpisodeTask = Task {
+                try? await model.api.nextEpisode(after: playbackSelection.episode, in: details)
+            }
             let prepared = try await model.preparePlayback(
                 for: movie,
                 startSeconds: startSeconds,
                 onStage: { preparationStage = $0 }
             )
-            model.presentPlayback(movie: movie, prepared: prepared)
+            model.presentPlayback(
+                movie: movie,
+                prepared: prepared,
+                details: details,
+                nextEpisode: await nextEpisodeTask.value
+            )
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription

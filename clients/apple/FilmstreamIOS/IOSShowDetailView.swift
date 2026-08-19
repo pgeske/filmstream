@@ -48,7 +48,16 @@ struct IOSShowDetailView: View {
                 }
             }
         ) { session in
-            IOSPlayerView(movie: session.movie, prepared: session.prepared, api: model.api)
+            IOSPlayerView(
+                movie: session.movie,
+                prepared: session.prepared,
+                api: model.api,
+                nextEpisode: session.nextEpisode,
+                onPlayNext: { episode in
+                    try await advancePlayback(to: episode)
+                }
+            )
+            .id(session.id)
         }
     }
 
@@ -236,16 +245,43 @@ struct IOSShowDetailView: View {
         }
         let movie = playbackSelection.episode.playbackMovie(in: details.show)
         do {
+            let nextEpisodeTask = Task {
+                try? await model.api.nextEpisode(after: playbackSelection.episode, in: details)
+            }
             let prepared = try await model.preparePlayback(
                 for: movie,
                 startSeconds: startSeconds,
                 onStage: { preparationStage = $0 }
             )
-            activePlayback = IOSEpisodePlaybackSession(movie: movie, prepared: prepared)
+            let nextEpisode = await nextEpisodeTask.value
+            activePlayback = IOSEpisodePlaybackSession(
+                movie: movie,
+                prepared: prepared,
+                nextEpisode: nextEpisode
+            )
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    private func advancePlayback(to episode: Episode) async throws {
+        guard let details else { return }
+        let movie = episode.playbackMovie(in: details.show)
+        let nextEpisodeTask = Task {
+            try? await model.api.nextEpisode(after: episode, in: details)
+        }
+        let prepared = try await model.preparePlayback(
+            for: movie,
+            startSeconds: 0,
+            onStage: { _ in }
+        )
+        let nextEpisode = await nextEpisodeTask.value
+        activePlayback = IOSEpisodePlaybackSession(
+            movie: movie,
+            prepared: prepared,
+            nextEpisode: nextEpisode
+        )
     }
 
     private func removeFromContinueWatching() async {
@@ -265,6 +301,7 @@ struct IOSShowDetailView: View {
 private struct IOSEpisodePlaybackSession: Identifiable {
     let movie: Movie
     let prepared: PreparedPlayback
+    let nextEpisode: Episode?
 
     var id: String { prepared.id }
 }

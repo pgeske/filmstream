@@ -24,11 +24,6 @@ struct PlayerView: View {
     @State private var nextEpisodeError: String?
     @State private var chromeAutoHideTask: Task<Void, Never>?
     @FocusState private var receivesRemoteCommands: Bool
-    @FocusState private var focusedPlaybackAction: PlaybackAction?
-
-    private enum PlaybackAction: Hashable {
-        case nextEpisode
-    }
 
     init(
         movie: Movie,
@@ -186,13 +181,7 @@ struct PlayerView: View {
                     isSubtitlePickerPresented = true
                 }
             case .down:
-                guard nextEpisode != nil, onPlayNext != nil else {
-                    revealPlaybackChrome()
-                    return
-                }
-                revealPlaybackChrome(autoHide: false)
-                receivesRemoteCommands = false
-                focusedPlaybackAction = .nextEpisode
+                revealPlaybackChrome()
             default:
                 break
             }
@@ -209,14 +198,6 @@ struct PlayerView: View {
         .onChange(of: controller.didReachEnd) { _, didReachEnd in
             if didReachEnd, nextEpisode != nil, onPlayNext != nil {
                 startNextEpisode()
-            }
-        }
-        .onChange(of: focusedPlaybackAction) { _, action in
-            if action == nil, !isSubtitlePickerPresented {
-                receivesRemoteCommands = true
-                schedulePlaybackChromeAutoHide()
-            } else {
-                revealPlaybackChrome(autoHide: false)
             }
         }
         .onExitCommand {
@@ -249,44 +230,6 @@ struct PlayerView: View {
                 Text(movie.title)
                     .font(.title2.weight(.bold))
                 Spacer()
-                if let nextEpisode, onPlayNext != nil {
-                    Button {
-                        startNextEpisode()
-                    } label: {
-                        Label("Next \(nextEpisode.label)", systemImage: "forward.end.fill")
-                            .font(.headline.weight(.bold))
-                            .foregroundStyle(Color.teaCream)
-                            .padding(.horizontal, 18)
-                            .padding(.vertical, 12)
-                            .background(
-                                focusedPlaybackAction == .nextEpisode
-                                    ? Color.teaAccent
-                                    : Color.teaPanelElevated,
-                                in: Capsule()
-                            )
-                            .overlay {
-                                Capsule()
-                                    .stroke(Color.teaAccentLight.opacity(0.5), lineWidth: 1)
-                            }
-                    }
-                    .buttonStyle(.plain)
-                    .focusEffectDisabled()
-                    .focused($focusedPlaybackAction, equals: .nextEpisode)
-                    .disabled(isStartingNextEpisode)
-                    .onMoveCommand { direction in
-                        switch direction {
-                        case .up:
-                            focusedPlaybackAction = nil
-                            receivesRemoteCommands = true
-                        case .left:
-                            controller.jump(by: -30)
-                        case .right:
-                            controller.jump(by: 30)
-                        default:
-                            break
-                        }
-                    }
-                }
                 VStack(alignment: .trailing, spacing: 7) {
                     Label(
                         controller.stateLabel,
@@ -333,7 +276,6 @@ struct PlayerView: View {
         chromeAutoHideTask = nil
         guard isPlaybackChromeVisible,
               !isSubtitlePickerPresented,
-              focusedPlaybackAction == nil,
               !isStartingNextEpisode,
               controller.isPlaying,
               !controller.isWaiting,
@@ -350,7 +292,6 @@ struct PlayerView: View {
                   !controller.isWaiting,
                   !controller.isSeeking,
                   !isSubtitlePickerPresented,
-                  focusedPlaybackAction == nil,
                   !isStartingNextEpisode else {
                 return
             }
@@ -377,7 +318,6 @@ struct PlayerView: View {
         }
         isStartingNextEpisode = true
         nextEpisodeError = nil
-        focusedPlaybackAction = nil
         controller.pause()
         revealPlaybackChrome(autoHide: false)
 

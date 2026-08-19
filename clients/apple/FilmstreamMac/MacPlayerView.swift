@@ -10,6 +10,8 @@ struct MacPlayerView: View {
     let movie: Movie
     let prepared: PreparedPlayback
     let api: FilmstreamAPI
+    let nextEpisode: Episode?
+    let onPlayNext: (@MainActor (Episode) async throws -> Void)?
     let onClose: () -> Void
 
     @StateObject private var controller: MacPlaybackController
@@ -18,6 +20,8 @@ struct MacPlayerView: View {
     @State private var scrubPosition: Double?
     @State private var isFullScreen = false
     @State private var controlsAreVisible = true
+    @State private var isStartingNextEpisode = false
+    @State private var nextEpisodeError: String?
     @State private var controlsHideTask: Task<Void, Never>?
     @State private var keyEventMonitor: Any?
 
@@ -25,11 +29,15 @@ struct MacPlayerView: View {
         movie: Movie,
         prepared: PreparedPlayback,
         api: FilmstreamAPI,
+        nextEpisode: Episode? = nil,
+        onPlayNext: (@MainActor (Episode) async throws -> Void)? = nil,
         onClose: @escaping () -> Void
     ) {
         self.movie = movie
         self.prepared = prepared
         self.api = api
+        self.nextEpisode = nextEpisode
+        self.onPlayNext = onPlayNext
         self.onClose = onClose
         _controller = StateObject(
             wrappedValue: MacPlaybackController(prepared: prepared, api: api)
@@ -76,18 +84,28 @@ struct MacPlayerView: View {
             }
             .animation(.easeOut(duration: 0.2), value: controlsAreVisible)
 
-            if let errorMessage = controller.errorMessage {
+            if let errorMessage = nextEpisodeError ?? controller.errorMessage {
                 VStack(spacing: 14) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.largeTitle)
                         .foregroundStyle(Color.macTeaAmber)
-                    Text("Unable to Play")
+                    Text(nextEpisodeError == nil ? "Unable to Play" : "Unable to Start Next Episode")
                         .font(.headline)
                     Text(errorMessage)
                         .font(.callout)
                         .foregroundStyle(Color.macTeaMuted)
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: 420)
+                }
+                .padding(28)
+                .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 18))
+            } else if isStartingNextEpisode {
+                VStack(spacing: 14) {
+                    ProgressView()
+                        .controlSize(.large)
+                        .tint(Color.macTeaAccent)
+                    Text("Starting \(nextEpisode?.label ?? "Next Episode")…")
+                        .font(.headline)
                 }
                 .padding(28)
                 .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 18))
@@ -121,6 +139,11 @@ struct MacPlayerView: View {
         .onChange(of: controller.errorMessage) { _, errorMessage in
             if errorMessage != nil {
                 keepControlsVisible()
+            }
+        }
+        .onChange(of: controller.didReachEnd) { _, didReachEnd in
+            if didReachEnd, nextEpisode != nil, onPlayNext != nil {
+                startNextEpisode()
             }
         }
         .onExitCommand {
@@ -430,6 +453,28 @@ struct MacPlayerView: View {
         self.keyEventMonitor = nil
     }
 
+    private func startNextEpisode() {
+        guard !isStartingNextEpisode,
+              let nextEpisode,
+              let onPlayNext else {
+            return
+        }
+        isStartingNextEpisode = true
+        nextEpisodeError = nil
+        controller.pause()
+        keepControlsVisible()
+
+        Task { @MainActor in
+            await reportProgress()
+            do {
+                try await onPlayNext(nextEpisode)
+            } catch {
+                isStartingNextEpisode = false
+                nextEpisodeError = error.localizedDescription
+            }
+        }
+    }
+
     private func closePlayback() {
         guard !didClose else { return }
         didClose = true
@@ -713,6 +758,7 @@ private final class MacPlaybackController: ObservableObject {
     @Published private(set) var isPlaying = false
     @Published private(set) var isSeeking = false
     @Published private(set) var isWaiting = true
+    @Published private(set) var didReachEnd = false
     @Published private(set) var stateLabel = "Preparing Stream…"
     @Published private(set) var errorMessage: String?
     @Published private(set) var subtitleOptions: [HLSSubtitleTrack]
@@ -725,6 +771,7 @@ private final class MacPlaybackController: ObservableObject {
     private var timeObserver: Any?
     private var statusObservation: NSKeyValueObservation?
     private var playbackObservation: NSKeyValueObservation?
+    private var itemEndObserver: NSObjectProtocol?
     private var seekTask: Task<Void, Never>?
     private var subtitleTask: Task<Void, Never>?
     private var subtitleCues: [SubtitleCue] = []
@@ -796,7 +843,15 @@ private final class MacPlaybackController: ObservableObject {
         guard !stopped else { return }
         wantsToPlay = true
         isPlaying = true
+        didReachEnd = false
         player.play()
+    }
+
+    func pause() {
+        guard !stopped else { return }
+        wantsToPlay = false
+        isPlaying = false
+        player.pause()
     }
 
     func togglePlayback() {
@@ -807,9 +862,7 @@ private final class MacPlaybackController: ObservableObject {
             return
         }
         if wantsToPlay {
-            wantsToPlay = false
-            isPlaying = false
-            player.pause()
+            pause()
         } else {
             play()
         }
@@ -866,6 +919,10 @@ private final class MacPlaybackController: ObservableObject {
         seekTask = nil
         subtitleTask?.cancel()
         subtitleTask = nil
+        if let itemEndObserver {
+            NotificationCenter.default.removeObserver(itemEndObserver)
+            self.itemEndObserver = nil
+        }
         player.pause()
         player.replaceCurrentItem(with: nil)
         if let timeObserver {
@@ -1020,6 +1077,11 @@ private final class MacPlaybackController: ObservableObject {
 
     private func installItem(url: URL) {
         statusObservation?.invalidate()
+        if let itemEndObserver {
+            NotificationCenter.default.removeObserver(itemEndObserver)
+            self.itemEndObserver = nil
+        }
+        didReachEnd = false
         let item = AVPlayerItem(url: url)
         item.preferredForwardBufferDuration = 30
         statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
@@ -1032,6 +1094,21 @@ private final class MacPlaybackController: ObservableObject {
                     self.stateLabel = "Unable to Play Stream"
                     self.errorMessage = item.error?.localizedDescription ?? "The HLS stream could not be opened."
                 }
+            }
+        }
+        itemEndObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, !self.stopped else { return }
+                self.positionSeconds = max(self.positionSeconds, self.durationSeconds)
+                self.wantsToPlay = false
+                self.isPlaying = false
+                self.isWaiting = false
+                self.didReachEnd = true
+                self.stateLabel = "Episode Finished"
             }
         }
         player.replaceCurrentItem(with: item)

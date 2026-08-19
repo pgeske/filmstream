@@ -11,17 +11,29 @@ struct IOSPlayerView: View {
     let movie: Movie
     let prepared: PreparedPlayback
     let api: FilmstreamAPI
+    let nextEpisode: Episode?
+    let onPlayNext: (@MainActor (Episode) async throws -> Void)?
 
     @StateObject private var controller: IOSPlaybackController
     @State private var didClose = false
     @State private var isChromeVisible = true
     @State private var scrubPosition: Double?
+    @State private var isStartingNextEpisode = false
+    @State private var nextEpisodeError: String?
     @State private var autoHideTask: Task<Void, Never>?
 
-    init(movie: Movie, prepared: PreparedPlayback, api: FilmstreamAPI) {
+    init(
+        movie: Movie,
+        prepared: PreparedPlayback,
+        api: FilmstreamAPI,
+        nextEpisode: Episode? = nil,
+        onPlayNext: (@MainActor (Episode) async throws -> Void)? = nil
+    ) {
         self.movie = movie
         self.prepared = prepared
         self.api = api
+        self.nextEpisode = nextEpisode
+        self.onPlayNext = onPlayNext
         _controller = StateObject(
             wrappedValue: IOSPlaybackController(prepared: prepared, api: api)
         )
@@ -60,12 +72,12 @@ struct IOSPlayerView: View {
                     .transition(.opacity)
             }
 
-            if let errorMessage = controller.errorMessage {
+            if let errorMessage = nextEpisodeError ?? controller.errorMessage {
                 VStack(spacing: 12) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.largeTitle)
                         .foregroundStyle(Color.mobileTeaAmber)
-                    Text("Unable to Play")
+                    Text(nextEpisodeError == nil ? "Unable to Play" : "Unable to Start Next Episode")
                         .font(.headline)
                     Text(errorMessage)
                         .font(.footnote)
@@ -74,6 +86,16 @@ struct IOSPlayerView: View {
                 }
                 .padding(24)
                 .frame(maxWidth: 330)
+                .background(.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 18))
+            } else if isStartingNextEpisode {
+                VStack(spacing: 12) {
+                    ProgressView()
+                        .controlSize(.large)
+                        .tint(Color.mobileTeaAccent)
+                    Text("Starting \(nextEpisode?.label ?? "Next Episode")…")
+                        .font(.headline)
+                }
+                .padding(24)
                 .background(.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 18))
             } else if controller.isWaiting {
                 ProgressView()
@@ -104,6 +126,11 @@ struct IOSPlayerView: View {
         }
         .onChange(of: controller.isSeeking) { _, _ in
             synchronizeChrome()
+        }
+        .onChange(of: controller.didReachEnd) { _, didReachEnd in
+            if didReachEnd, nextEpisode != nil, onPlayNext != nil {
+                startNextEpisode()
+            }
         }
         .task {
             while !Task.isCancelled {
@@ -338,6 +365,28 @@ struct IOSPlayerView: View {
         }
     }
 
+    private func startNextEpisode() {
+        guard !isStartingNextEpisode,
+              let nextEpisode,
+              let onPlayNext else {
+            return
+        }
+        isStartingNextEpisode = true
+        nextEpisodeError = nil
+        controller.pause()
+        revealChrome(autoHide: false)
+
+        Task { @MainActor in
+            await reportProgress()
+            do {
+                try await onPlayNext(nextEpisode)
+            } catch {
+                isStartingNextEpisode = false
+                nextEpisodeError = error.localizedDescription
+            }
+        }
+    }
+
     private func closePlayback() {
         guard !didClose else { return }
         didClose = true
@@ -453,6 +502,7 @@ private final class IOSPlaybackController: ObservableObject {
     @Published private(set) var isPlaying = false
     @Published private(set) var isSeeking = false
     @Published private(set) var isWaiting = true
+    @Published private(set) var didReachEnd = false
     @Published private(set) var stateLabel = "Preparing Stream…"
     @Published private(set) var errorMessage: String?
     @Published private(set) var subtitleOptions: [HLSSubtitleTrack]
@@ -465,6 +515,7 @@ private final class IOSPlaybackController: ObservableObject {
     private var timeObserver: Any?
     private var statusObservation: NSKeyValueObservation?
     private var playbackObservation: NSKeyValueObservation?
+    private var itemEndObserver: NSObjectProtocol?
     private var seekTask: Task<Void, Never>?
     private var subtitleTask: Task<Void, Never>?
     private var subtitleCues: [SubtitleCue] = []
@@ -539,7 +590,15 @@ private final class IOSPlaybackController: ObservableObject {
         guard !stopped else { return }
         wantsToPlay = true
         isPlaying = true
+        didReachEnd = false
         player.play()
+    }
+
+    func pause() {
+        guard !stopped else { return }
+        wantsToPlay = false
+        isPlaying = false
+        player.pause()
     }
 
     func togglePlayback() {
@@ -550,9 +609,7 @@ private final class IOSPlaybackController: ObservableObject {
             return
         }
         if wantsToPlay {
-            wantsToPlay = false
-            isPlaying = false
-            player.pause()
+            pause()
         } else {
             play()
         }
@@ -610,6 +667,10 @@ private final class IOSPlaybackController: ObservableObject {
         seekTask = nil
         subtitleTask?.cancel()
         subtitleTask = nil
+        if let itemEndObserver {
+            NotificationCenter.default.removeObserver(itemEndObserver)
+            self.itemEndObserver = nil
+        }
         player.pause()
         player.replaceCurrentItem(with: nil)
         if let timeObserver {
@@ -764,6 +825,11 @@ private final class IOSPlaybackController: ObservableObject {
 
     private func installItem(url: URL) {
         statusObservation?.invalidate()
+        if let itemEndObserver {
+            NotificationCenter.default.removeObserver(itemEndObserver)
+            self.itemEndObserver = nil
+        }
+        didReachEnd = false
         let item = AVPlayerItem(url: url)
         item.preferredForwardBufferDuration = 30
         statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
@@ -776,6 +842,21 @@ private final class IOSPlaybackController: ObservableObject {
                     self.stateLabel = "Unable to Play Stream"
                     self.errorMessage = item.error?.localizedDescription ?? "The HLS stream could not be opened."
                 }
+            }
+        }
+        itemEndObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, !self.stopped else { return }
+                self.positionSeconds = max(self.positionSeconds, self.durationSeconds)
+                self.wantsToPlay = false
+                self.isPlaying = false
+                self.isWaiting = false
+                self.didReachEnd = true
+                self.stateLabel = "Episode Finished"
             }
         }
         player.replaceCurrentItem(with: item)

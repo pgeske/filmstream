@@ -105,8 +105,37 @@ final class MacAppModel {
         )
     }
 
-    func presentPlayback(movie: Movie, prepared: PreparedPlayback) {
-        activePlayback = MacPlaybackSession(movie: movie, prepared: prepared)
+    func presentPlayback(
+        movie: Movie,
+        prepared: PreparedPlayback,
+        details: SeriesDetails? = nil,
+        nextEpisode: Episode? = nil
+    ) {
+        activePlayback = MacPlaybackSession(
+            movie: movie,
+            prepared: prepared,
+            details: details,
+            nextEpisode: nextEpisode
+        )
+    }
+
+    func advancePlayback(to episode: Episode) async throws {
+        guard let details = activePlayback?.details else { return }
+        let movie = episode.playbackMovie(in: details.show)
+        let nextEpisodeTask = Task {
+            try? await api.nextEpisode(after: episode, in: details)
+        }
+        let prepared = try await preparePlayback(
+            for: movie,
+            startSeconds: 0,
+            onStage: { _ in }
+        )
+        presentPlayback(
+            movie: movie,
+            prepared: prepared,
+            details: details,
+            nextEpisode: await nextEpisodeTask.value
+        )
     }
 
     func dismissPlayback() {
@@ -152,6 +181,8 @@ final class MacAppModel {
 struct MacPlaybackSession: Identifiable {
     let movie: Movie
     let prepared: PreparedPlayback
+    let details: SeriesDetails?
+    let nextEpisode: Episode?
 
     var id: String { prepared.playback.id }
 }

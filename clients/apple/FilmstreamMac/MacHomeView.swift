@@ -59,6 +59,10 @@ struct MacHomeView: View {
                     movie: session.movie,
                     prepared: session.prepared,
                     api: model.api,
+                    nextEpisode: session.nextEpisode,
+                    onPlayNext: { episode in
+                        try await model.advancePlayback(to: episode)
+                    },
                     onClose: model.dismissPlayback
                 )
                 .id(session.id)

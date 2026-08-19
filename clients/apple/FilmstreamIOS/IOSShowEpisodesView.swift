@@ -61,7 +61,16 @@ struct IOSShowEpisodesView: View {
                 Task { await model.loadContinueWatching() }
             }
         ) { session in
-            IOSPlayerView(movie: session.movie, prepared: session.prepared, api: model.api)
+            IOSPlayerView(
+                movie: session.movie,
+                prepared: session.prepared,
+                api: model.api,
+                nextEpisode: session.nextEpisode,
+                onPlayNext: { episode in
+                    try await advancePlayback(to: episode)
+                }
+            )
+            .id(session.id)
         }
     }
 
@@ -179,16 +188,42 @@ struct IOSShowEpisodesView: View {
             !$0.completed && $0.positionSeconds >= 30 ? $0.positionSeconds : nil
         } ?? 0
         do {
+            let nextEpisodeTask = Task {
+                try? await model.api.nextEpisode(after: episode, in: details)
+            }
             let prepared = try await model.preparePlayback(
                 for: movie,
                 startSeconds: startSeconds,
                 onStage: { _ in }
             )
-            activePlayback = IOSEpisodeBrowserPlaybackSession(movie: movie, prepared: prepared)
+            let nextEpisode = await nextEpisodeTask.value
+            activePlayback = IOSEpisodeBrowserPlaybackSession(
+                movie: movie,
+                prepared: prepared,
+                nextEpisode: nextEpisode
+            )
             errorMessage = nil
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    private func advancePlayback(to episode: Episode) async throws {
+        let movie = episode.playbackMovie(in: details.show)
+        let nextEpisodeTask = Task {
+            try? await model.api.nextEpisode(after: episode, in: details)
+        }
+        let prepared = try await model.preparePlayback(
+            for: movie,
+            startSeconds: 0,
+            onStage: { _ in }
+        )
+        let nextEpisode = await nextEpisodeTask.value
+        activePlayback = IOSEpisodeBrowserPlaybackSession(
+            movie: movie,
+            prepared: prepared,
+            nextEpisode: nextEpisode
+        )
     }
 }
 
@@ -221,6 +256,7 @@ private struct MobileEpisodeStillImage: View {
 private struct IOSEpisodeBrowserPlaybackSession: Identifiable {
     let movie: Movie
     let prepared: PreparedPlayback
+    let nextEpisode: Episode?
 
     var id: String { prepared.id }
 }
