@@ -101,6 +101,41 @@ func TestRankStreamingOptimizedPrefersNativeFriendlyEncode(t *testing.T) {
 	}
 }
 
+func TestRankStreamingOptimizedRejectsUpscalesAnd2160pRemuxes(t *testing.T) {
+	seeders := 500
+	ranked := Rank(SearchRequest{
+		Query: "Classic Show", MediaType: "show", SeasonNumber: 1, EpisodeNumber: 1,
+		PreferSeasonPack: true,
+		Preferences: Preferences{
+			Resolution: "1080p", Codecs: []string{"h264", "h265"}, StreamingOptimized: true,
+		},
+	}, []Candidate{
+		{Name: "Classic.Show.S01.2160p.UHD.REMUX.HEVC", Seeders: &seeders},
+		{Name: "Classic.Show.S01.1080p.AI.Upscaled.x265", Seeders: &seeders},
+		{Name: "Classic.Show.S01.1080p.WEB-DL.x265", Seeders: &seeders},
+	})
+	if len(ranked) != 1 || ranked[0].Candidate.Name != "Classic.Show.S01.1080p.WEB-DL.x265" {
+		t.Fatalf("ranked = %+v", ranked)
+	}
+}
+
+func TestRankStreamingOptimizedPrioritizesPreferredQualityBeforeSeeders(t *testing.T) {
+	manySeeders, enoughSeeders := 5000, 20
+	ranked := Rank(SearchRequest{
+		Query: "The Show", MediaType: "show", SeasonNumber: 1, EpisodeNumber: 1,
+		PreferSeasonPack: true,
+		Preferences: Preferences{
+			Resolution: "1080p", Codecs: []string{"h264", "h265"}, StreamingOptimized: true,
+		},
+	}, []Candidate{
+		{Name: "The.Show.S01.720p.WEB-DL.x264", Seeders: &manySeeders},
+		{Name: "The.Show.S01.1080p.WEB-DL.x265", Seeders: &enoughSeeders},
+	})
+	if len(ranked) != 2 || ranked[0].Candidate.Name != "The.Show.S01.1080p.WEB-DL.x265" {
+		t.Fatalf("ranked = %+v", ranked)
+	}
+}
+
 func TestRankStreamingOptimizedPrioritizesPopularityOverSize(t *testing.T) {
 	popularSeeders, smallerSeeders := 140, 40
 	ranked := Rank(SearchRequest{

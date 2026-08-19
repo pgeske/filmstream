@@ -118,6 +118,12 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 			if hasWord(words, "dv") || hasWord(words, "dovi") || strings.Contains(name, "dolby vision") {
 				continue
 			}
+			if isUpscaledRelease(name) {
+				continue
+			}
+			if strings.EqualFold(candidate.Resolution, "2160p") && hasWord(words, "remux") {
+				continue
+			}
 			if len(request.Preferences.Codecs) > 0 {
 				unknownUntrustedCodec := candidate.Codec == "" && !candidate.Trusted
 				knownUnsupportedCodec := candidate.Codec != "" && !containsFold(request.Preferences.Codecs, candidate.Codec)
@@ -169,12 +175,16 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 		if preferred := strings.ToLower(request.Preferences.Resolution); preferred != "" {
 			switch strings.ToLower(candidate.Resolution) {
 			case preferred:
-				score += 50
+				score += 300
 				reasons = append(reasons, "preferred resolution")
 			case "2160p":
-				score += 15
+				score += 160
+				reasons = append(reasons, "alternate 2160p quality")
 			case "720p":
-				score += 5
+				score += 100
+				reasons = append(reasons, "alternate 720p quality")
+			case "480p":
+				score += 40
 			}
 		}
 
@@ -208,12 +218,6 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 				}
 			}
 			words := wordSet(normalize(candidate.Name))
-			if candidate.SizeBytes > 0 {
-				sizeGiB := float64(candidate.SizeBytes) / float64(int64(1)<<30)
-				penalty := math.Min(sizeGiB*0.5, 25)
-				score -= penalty
-				reasons = append(reasons, formatReason("streaming size tie-breaker", penalty))
-			}
 			if hasWord(words, "remux") {
 				score -= 100
 				reasons = append(reasons, "remux penalty")
@@ -264,7 +268,7 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 	if request.PreferSeasonPack && request.SeasonNumber > 0 {
 		seasonPacks := make([]RankedCandidate, 0, len(ranked))
 		for _, candidate := range ranked {
-			if isSeasonPack(candidate.Candidate.Name, request.SeasonNumber) {
+			if IsSeasonPack(candidate.Candidate.Name, request.SeasonNumber) {
 				seasonPacks = append(seasonPacks, candidate)
 			}
 		}
@@ -279,12 +283,21 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 	return ranked
 }
 
-func isSeasonPack(name string, seasonNumber int) bool {
+func IsSeasonPack(name string, seasonNumber int) bool {
 	if _, _, hasEpisode := releaseEpisode(name); hasEpisode {
 		return false
 	}
 	season, hasSeason := releaseSeason(name)
 	return hasSeason && season == seasonNumber
+}
+
+func isUpscaledRelease(normalizedName string) bool {
+	words := wordSet(normalizedName)
+	if hasWord(words, "upscale") || hasWord(words, "upscaled") || hasWord(words, "upscaling") {
+		return true
+	}
+	compact := strings.ReplaceAll(normalizedName, " ", "")
+	return strings.Contains(compact, "aiupscal")
 }
 
 func titleSimilarity(query, candidate string) float64 {

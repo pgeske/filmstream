@@ -51,9 +51,12 @@ const (
 	maxLiveSwarmCandidates = 3
 	minimumLivePeers       = 3
 	strongLiveSwarmPeers   = 20
-	progressiveSwarmWait   = time.Second
-	cachedSwarmWait        = 5 * time.Second
-	liveSwarmWait          = 16 * time.Second
+	progressiveSwarmWait   = 750 * time.Millisecond
+	cachedSwarmWait        = 3 * time.Second
+	liveSwarmWait          = 8 * time.Second
+
+	textSubtitlesVerifiedReason = "text subtitles verified"
+	subtitleFallbackReason      = "subtitle fallback verified"
 )
 
 type CreatePlaybackResponse struct {
@@ -141,6 +144,9 @@ type Server struct {
 	prewarmBaseURL string
 	prewarmClient  *http.Client
 	prewarmContext context.Context
+
+	releaseSearchMu sync.Mutex
+	releaseSearches map[string]*releaseSearchState
 }
 
 func New(indexers *indexer.Registry, engine *torrentstream.Engine, defaults catalog.Preferences, logger *slog.Logger) *Server {
@@ -158,6 +164,7 @@ func New(indexers *indexer.Registry, engine *torrentstream.Engine, defaults cata
 		usenetFailures:     make(map[string]time.Time),
 		prewarmStates:      make(map[string]*playbackPrewarmState),
 		prewarmSlots:       make(chan struct{}, 2),
+		releaseSearches:    make(map[string]*releaseSearchState),
 	}
 	engine.SetCleanupHandler(func(id, _ string) {
 		server.cleanupPlayback(id)
@@ -882,10 +889,11 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 	var selected *catalog.RankedCandidate
 	if request.Query != "" {
 		isShow := request.MediaType == "show"
+		preferSeasonPack := isShow && s.shouldPreferSeasonPack(r.Context(), request)
 		search := catalog.SearchRequest{
 			Query: request.Query, Year: request.Year, MediaType: request.MediaType,
 			SeasonNumber: request.SeasonNumber, EpisodeNumber: request.EpisodeNumber,
-			PreferSeasonPack: isShow,
+			PreferSeasonPack: preferSeasonPack,
 			Preferences:      preferences,
 		}
 		allowUsenet := !isShow && s.playbackSourceMode != config.PlaybackSourceTorrentOnly
@@ -946,11 +954,20 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 		}
 		if session == nil {
 			if ranked == nil && searchErr == nil {
-				protocol := ""
 				if isShow {
-					protocol = catalog.ProtocolTorrent
+					if cachedRanked, found := s.cachedShowReleases(r.Context(), request); found {
+						ranked = cachedRanked
+						s.logger.Info("reused prefetched TV release search", "media_id", request.MediaID,
+							"candidates", len(ranked))
+					}
 				}
-				ranked, searchErr = s.searchAndRank(r.Context(), search, request.OriginalTitle, protocol)
+				if ranked == nil {
+					protocol := ""
+					if isShow {
+						protocol = catalog.ProtocolTorrent
+					}
+					ranked, searchErr = s.searchAndRank(r.Context(), search, request.OriginalTitle, protocol)
+				}
 			}
 			if searchErr != nil {
 				writeError(w, http.StatusBadGateway, searchErr.Error())
@@ -1198,6 +1215,30 @@ func (s *Server) createCachedPlayback(
 		}
 	}
 	if cacheMediaID == "" {
+		return nil, nil, nil
+	}
+	if request.Preferences.PreferTextSubtitles &&
+		!hasRankingReason(cached.Selected, textSubtitlesVerifiedReason) &&
+		!hasRankingReason(cached.Selected, subtitleFallbackReason) {
+		if removeErr := s.playbackCache.Remove(cacheMediaID, request.Query, request.Year); removeErr != nil {
+			s.logger.Warn("remove cached playback without subtitle validation", "title", request.Query, "error", removeErr)
+		}
+		s.logger.Info("cached playback predates subtitle validation", "title", request.Query,
+			"name", cached.Selected.Candidate.Name)
+		return nil, nil, nil
+	}
+	cachedSearch := catalog.SearchRequest{
+		Query: request.Query, Year: request.Year, MediaType: request.MediaType,
+		SeasonNumber: request.SeasonNumber, EpisodeNumber: request.EpisodeNumber,
+		PreferSeasonPack: request.MediaType == string(metadata.MediaTypeShow) && s.shouldPreferSeasonPack(ctx, request),
+		Preferences:      request.Preferences,
+	}
+	if len(catalog.Rank(cachedSearch, []catalog.Candidate{cached.Selected.Candidate})) == 0 {
+		if removeErr := s.playbackCache.Remove(cacheMediaID, request.Query, request.Year); removeErr != nil {
+			s.logger.Warn("remove cached playback rejected by current policy", "title", request.Query, "error", removeErr)
+		}
+		s.logger.Info("cached playback no longer matches release policy", "title", request.Query,
+			"name", cached.Selected.Candidate.Name)
 		return nil, nil, nil
 	}
 	session, err := s.engine.Create(ctx, torrentstream.Source{
@@ -1541,6 +1582,10 @@ func (s *Server) createRankedPlayback(
 	}
 	if preferences.PreferTextSubtitles {
 		if subtitleOption := s.firstTextSubtitleOption(ctx, options); subtitleOption >= 0 {
+			options[subtitleOption].candidate.Reasons = append(
+				options[subtitleOption].candidate.Reasons,
+				textSubtitlesVerifiedReason,
+			)
 			return s.choosePlaybackOption(
 				options,
 				subtitleOption,
@@ -1548,6 +1593,9 @@ func (s *Server) createRankedPlayback(
 			)
 		}
 		s.logger.Warn("no live ranked playback option exposed text subtitles; using best available release")
+		if strong >= 0 {
+			options[strong].candidate.Reasons = append(options[strong].candidate.Reasons, subtitleFallbackReason)
+		}
 	}
 	if strong >= 0 {
 		return s.choosePlaybackOption(options, strong, true)
@@ -1558,7 +1606,19 @@ func (s *Server) createRankedPlayback(
 			best = i
 		}
 	}
+	if preferences.PreferTextSubtitles {
+		options[best].candidate.Reasons = append(options[best].candidate.Reasons, subtitleFallbackReason)
+	}
 	return s.choosePlaybackOption(options, best, false)
+}
+
+func hasRankingReason(candidate catalog.RankedCandidate, reason string) bool {
+	for _, candidateReason := range candidate.Reasons {
+		if candidateReason == reason {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) playbackHasTextSubtitles(ctx context.Context, playbackID string) (bool, error) {

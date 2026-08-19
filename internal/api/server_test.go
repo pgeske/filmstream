@@ -36,6 +36,8 @@ type fakeResolver struct{}
 
 type fakeMetadata struct{}
 
+type airingMetadata struct{}
+
 type fakeRatings struct{}
 
 type partialRatings struct{}
@@ -222,6 +224,27 @@ func (fakeMetadata) Season(_ context.Context, id string, number int) (metadata.S
 				ID: "tmdb-tv:3:s1:e2", SeriesID: id, SeriesTitle: "Top Rated Show",
 				SeasonNumber: 1, EpisodeNumber: 2, Title: "Second",
 			},
+		},
+	}, nil
+}
+
+func (airingMetadata) Search(_ context.Context, _ string) ([]metadata.Movie, error) {
+	return nil, nil
+}
+
+func (airingMetadata) Show(_ context.Context, id string) (metadata.Show, error) {
+	return metadata.Show{
+		Movie:   metadata.Movie{ID: id, MediaType: metadata.MediaTypeShow, Title: "Current Show", NumberOfSeasons: 1},
+		Seasons: []metadata.SeasonSummary{{Number: 1, Name: "Season 1", EpisodeCount: 10}},
+	}, nil
+}
+
+func (airingMetadata) Season(_ context.Context, id string, number int) (metadata.Season, error) {
+	return metadata.Season{
+		SeriesID: id, SeriesTitle: "Current Show", Number: number,
+		Episodes: []metadata.Episode{
+			{ID: id + ":s1:e1", SeriesID: id, SeasonNumber: 1, EpisodeNumber: 1},
+			{ID: id + ":s1:e2", SeriesID: id, SeasonNumber: 1, EpisodeNumber: 2},
 		},
 	}, nil
 }
@@ -566,64 +589,76 @@ func TestCreatePlaybackJoinsInProgressPrewarm(t *testing.T) {
 	}
 }
 
-func TestShowPrewarmResolvesReleaseWithoutBufferingVideo(t *testing.T) {
-	var createRequests atomic.Int32
-	var hlsRequests atomic.Int32
+func TestShowPrewarmCachesReleaseSearchWithoutCreatingPlayback(t *testing.T) {
+	var searchRequests atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/v1/playbacks":
-			createRequests.Add(1)
-			var request CreatePlaybackRequest
-			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-				t.Error(err)
-			}
-			if request.Preferences.PreferTextSubtitles {
-				t.Error("show release prewarm unexpectedly requested a subtitle media probe")
-			}
-			w.WriteHeader(http.StatusCreated)
-			fmt.Fprint(w, `{"id":"show-release","name":"The Show S01","file_name":"episode.mkv","file_size":1000,"source":"torrent","stream_url":"http://127.0.0.1/stream"}`)
-		case "/v1/playbacks/show-release/hls":
-			hlsRequests.Add(1)
-			w.WriteHeader(http.StatusCreated)
-			fmt.Fprint(w, `{}`)
+		switch r.URL.Query().Get("t") {
+		case "caps":
+			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><tv-search available="yes" supportedParams="q,season,ep"/></searching></caps>`)
+		case "tvsearch", "search":
+			searchRequests.Add(1)
+			fmt.Fprint(w, `<?xml version="1.0"?><rss><channel><item><title>The.Show.S01.Complete.1080p.WEB.H264</title><guid>pack</guid><enclosure url="/pack" length="1000" type="application/x-bittorrent"/><attr name="seeders" value="50"/></item></channel></rss>`)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer upstream.Close()
-
+	registry, err := indexer.NewRegistry([]config.Indexer{{
+		Name: "torrent", Type: "torznab", Endpoint: upstream.URL,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	server := &Server{
-		defaults:      catalog.Preferences{},
-		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
-		prewarmStates: make(map[string]*playbackPrewarmState),
-		prewarmSlots:  make(chan struct{}, 1),
+		indexers: registry,
+		defaults: catalog.Preferences{
+			Resolution: "1080p", Codecs: []string{"h264", "h265"}, StreamingOptimized: true,
+		},
+		logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		prewarmStates:   make(map[string]*playbackPrewarmState),
+		prewarmSlots:    make(chan struct{}, 1),
+		releaseSearches: make(map[string]*releaseSearchState),
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	server.prewarmContext = ctx
-	server.prewarmBaseURL = upstream.URL
-	server.prewarmClient = upstream.Client()
 
-	request := httptest.NewRequest(http.MethodPost, "/v1/playbacks/prewarm", strings.NewReader(
+	httpRequest := httptest.NewRequest(http.MethodPost, "/v1/playbacks/prewarm", strings.NewReader(
 		`{"media_id":"tmdb-tv:3:s1:e1","media_type":"show","query":"The Show","series_id":"tmdb-tv:3","season_number":1,"episode_number":1,"preferences":{"prefer_text_subtitles":true}}`,
 	))
 	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
+	server.Handler().ServeHTTP(response, httpRequest)
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
 
-	deadline := time.Now().Add(time.Second)
-	for createRequests.Load() == 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
+	request := CreatePlaybackRequest{
+		MediaID: "tmdb-tv:3:s1:e1", MediaType: "show", Query: "The Show",
+		SeriesID: "tmdb-tv:3", SeasonNumber: 1, EpisodeNumber: 1,
+		Preferences: mergePreferences(server.defaults, catalog.Preferences{PreferTextSubtitles: true}),
 	}
-	if createRequests.Load() != 1 {
-		t.Fatalf("create requests = %d, want 1", createRequests.Load())
+	lookupContext, lookupCancel := context.WithTimeout(t.Context(), time.Second)
+	defer lookupCancel()
+	ranked, found := server.cachedShowReleases(lookupContext, request)
+	if !found || len(ranked) != 1 || !catalog.IsSeasonPack(ranked[0].Candidate.Name, 1) {
+		t.Fatalf("ranked = %+v, found = %v", ranked, found)
 	}
-	time.Sleep(25 * time.Millisecond)
-	if hlsRequests.Load() != 0 {
-		t.Fatalf("HLS requests = %d, want 0", hlsRequests.Load())
+	if searchRequests.Load() == 0 || len(server.prewarmStates) != 0 {
+		t.Fatalf("search requests = %d, playback prewarms = %d", searchRequests.Load(), len(server.prewarmStates))
+	}
+}
+
+func TestSeasonPackPreferenceAllowsCurrentIncompleteSeasonFallback(t *testing.T) {
+	current := &Server{metadataProvider: airingMetadata{}}
+	request := CreatePlaybackRequest{SeriesID: "tmdb-tv:9", SeasonNumber: 1}
+	if current.shouldPreferSeasonPack(t.Context(), request) {
+		t.Fatal("incomplete current season unexpectedly required a season pack")
+	}
+
+	older := &Server{metadataProvider: fakeMetadata{}}
+	request = CreatePlaybackRequest{SeriesID: "tmdb-tv:3", SeasonNumber: 1}
+	if !older.shouldPreferSeasonPack(t.Context(), request) {
+		t.Fatal("completed older season did not prefer a season pack")
 	}
 }
 

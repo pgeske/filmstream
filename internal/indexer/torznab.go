@@ -134,8 +134,7 @@ func (t *Torznab) Search(ctx context.Context, request catalog.SearchRequest) ([]
 		seasonParameters := map[string]string{"t": "search", "q": seasonQuery, "limit": "100"}
 		episodeParameters := map[string]string{"t": "search", "q": episodeQuery, "limit": "100"}
 
-		var candidates []catalog.Candidate
-		var failures []error
+		searches := []map[string]string{seasonParameters}
 		if capabilities.TVSearchAvailable {
 			tvParameters := map[string]string{"t": "tvsearch", "q": torznabQuery(request.Query), "limit": "100"}
 			if capabilities.TVSearchParams["season"] {
@@ -143,26 +142,44 @@ func (t *Torznab) Search(ctx context.Context, request catalog.SearchRequest) ([]
 			} else {
 				tvParameters["q"] = seasonQuery
 			}
-			tvCandidates, tvErr := t.search(ctx, tvParameters)
-			if tvErr != nil {
-				failures = append(failures, tvErr)
+			searches = append(searches, tvParameters)
+		}
+
+		type searchResult struct {
+			candidates []catalog.Candidate
+			err        error
+		}
+		results := make(chan searchResult, len(searches))
+		for _, parameters := range searches {
+			go func(parameters map[string]string) {
+				candidates, err := t.search(ctx, parameters)
+				results <- searchResult{candidates: candidates, err: err}
+			}(parameters)
+		}
+		var candidates []catalog.Candidate
+		var failures []error
+		for range searches {
+			result := <-results
+			if result.err != nil {
+				failures = append(failures, result.err)
 			} else {
-				candidates = append(candidates, tvCandidates...)
+				candidates = append(candidates, result.candidates...)
 			}
 		}
-		seasonCandidates, seasonErr := t.search(ctx, seasonParameters)
-		if seasonErr != nil {
-			failures = append(failures, seasonErr)
-		} else {
-			candidates = append(candidates, seasonCandidates...)
+		candidates = mergeCandidates(candidates)
+		if request.PreferSeasonPack {
+			for _, candidate := range candidates {
+				if catalog.IsSeasonPack(candidate.Name, request.SeasonNumber) {
+					return candidates, nil
+				}
+			}
 		}
 		episodeCandidates, episodeErr := t.search(ctx, episodeParameters)
 		if episodeErr != nil {
 			failures = append(failures, episodeErr)
 		} else {
-			candidates = append(candidates, episodeCandidates...)
+			candidates = mergeCandidates(candidates, episodeCandidates)
 		}
-		candidates = mergeCandidates(candidates)
 		if len(candidates) == 0 && len(failures) > 0 {
 			return nil, errors.Join(failures...)
 		}

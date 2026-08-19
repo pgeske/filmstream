@@ -424,7 +424,7 @@ private struct PlaybackPreferences: Encodable {
             resolution: "1080p",
             codecs: ["h264", "h265"],
             languages: languages,
-            maxSizeBytes: 50 * 1_073_741_824,
+            maxSizeBytes: 60 * 1_073_741_824,
             streamingOptimized: true,
             preferTextSubtitles: true
         )

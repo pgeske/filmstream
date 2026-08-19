@@ -145,6 +145,41 @@ func TestTorznabTVSearchIncludesSeasonPacksAndEpisodeFallback(t *testing.T) {
 	}
 }
 
+func TestTorznabSkipsEpisodeSearchWhenSeasonPackIsAvailable(t *testing.T) {
+	episodeSearches := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("t") {
+		case "caps":
+			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><tv-search available="yes" supportedParams="q,season,ep"/></searching></caps>`)
+		case "tvsearch":
+			fmt.Fprint(w, `<?xml version="1.0"?><rss><channel><item><title>Example.Show.S01.Complete.1080p</title><guid>pack</guid><enclosure url="/pack" length="1000" type="application/x-bittorrent"/></item></channel></rss>`)
+		case "search":
+			if r.URL.Query().Get("q") == "Example Show S01E02" {
+				episodeSearches++
+			}
+			fmt.Fprint(w, `<?xml version="1.0"?><rss><channel></channel></rss>`)
+		default:
+			http.Error(w, "unsupported", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	configured, err := NewTorznab("test", server.URL+"/api", "", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := configured.Search(t.Context(), catalog.SearchRequest{
+		Query: "Example Show", MediaType: "show", SeasonNumber: 1, EpisodeNumber: 2,
+		PreferSeasonPack: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || candidates[0].ID != "pack" || episodeSearches != 0 {
+		t.Fatalf("candidates = %+v, episode searches = %d", candidates, episodeSearches)
+	}
+}
+
 func TestTorznabRecognizesUsenetEnclosure(t *testing.T) {
 	configured, err := NewTorznab("test", "https://indexer.example/6/api", "secret", http.DefaultClient)
 	if err != nil {

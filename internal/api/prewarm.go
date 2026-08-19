@@ -24,11 +24,10 @@ const (
 )
 
 type playbackPrewarmTarget struct {
-	request     CreatePlaybackRequest
-	source      string
-	priority    bool
-	bufferVideo bool
-	seed        *CreatePlaybackResponse
+	request  CreatePlaybackRequest
+	source   string
+	priority bool
+	seed     *CreatePlaybackResponse
 }
 
 type playbackPrewarmState struct {
@@ -80,14 +79,16 @@ func (s *Server) prewarmPlayback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	request.Preferences = mergePreferences(s.defaults, request.Preferences)
-	bufferVideo := request.MediaType != string(metadata.MediaTypeShow)
-	if !bufferVideo {
-		// A show detail hint resolves and mounts the season release without downloading
-		// episode payload. Active playback separately warms only the next episode.
-		request.Preferences.PreferTextSubtitles = false
+	if request.MediaType == string(metadata.MediaTypeShow) {
+		// Browsing a show warms only the indexer search. Torrent media is mounted and
+		// subtitle-probed after an explicit play request; active playback separately
+		// buffers only its next episode.
+		s.queueShowReleaseSearch(request)
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "finding_releases"})
+		return
 	}
 	s.queuePlaybackPrewarm(playbackPrewarmTarget{
-		request: request, source: "hint", priority: true, bufferVideo: bufferVideo,
+		request: request, source: "hint", priority: true,
 	})
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "prewarming"})
 }
@@ -207,11 +208,6 @@ func (s *Server) runPlaybackPrewarm(ctx context.Context, key string, state *play
 		}
 		return
 	}
-	if !state.target.bufferVideo {
-		time.AfterFunc(prewarmHintTTL, func() { s.expireUnusedPrewarm(key, state) })
-		return
-	}
-
 	s.prewarmMu.Lock()
 	claimed := state.claimed
 	s.prewarmMu.Unlock()
@@ -466,7 +462,6 @@ func (s *Server) queueNextEpisodePrewarm(current history.Entry) {
 	if next, ok := s.nextEpisodeForPrewarming(lookupContext, current); ok {
 		target := s.prewarmTargetForHistory(lookupContext, next)
 		target.priority = true
-		target.bufferVideo = true
 		s.queuePlaybackPrewarm(target)
 	}
 }
@@ -526,7 +521,7 @@ func (s *Server) queuePlaybackHandoff(playbackID string) bool {
 		}
 		request.StartSeconds = entry.ResumePosition()
 		target := playbackPrewarmTarget{
-			request: request, source: "history", priority: true, bufferVideo: true, seed: &response,
+			request: request, source: "history", priority: true, seed: &response,
 		}
 		s.queuePlaybackPrewarm(target)
 		return true
