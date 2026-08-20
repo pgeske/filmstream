@@ -19,7 +19,7 @@ import (
 
 const (
 	defaultStartupTimeout       = 90 * time.Second
-	defaultStartupBufferSeconds = 24
+	defaultStartupBufferSeconds = 12
 	defaultReadRate             = 1.25
 	defaultSegmentSeconds       = 4
 	defaultParkedTTL            = 2 * time.Hour

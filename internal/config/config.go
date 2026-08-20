@@ -21,7 +21,7 @@ const (
 	defaultSeedMaxHours      = 168
 	defaultIdleGraceSeconds  = 120
 	defaultHLSStartupSeconds = 90
-	defaultHLSBufferSeconds  = 24
+	defaultHLSBufferSeconds  = 12
 	defaultHLSReadRate       = 1.25
 	defaultHLSSegmentSeconds = 4
 )

@@ -28,7 +28,7 @@ func TestDefaultsMatchLocalMVP(t *testing.T) {
 		t.Fatalf("playback source mode = %q", cfg.PlaybackSourceMode)
 	}
 	if cfg.HLSDir == "" || cfg.FFmpegPath != "ffmpeg" || cfg.FFprobePath != "ffprobe" ||
-		cfg.HLSBufferSeconds != 24 || cfg.HLSReadRate != 1.25 || cfg.HLSSegmentSeconds != 4 {
+		cfg.HLSBufferSeconds != 12 || cfg.HLSReadRate != 1.25 || cfg.HLSSegmentSeconds != 4 {
 		t.Fatalf("HLS defaults = dir %q, ffmpeg %q, ffprobe %q, startup buffer %d, read rate %.2f, segment %d",
 			cfg.HLSDir, cfg.FFmpegPath, cfg.FFprobePath, cfg.HLSBufferSeconds, cfg.HLSReadRate, cfg.HLSSegmentSeconds)
 	}

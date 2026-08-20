@@ -530,6 +530,22 @@ func TestCanceledParkCannotStopPlaybackAfterAutoplayStarts(t *testing.T) {
 	}
 }
 
+func TestManagerDefaultsToTwelveSecondStartupBuffer(t *testing.T) {
+	ffprobe := writeExecutable(t, "ffprobe", "#!/bin/sh\nexit 1\n")
+	ffmpeg := writeExecutable(t, "ffmpeg", "#!/bin/sh\nexit 1\n")
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	if manager.bufferSeconds != 12 {
+		t.Fatalf("startup buffer = %d", manager.bufferSeconds)
+	}
+}
+
 func TestManagerRejectsDolbyVision(t *testing.T) {
 	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
 cat <<'JSON'
