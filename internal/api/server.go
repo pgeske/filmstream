@@ -45,15 +45,16 @@ type CreatePlaybackRequest struct {
 }
 
 const (
-	maxUsenetCandidates    = 30
-	maxUsenetPreparation   = 90 * time.Second
-	usenetFailureTTL       = 30 * time.Minute
-	maxLiveSwarmCandidates = 3
-	minimumLivePeers       = 3
-	strongLiveSwarmPeers   = 20
-	progressiveSwarmWait   = 750 * time.Millisecond
-	cachedSwarmWait        = 3 * time.Second
-	liveSwarmWait          = 8 * time.Second
+	maxUsenetCandidates     = 30
+	maxUsenetPreparation    = 90 * time.Second
+	usenetFailureTTL        = 30 * time.Minute
+	maxLiveSwarmCandidates  = 3
+	minimumLivePeers        = 3
+	strongLiveSwarmPeers    = 20
+	progressiveSwarmWait    = 750 * time.Millisecond
+	cachedSwarmWait         = 3 * time.Second
+	liveSwarmWait           = 8 * time.Second
+	swarmStatusPollInterval = 250 * time.Millisecond
 
 	subtitlesVerifiedReason = "subtitles verified"
 	subtitleFallbackReason  = "subtitle fallback verified"
@@ -104,6 +105,15 @@ type HLSStreamManager interface {
 	Stop(string)
 }
 
+type torrentPlaybackEngine interface {
+	Create(context.Context, torrentstream.Source) (*torrentstream.Session, error)
+	Get(string) (*torrentstream.Session, bool)
+	TorrentMetainfo(string) ([]byte, error)
+	Drop(string) error
+	Status(string) (torrentstream.Status, bool)
+	ServeHTTP(http.ResponseWriter, *http.Request, string) error
+}
+
 type usenetPlaybackEngine interface {
 	SetCleanupHandler(func(string, string))
 	Create(context.Context, usenetstream.Source) (*usenetstream.Session, error)
@@ -121,9 +131,15 @@ type playbackCacheKey struct {
 	source  string
 }
 
+type playbackSelectionTiming struct {
+	progressiveWait time.Duration
+	liveSwarmWait   time.Duration
+	statusPoll      time.Duration
+}
+
 type Server struct {
 	indexers           *indexer.Registry
-	engine             *torrentstream.Engine
+	engine             torrentPlaybackEngine
 	usenetEngine       usenetPlaybackEngine
 	playbackSourceMode string
 	defaults           catalog.Preferences
@@ -157,6 +173,8 @@ type Server struct {
 
 	releaseSearchMu sync.Mutex
 	releaseSearches map[string]*releaseSearchState
+
+	selectionTiming playbackSelectionTiming
 }
 
 func New(indexers *indexer.Registry, engine *torrentstream.Engine, defaults catalog.Preferences, logger *slog.Logger) *Server {
@@ -1205,9 +1223,10 @@ func wrapUsenetSession(session *usenetstream.Session) *playbackSession {
 }
 
 type playbackOption struct {
-	session   *torrentstream.Session
-	candidate catalog.RankedCandidate
-	peers     int
+	session          *torrentstream.Session
+	candidate        catalog.RankedCandidate
+	peers            int
+	subtitlesChecked bool
 }
 
 func (s *Server) createCachedUsenetPlayback(
@@ -1620,9 +1639,15 @@ func (s *Server) createRankedPlayback(
 	if preferences.StreamingOptimized {
 		attempts = min(maxLiveSwarmCandidates, len(ranked))
 	}
+	timing := s.rankedPlaybackTiming()
 	options := make([]playbackOption, 0, attempts)
-	observationRemaining := liveSwarmWait
+	observationRemaining := timing.liveSwarmWait
 	var failures []string
+
+	// Peer discovery continues only while a torrent is mounted. Keep an unsuccessful
+	// option alive as a possible late fallback, but mount the next release only after
+	// the current one lacks subtitles or misses its short health window.
+	// choosePlaybackOption drops every unselected mount as soon as one release works.
 	for i := 0; i < attempts; i++ {
 		candidate := ranked[i]
 		resolved, err := s.indexers.Resolve(ctx, candidate.Candidate)
@@ -1648,20 +1673,43 @@ func (s *Server) createRankedPlayback(
 		if !preferences.StreamingOptimized {
 			return session, &candidate, nil
 		}
-		options = append(options, playbackOption{session: session, candidate: candidate})
 
-		if i+1 < attempts && observationRemaining > 0 {
-			wait := min(progressiveSwarmWait, observationRemaining)
-			started := time.Now()
-			strong, err := s.observePlaybackOptions(ctx, options, strongLiveSwarmPeers, wait)
+		current := len(options)
+		options = append(options, playbackOption{session: session, candidate: candidate})
+		wait := time.Duration(0)
+		if i+1 < attempts {
+			wait = min(timing.progressiveWait, observationRemaining)
+		}
+		started := time.Now()
+		if preferences.PreferTextSubtitles {
+			subtitleOption, err := s.observeSubtitlePlaybackOptions(ctx, options, current, wait)
 			observationRemaining -= min(time.Since(started), observationRemaining)
 			if err != nil {
 				s.dropPlaybackOptions(options)
 				return nil, nil, err
 			}
-			if strong >= 0 && !preferences.PreferTextSubtitles {
-				return s.choosePlaybackOption(options, strong, true)
+			if subtitleOption >= 0 {
+				options[subtitleOption].candidate.Reasons = append(
+					options[subtitleOption].candidate.Reasons,
+					subtitlesVerifiedReason,
+				)
+				return s.choosePlaybackOption(
+					options,
+					subtitleOption,
+					options[subtitleOption].peers >= strongLiveSwarmPeers,
+				)
 			}
+			continue
+		}
+
+		strong, err := s.observePlaybackOptions(ctx, options, strongLiveSwarmPeers, wait)
+		observationRemaining -= min(time.Since(started), observationRemaining)
+		if err != nil {
+			s.dropPlaybackOptions(options)
+			return nil, nil, err
+		}
+		if strong >= 0 {
+			return s.choosePlaybackOption(options, strong, true)
 		}
 	}
 	if len(options) == 0 {
@@ -1671,13 +1719,15 @@ func (s *Server) createRankedPlayback(
 		return nil, nil, errors.New("no usable torrent candidates found")
 	}
 
-	strong, err := s.observePlaybackOptions(ctx, options, strongLiveSwarmPeers, observationRemaining)
-	if err != nil {
-		s.dropPlaybackOptions(options)
-		return nil, nil, err
-	}
 	if preferences.PreferTextSubtitles {
-		if subtitleOption := s.firstSubtitleOption(ctx, options); subtitleOption >= 0 {
+		started := time.Now()
+		subtitleOption, err := s.observeSubtitlePlaybackOptions(ctx, options, -1, observationRemaining)
+		observationRemaining -= min(time.Since(started), observationRemaining)
+		if err != nil {
+			s.dropPlaybackOptions(options)
+			return nil, nil, err
+		}
+		if subtitleOption >= 0 {
 			options[subtitleOption].candidate.Reasons = append(
 				options[subtitleOption].candidate.Reasons,
 				subtitlesVerifiedReason,
@@ -1688,6 +1738,14 @@ func (s *Server) createRankedPlayback(
 				options[subtitleOption].peers >= strongLiveSwarmPeers,
 			)
 		}
+	}
+
+	strong, err := s.observePlaybackOptions(ctx, options, strongLiveSwarmPeers, observationRemaining)
+	if err != nil {
+		s.dropPlaybackOptions(options)
+		return nil, nil, err
+	}
+	if preferences.PreferTextSubtitles {
 		s.logger.Warn("no live ranked playback option exposed supported subtitles; using best available release")
 		if strong >= 0 {
 			options[strong].candidate.Reasons = append(options[strong].candidate.Reasons, subtitleFallbackReason)
@@ -1706,6 +1764,20 @@ func (s *Server) createRankedPlayback(
 		options[best].candidate.Reasons = append(options[best].candidate.Reasons, subtitleFallbackReason)
 	}
 	return s.choosePlaybackOption(options, best, false)
+}
+
+func (s *Server) rankedPlaybackTiming() playbackSelectionTiming {
+	timing := s.selectionTiming
+	if timing.progressiveWait <= 0 {
+		timing.progressiveWait = progressiveSwarmWait
+	}
+	if timing.liveSwarmWait <= 0 {
+		timing.liveSwarmWait = liveSwarmWait
+	}
+	if timing.statusPoll <= 0 {
+		timing.statusPoll = swarmStatusPollInterval
+	}
+	return timing
 }
 
 func hasRankingReason(candidate catalog.RankedCandidate, reason string) bool {
@@ -1731,24 +1803,73 @@ func (s *Server) playbackHasSubtitles(ctx context.Context, playbackID string) (b
 	return len(tracks) > 0, nil
 }
 
-func (s *Server) firstSubtitleOption(ctx context.Context, options []playbackOption) int {
-	for index, option := range options {
-		if option.peers < minimumLivePeers {
-			continue
+// observeSubtitlePlaybackOptions probes each option once, and only after it has
+// enough live peers to be safe. current identifies the newly mounted option: once
+// that option is checked, its caller can immediately progress instead of idling for
+// the rest of the health window. A negative current performs the final fallback wait.
+func (s *Server) observeSubtitlePlaybackOptions(
+	ctx context.Context,
+	options []playbackOption,
+	current int,
+	wait time.Duration,
+) (int, error) {
+	check := func() (int, bool, error) {
+		s.refreshPlaybackOptions(options)
+		for index := range options {
+			option := &options[index]
+			if option.peers < minimumLivePeers || option.subtitlesChecked {
+				continue
+			}
+			option.subtitlesChecked = true
+			hasSubtitles, err := s.playbackHasSubtitles(ctx, option.session.ID)
+			if err != nil {
+				if ctx.Err() != nil {
+					return -1, false, ctx.Err()
+				}
+				s.logger.Warn("probe playback subtitles", "id", option.session.ID,
+					"name", option.candidate.Candidate.Name, "error", err)
+				continue
+			}
+			if hasSubtitles {
+				s.logger.Info("preferred playback with supported subtitles", "id", option.session.ID,
+					"name", option.candidate.Candidate.Name, "live_peers", option.peers)
+				return index, true, nil
+			}
 		}
-		hasSubtitles, err := s.playbackHasSubtitles(ctx, option.session.ID)
-		if err != nil {
-			s.logger.Warn("probe playback subtitles", "id", option.session.ID,
-				"name", option.candidate.Candidate.Name, "error", err)
-			continue
+		if current >= 0 && options[current].subtitlesChecked {
+			return -1, true, nil
 		}
-		if hasSubtitles {
-			s.logger.Info("preferred playback with supported subtitles", "id", option.session.ID,
-				"name", option.candidate.Candidate.Name, "live_peers", option.peers)
-			return index
+		if current < 0 {
+			allChecked := true
+			for index := range options {
+				allChecked = allChecked && options[index].subtitlesChecked
+			}
+			if allChecked {
+				return -1, true, nil
+			}
+		}
+		return -1, false, nil
+	}
+	if selected, done, err := check(); err != nil || done || wait <= 0 {
+		return selected, err
+	}
+	timer := time.NewTimer(wait)
+	ticker := time.NewTicker(s.rankedPlaybackTiming().statusPoll)
+	defer timer.Stop()
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return -1, ctx.Err()
+		case <-timer.C:
+			selected, _, err := check()
+			return selected, err
+		case <-ticker.C:
+			if selected, done, err := check(); err != nil || done {
+				return selected, err
+			}
 		}
 	}
-	return -1
 }
 
 func (s *Server) observePlaybackOptions(
@@ -1758,12 +1879,7 @@ func (s *Server) observePlaybackOptions(
 	wait time.Duration,
 ) (int, error) {
 	refresh := func() int {
-		for i := range options {
-			status, ok := s.engine.Status(options[i].session.ID)
-			if ok {
-				options[i].peers = max(status.ActivePeers, status.ConnectedSeeders)
-			}
-		}
+		s.refreshPlaybackOptions(options)
 		for i := range options {
 			if options[i].peers >= threshold {
 				return i
@@ -1775,7 +1891,7 @@ func (s *Server) observePlaybackOptions(
 		return strong, nil
 	}
 	timer := time.NewTimer(wait)
-	ticker := time.NewTicker(250 * time.Millisecond)
+	ticker := time.NewTicker(s.rankedPlaybackTiming().statusPoll)
 	defer timer.Stop()
 	defer ticker.Stop()
 	for {
@@ -1788,6 +1904,15 @@ func (s *Server) observePlaybackOptions(
 			if strong := refresh(); strong >= 0 {
 				return strong, nil
 			}
+		}
+	}
+}
+
+func (s *Server) refreshPlaybackOptions(options []playbackOption) {
+	for i := range options {
+		status, ok := s.engine.Status(options[i].session.ID)
+		if ok {
+			options[i].peers = max(status.ActivePeers, status.ConnectedSeeders)
 		}
 	}
 }

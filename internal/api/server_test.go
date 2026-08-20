@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -41,6 +42,57 @@ type airingMetadata struct{}
 type fakeRatings struct{}
 
 type partialRatings struct{}
+
+type fakeTorrentPlaybackEngine struct {
+	mu       sync.Mutex
+	created  []torrentstream.Source
+	dropped  []string
+	sessions map[string]*torrentstream.Session
+	statuses map[string]torrentstream.Status
+}
+
+func (f *fakeTorrentPlaybackEngine) Create(_ context.Context, source torrentstream.Source) (*torrentstream.Session, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id := fmt.Sprintf("playback-%d", len(f.created)+1)
+	session := &torrentstream.Session{ID: id, Name: id, FileName: "episode.mkv"}
+	f.created = append(f.created, source)
+	if f.sessions == nil {
+		f.sessions = make(map[string]*torrentstream.Session)
+	}
+	f.sessions[id] = session
+	return session, nil
+}
+
+func (f *fakeTorrentPlaybackEngine) Get(id string) (*torrentstream.Session, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	session, ok := f.sessions[id]
+	return session, ok
+}
+
+func (*fakeTorrentPlaybackEngine) TorrentMetainfo(string) ([]byte, error) {
+	return nil, nil
+}
+
+func (f *fakeTorrentPlaybackEngine) Drop(id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dropped = append(f.dropped, id)
+	delete(f.sessions, id)
+	return nil
+}
+
+func (f *fakeTorrentPlaybackEngine) Status(id string) (torrentstream.Status, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	status, ok := f.statuses[id]
+	return status, ok
+}
+
+func (*fakeTorrentPlaybackEngine) ServeHTTP(http.ResponseWriter, *http.Request, string) error {
+	return nil
+}
 
 type fakeUsenetPlaybackEngine struct {
 	createdSource usenetstream.Source
@@ -1626,21 +1678,178 @@ func TestUsenetCandidateFailuresAreTemporarilySkipped(t *testing.T) {
 	}
 }
 
-func TestFirstTextSubtitleOptionPrefersLiveSupportedRelease(t *testing.T) {
-	manager := &fakeHLSManager{subtitleTracks: map[string][]hls.SubtitleTrack{
-		"with-subtitles": {{Index: 3, Language: "en"}},
-	}}
+func TestRankedPlaybackStopsAfterHighestRankedHealthySubtitleRelease(t *testing.T) {
+	server, engine := newRankedPlaybackTestServer(t,
+		map[string]torrentstream.Status{
+			"playback-1": {ActivePeers: minimumLivePeers},
+			"playback-2": {ActivePeers: strongLiveSwarmPeers},
+		},
+		map[string][]hls.SubtitleTrack{
+			"playback-1": {{Index: 3, Language: "en"}},
+			"playback-2": {{Index: 4, Language: "en"}},
+		},
+	)
+
+	session, selected, err := server.createRankedPlayback(
+		t.Context(), rankedTorrentCandidates(3),
+		catalog.Preferences{StreamingOptimized: true, PreferTextSubtitles: true}, "S01E01",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.ID != "playback-1" || selected.Candidate.ID != "release-1" {
+		t.Fatalf("session = %+v, selected = %+v", session, selected)
+	}
+	if len(engine.created) != 1 {
+		t.Fatalf("mounted torrents = %d, want 1", len(engine.created))
+	}
+	if !hasRankingReason(*selected, subtitlesVerifiedReason) {
+		t.Fatalf("selection reasons = %v", selected.Reasons)
+	}
+}
+
+func TestRankedPlaybackProgressesPastDeadSwarmWithoutUsingFullWait(t *testing.T) {
+	server, engine := newRankedPlaybackTestServer(t,
+		map[string]torrentstream.Status{
+			"playback-1": {},
+			"playback-2": {ActivePeers: minimumLivePeers},
+		},
+		map[string][]hls.SubtitleTrack{
+			"playback-2": {{Index: 3, Language: "en"}},
+		},
+	)
+	server.selectionTiming = playbackSelectionTiming{
+		progressiveWait: 30 * time.Millisecond,
+		liveSwarmWait:   2 * time.Second,
+		statusPoll:      time.Millisecond,
+	}
+
+	started := time.Now()
+	session, selected, err := server.createRankedPlayback(
+		t.Context(), rankedTorrentCandidates(3),
+		catalog.Preferences{StreamingOptimized: true, PreferTextSubtitles: true}, "S01E01",
+	)
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.ID != "playback-2" || selected.Candidate.ID != "release-2" {
+		t.Fatalf("session = %+v, selected = %+v", session, selected)
+	}
+	if len(engine.created) != 2 {
+		t.Fatalf("mounted torrents = %d, want 2", len(engine.created))
+	}
+	if !slices.Equal(engine.dropped, []string{"playback-1"}) {
+		t.Fatalf("dropped torrents = %v", engine.dropped)
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("selection took %v; it consumed the two-second fallback wait", elapsed)
+	}
+}
+
+func TestRankedPlaybackSubtitleFallbacks(t *testing.T) {
+	tests := []struct {
+		name       string
+		statuses   map[string]torrentstream.Status
+		tracks     map[string][]hls.SubtitleTrack
+		candidates int
+		wantID     string
+		wantMounts int
+	}{
+		{
+			name: "subtitle-less options use strongest live swarm",
+			statuses: map[string]torrentstream.Status{
+				"playback-1": {ActivePeers: 5},
+				"playback-2": {ActivePeers: strongLiveSwarmPeers},
+				"playback-3": {},
+			},
+			candidates: 3, wantID: "release-2", wantMounts: 3,
+		},
+		{
+			name: "scarce weak options use best available swarm",
+			statuses: map[string]torrentstream.Status{
+				"playback-1": {ActivePeers: 1},
+				"playback-2": {ActivePeers: 2},
+			},
+			candidates: 2, wantID: "release-2", wantMounts: 2,
+		},
+		{
+			name: "later subtitle release survives dead and subtitle-less options",
+			statuses: map[string]torrentstream.Status{
+				"playback-1": {},
+				"playback-2": {ActivePeers: 5},
+				"playback-3": {ActivePeers: minimumLivePeers},
+			},
+			tracks: map[string][]hls.SubtitleTrack{
+				"playback-3": {{Index: 3, Language: "en"}},
+			},
+			candidates: 3, wantID: "release-3", wantMounts: 3,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server, engine := newRankedPlaybackTestServer(t, test.statuses, test.tracks)
+			session, selected, err := server.createRankedPlayback(
+				t.Context(), rankedTorrentCandidates(test.candidates),
+				catalog.Preferences{StreamingOptimized: true, PreferTextSubtitles: true}, "S01E01",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if session.ID != strings.Replace(test.wantID, "release", "playback", 1) ||
+				selected.Candidate.ID != test.wantID {
+				t.Fatalf("session = %+v, selected = %+v", session, selected)
+			}
+			if len(engine.created) != test.wantMounts {
+				t.Fatalf("mounted torrents = %d, want %d", len(engine.created), test.wantMounts)
+			}
+			if test.tracks == nil && !hasRankingReason(*selected, subtitleFallbackReason) {
+				t.Fatalf("selection reasons = %v", selected.Reasons)
+			}
+		})
+	}
+}
+
+func newRankedPlaybackTestServer(
+	t *testing.T,
+	statuses map[string]torrentstream.Status,
+	tracks map[string][]hls.SubtitleTrack,
+) (*Server, *fakeTorrentPlaybackEngine) {
+	t.Helper()
+	registry, err := indexer.NewRegistry([]config.Indexer{{
+		Name: "torrent", Type: "torznab", Endpoint: "https://indexer.example/api",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := &fakeTorrentPlaybackEngine{statuses: statuses}
 	server := &Server{
-		hlsManager: manager,
-		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		indexers: registry,
+		engine:   engine,
+		hlsManager: &fakeHLSManager{
+			subtitleTracks: tracks,
+		},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		selectionTiming: playbackSelectionTiming{
+			progressiveWait: 5 * time.Millisecond,
+			liveSwarmWait:   40 * time.Millisecond,
+			statusPoll:      time.Millisecond,
+		},
 	}
-	options := []playbackOption{
-		{session: &torrentstream.Session{ID: "without-subtitles"}, peers: 12},
-		{session: &torrentstream.Session{ID: "with-subtitles"}, peers: 5},
+	return server, engine
+}
+
+func rankedTorrentCandidates(count int) []catalog.RankedCandidate {
+	candidates := make([]catalog.RankedCandidate, 0, count)
+	for i := 1; i <= count; i++ {
+		candidates = append(candidates, catalog.RankedCandidate{Candidate: catalog.Candidate{
+			ID: fmt.Sprintf("release-%d", i), Indexer: "torrent",
+			Name: fmt.Sprintf("Show.S01.Release.%d", i), Protocol: catalog.ProtocolTorrent,
+			MagnetURI: fmt.Sprintf("magnet:?xt=urn:btih:%040d", i),
+		}})
 	}
-	if index := server.firstSubtitleOption(t.Context(), options); index != 1 {
-		t.Fatalf("subtitle option = %d, want 1", index)
-	}
+	return candidates
 }
 
 func TestHLSAssetsAndCleanup(t *testing.T) {
