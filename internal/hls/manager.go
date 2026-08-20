@@ -1063,7 +1063,12 @@ func playlistReady(dir string, minimumSeconds int) bool {
 
 	var duration float64
 	segmentCount := 0
+	complete := false
 	for _, line := range strings.Split(string(playlist), "\n") {
+		if line == "#EXT-X-ENDLIST" {
+			complete = true
+			continue
+		}
 		if !strings.HasPrefix(line, "#EXTINF:") {
 			continue
 		}
@@ -1075,7 +1080,7 @@ func playlistReady(dir string, minimumSeconds int) bool {
 		duration += seconds
 		segmentCount++
 	}
-	if segmentCount == 0 || duration < float64(minimumSeconds) {
+	if segmentCount == 0 || (!complete && duration < float64(minimumSeconds)) {
 		return false
 	}
 	matches, _ := filepath.Glob(filepath.Join(dir, "segment-*.m4s"))

@@ -506,6 +506,23 @@ func TestPlaylistReadyWaitsForStartupBuffer(t *testing.T) {
 	}
 }
 
+func TestPlaylistReadyAcceptsShortCompletedStream(t *testing.T) {
+	dir := t.TempDir()
+	playlist := "#EXTM3U\n#EXTINF:2.0,\nsegment-000000.m4s\n#EXT-X-ENDLIST\n"
+	if err := os.WriteFile(filepath.Join(dir, "index.m3u8"), []byte(playlist), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if playlistReady(dir, 24) {
+		t.Fatal("playlist was ready before its completed segment existed")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "segment-000000.m4s"), []byte("segment"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !playlistReady(dir, 24) {
+		t.Fatal("completed playlist near the end of the media was not ready")
+	}
+}
+
 func TestManagerRejectsUnsafeAssetNames(t *testing.T) {
 	manager := &Manager{streams: make(map[string]*runningStream)}
 	for _, name := range []string{"../config.json", "ffmpeg.log", "segment-one.ts", "subtitle-all.vtt", "subtitle--1.vtt"} {
