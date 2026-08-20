@@ -55,8 +55,8 @@ const (
 	cachedSwarmWait        = 3 * time.Second
 	liveSwarmWait          = 8 * time.Second
 
-	textSubtitlesVerifiedReason = "text subtitles verified"
-	subtitleFallbackReason      = "subtitle fallback verified"
+	subtitlesVerifiedReason = "subtitles verified"
+	subtitleFallbackReason  = "subtitle fallback verified"
 )
 
 type CreatePlaybackResponse struct {
@@ -86,10 +86,10 @@ type catalogSection struct {
 
 type HLSStreamManager interface {
 	ProbeSubtitles(context.Context, string) ([]hls.SubtitleTrack, error)
-	Start(context.Context, string, float64, []string) (hls.Stream, error)
+	Start(context.Context, string, float64, []string, int) (hls.Stream, error)
 	StartSubtitle(context.Context, string, int) error
 	AssetPath(string, string) (string, error)
-	Prepared(string, float64, []string, int) bool
+	Prepared(string, float64, []string, int, int) bool
 	Park(context.Context, string, int) error
 	Stop(string)
 }
@@ -273,6 +273,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/playbacks/{id}/hls", s.startHLSPlayback)
 	mux.HandleFunc("POST /v1/playbacks/{id}/hls/park", s.parkHLSPlayback)
 	mux.HandleFunc("DELETE /v1/playbacks/{id}/hls", s.stopHLSPlayback)
+	mux.HandleFunc("GET /v1/playbacks/{id}/hls/subtitles", s.listHLSSubtitles)
 	mux.HandleFunc("POST /v1/playbacks/{id}/hls/subtitles/{index}", s.startHLSSubtitle)
 	mux.HandleFunc("GET /v1/playbacks/{id}/hls/{asset}", s.serveHLSAsset)
 	return mux
@@ -1160,7 +1161,7 @@ func (s *Server) createCachedUsenetPlayback(
 		return nil, nil
 	}
 	if preferences.PreferTextSubtitles {
-		hasTextSubtitles, probeErr := s.playbackHasTextSubtitles(preparationContext, session.ID)
+		hasSubtitles, probeErr := s.playbackHasSubtitles(preparationContext, session.ID)
 		if probeErr != nil {
 			_ = s.usenetEngine.Drop(session.ID)
 			if !transientPlaybackFailure(probeErr) {
@@ -1173,12 +1174,12 @@ func (s *Server) createCachedUsenetPlayback(
 				"title", request.Query, "name", cached.Selected.Candidate.Name, "error", probeErr)
 			return nil, nil
 		}
-		if !hasTextSubtitles {
+		if !hasSubtitles {
 			_ = s.usenetEngine.Drop(session.ID)
 			if removeErr := s.playbackCache.RemoveUsenet(request.MediaID, request.Query, request.Year); removeErr != nil {
-				s.logger.Warn("remove cached NZB without text subtitles", "title", request.Query, "error", removeErr)
+				s.logger.Warn("remove cached NZB without supported subtitles", "title", request.Query, "error", removeErr)
 			}
-			s.logger.Info("cached Usenet playback lacks text subtitles; searching again", "title", request.Query)
+			s.logger.Info("cached Usenet playback lacks supported subtitles; searching again", "title", request.Query)
 			return nil, nil
 		}
 	}
@@ -1218,7 +1219,7 @@ func (s *Server) createCachedPlayback(
 		return nil, nil, nil
 	}
 	if request.Preferences.PreferTextSubtitles &&
-		!hasRankingReason(cached.Selected, textSubtitlesVerifiedReason) &&
+		!hasRankingReason(cached.Selected, subtitlesVerifiedReason) &&
 		!hasRankingReason(cached.Selected, subtitleFallbackReason) {
 		if removeErr := s.playbackCache.Remove(cacheMediaID, request.Query, request.Year); removeErr != nil {
 			s.logger.Warn("remove cached playback without subtitle validation", "title", request.Query, "error", removeErr)
@@ -1380,7 +1381,7 @@ func (s *Server) createRankedUsenetPlayback(
 					s.logger.Info("selected Usenet playback", "id", session.ID, "name", candidate.Candidate.Name)
 					return wrapUsenetSession(session), &candidate, nil
 				}
-				hasTextSubtitles, probeErr := s.playbackHasTextSubtitles(preparationContext, session.ID)
+				hasSubtitles, probeErr := s.playbackHasSubtitles(preparationContext, session.ID)
 				if probeErr != nil {
 					_ = s.usenetEngine.Drop(session.ID)
 					if !transientPlaybackFailure(probeErr) {
@@ -1391,11 +1392,11 @@ func (s *Server) createRankedUsenetPlayback(
 						"name", candidate.Candidate.Name, "error", probeErr)
 					continue
 				}
-				if hasTextSubtitles {
+				if hasSubtitles {
 					if fallbackSession != nil {
 						_ = s.usenetEngine.Drop(fallbackSession.ID)
 					}
-					s.logger.Info("selected Usenet playback with text subtitles",
+					s.logger.Info("selected Usenet playback with supported subtitles",
 						"id", session.ID, "name", candidate.Candidate.Name)
 					return wrapUsenetSession(session), &candidate, nil
 				}
@@ -1427,7 +1428,7 @@ func (s *Server) createRankedUsenetPlayback(
 		failures = append(failures, fmt.Sprintf("%s: %v", candidate.Candidate.Name, err))
 	}
 	if fallbackSession != nil {
-		s.logger.Warn("no Usenet candidate exposed text subtitles; using best available release",
+		s.logger.Warn("no Usenet candidate exposed supported subtitles; using best available release",
 			"id", fallbackSession.ID, "name", fallbackCandidate.Candidate.Name)
 		return wrapUsenetSession(fallbackSession), fallbackCandidate, nil
 	}
@@ -1581,10 +1582,10 @@ func (s *Server) createRankedPlayback(
 		return nil, nil, err
 	}
 	if preferences.PreferTextSubtitles {
-		if subtitleOption := s.firstTextSubtitleOption(ctx, options); subtitleOption >= 0 {
+		if subtitleOption := s.firstSubtitleOption(ctx, options); subtitleOption >= 0 {
 			options[subtitleOption].candidate.Reasons = append(
 				options[subtitleOption].candidate.Reasons,
-				textSubtitlesVerifiedReason,
+				subtitlesVerifiedReason,
 			)
 			return s.choosePlaybackOption(
 				options,
@@ -1592,7 +1593,7 @@ func (s *Server) createRankedPlayback(
 				options[subtitleOption].peers >= strongLiveSwarmPeers,
 			)
 		}
-		s.logger.Warn("no live ranked playback option exposed text subtitles; using best available release")
+		s.logger.Warn("no live ranked playback option exposed supported subtitles; using best available release")
 		if strong >= 0 {
 			options[strong].candidate.Reasons = append(options[strong].candidate.Reasons, subtitleFallbackReason)
 		}
@@ -1621,7 +1622,7 @@ func hasRankingReason(candidate catalog.RankedCandidate, reason string) bool {
 	return false
 }
 
-func (s *Server) playbackHasTextSubtitles(ctx context.Context, playbackID string) (bool, error) {
+func (s *Server) playbackHasSubtitles(ctx context.Context, playbackID string) (bool, error) {
 	s.hlsMu.RLock()
 	manager := s.hlsManager
 	s.hlsMu.RUnlock()
@@ -1635,19 +1636,19 @@ func (s *Server) playbackHasTextSubtitles(ctx context.Context, playbackID string
 	return len(tracks) > 0, nil
 }
 
-func (s *Server) firstTextSubtitleOption(ctx context.Context, options []playbackOption) int {
+func (s *Server) firstSubtitleOption(ctx context.Context, options []playbackOption) int {
 	for index, option := range options {
 		if option.peers < minimumLivePeers {
 			continue
 		}
-		hasTextSubtitles, err := s.playbackHasTextSubtitles(ctx, option.session.ID)
+		hasSubtitles, err := s.playbackHasSubtitles(ctx, option.session.ID)
 		if err != nil {
 			s.logger.Warn("probe playback subtitles", "id", option.session.ID,
 				"name", option.candidate.Candidate.Name, "error", err)
 			continue
 		}
-		if hasTextSubtitles {
-			s.logger.Info("preferred playback with text subtitles", "id", option.session.ID,
+		if hasSubtitles {
+			s.logger.Info("preferred playback with supported subtitles", "id", option.session.ID,
 				"name", option.candidate.Candidate.Name, "live_peers", option.peers)
 			return index
 		}
@@ -1795,8 +1796,10 @@ func (s *Server) streamPlayback(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) playbackExists(id string) bool {
-	if _, ok := s.engine.Get(id); ok {
-		return true
+	if s.engine != nil {
+		if _, ok := s.engine.Get(id); ok {
+			return true
+		}
 	}
 	if s.usenetEngine != nil {
 		_, ok := s.usenetEngine.Get(id)
@@ -1820,7 +1823,8 @@ func (s *Server) startHLSPlayback(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 	var request struct {
-		StartSeconds float64 `json:"start_seconds,omitempty"`
+		StartSeconds        float64 `json:"start_seconds,omitempty"`
+		BitmapSubtitleIndex *int    `json:"bitmap_subtitle_index,omitempty"`
 	}
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	decoder.DisallowUnknownFields()
@@ -1831,7 +1835,17 @@ func (s *Server) startHLSPlayback(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	preferredLanguages := append([]string(nil), s.playbackLanguages[id]...)
 	s.mu.RUnlock()
-	stream, err := manager.Start(r.Context(), id, request.StartSeconds, preferredLanguages)
+	bitmapSubtitleIndex := -1
+	if request.BitmapSubtitleIndex != nil {
+		if *request.BitmapSubtitleIndex < 0 {
+			writeError(w, http.StatusBadRequest, "invalid bitmap subtitle index")
+			return
+		}
+		bitmapSubtitleIndex = *request.BitmapSubtitleIndex
+	}
+	stream, err := manager.Start(
+		r.Context(), id, request.StartSeconds, preferredLanguages, bitmapSubtitleIndex,
+	)
 	if err != nil {
 		s.invalidateCachedPlayback(id)
 		writeError(w, http.StatusBadGateway, err.Error())
@@ -1845,6 +1859,27 @@ func (s *Server) startHLSPlayback(w http.ResponseWriter, r *http.Request) {
 		Stream:      stream,
 		PlaylistURL: fmt.Sprintf("%s://%s/v1/playbacks/%s/hls/index.m3u8", requestScheme(r), r.Host, id),
 	})
+}
+
+func (s *Server) listHLSSubtitles(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.playbackExists(id) {
+		writeError(w, http.StatusNotFound, "playback not found")
+		return
+	}
+	s.hlsMu.RLock()
+	manager := s.hlsManager
+	s.hlsMu.RUnlock()
+	if manager == nil {
+		writeError(w, http.StatusNotImplemented, "HLS playback is not configured")
+		return
+	}
+	tracks, err := manager.ProbeSubtitles(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, tracks)
 }
 
 func (s *Server) startHLSSubtitle(w http.ResponseWriter, r *http.Request) {

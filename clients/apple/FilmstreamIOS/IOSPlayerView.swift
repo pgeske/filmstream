@@ -512,12 +512,14 @@ private final class IOSPlaybackController: ObservableObject {
     private let api: FilmstreamAPI
     private let playback: Playback
     private var streamStartSeconds: Double
+    private var burnedSubtitleIndex: Int?
     private var timeObserver: Any?
     private var statusObservation: NSKeyValueObservation?
     private var playbackObservation: NSKeyValueObservation?
     private var itemEndObserver: NSObjectProtocol?
     private var seekTask: Task<Void, Never>?
     private var subtitleTask: Task<Void, Never>?
+    private var subtitleSwitchTask: Task<Void, Never>?
     private var subtitleCues: [SubtitleCue] = []
     private var seekGeneration = 0
     private var seekOriginSeconds: Double
@@ -535,6 +537,7 @@ private final class IOSPlaybackController: ObservableObject {
         seekOriginSeconds = streamStartSeconds
         subtitleOptions = prepared.hls.subtitles ?? []
         selectedSubtitle = Self.preferredSubtitle(in: subtitleOptions)
+        burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
 
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
         try? AVAudioSession.sharedInstance().setActive(true)
@@ -656,7 +659,7 @@ private final class IOSPlaybackController: ObservableObject {
         defaults.set(track != nil, forKey: "filmstream.subtitles.enabled")
         defaults.set(track?.language, forKey: "filmstream.subtitles.language")
         defaults.set(track?.title, forKey: "filmstream.subtitles.title")
-        restartSubtitleUpdates()
+        switchSubtitleStreamIfNeeded()
     }
 
     func stop() {
@@ -667,6 +670,8 @@ private final class IOSPlaybackController: ObservableObject {
         seekTask = nil
         subtitleTask?.cancel()
         subtitleTask = nil
+        subtitleSwitchTask?.cancel()
+        subtitleSwitchTask = nil
         if let itemEndObserver {
             NotificationCenter.default.removeObserver(itemEndObserver)
             self.itemEndObserver = nil
@@ -701,6 +706,7 @@ private final class IOSPlaybackController: ObservableObject {
             let prepared = try await api.prepareNativePlayback(playback, startSeconds: target)
             guard !Task.isCancelled, generation == seekGeneration, !stopped else { return }
             streamStartSeconds = max(0, prepared.hls.startSeconds)
+            burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
             updateSubtitleOptions(prepared.hls.subtitles ?? [])
             if let duration = prepared.hls.durationSeconds, duration > 0 {
                 durationSeconds = duration
@@ -757,12 +763,80 @@ private final class IOSPlaybackController: ObservableObject {
         restartSubtitleUpdates()
     }
 
+    private func switchSubtitleStreamIfNeeded() {
+        let desiredBitmapIndex = selectedSubtitle?.isBitmap == true ? selectedSubtitle?.index : nil
+        guard desiredBitmapIndex != burnedSubtitleIndex else {
+            restartSubtitleUpdates()
+            return
+        }
+
+        subtitleSwitchTask?.cancel()
+        subtitleTask?.cancel()
+        subtitleTask = nil
+        subtitleCues = []
+        activeSubtitleText = nil
+        let resumePosition = max(0, positionSeconds)
+        let shouldResume = wantsToPlay
+        player.pause()
+        isWaiting = true
+        stateLabel = "Changing Subtitles…"
+        errorMessage = nil
+
+        subtitleSwitchTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let prepared = try await self.api.prepareNativePlayback(
+                    self.playback,
+                    startSeconds: resumePosition,
+                    bitmapSubtitleIndex: desiredBitmapIndex,
+                    useSavedSubtitlePreference: false
+                )
+                guard !Task.isCancelled, !self.stopped else { return }
+                self.streamStartSeconds = max(0, prepared.hls.startSeconds)
+                self.burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
+                self.updateSubtitleOptions(prepared.hls.subtitles ?? [])
+                self.installItem(url: self.cacheBusted(prepared.hls.playlistURL))
+                let localPosition = max(0, resumePosition - self.streamStartSeconds)
+                self.player.seek(
+                    to: CMTime(seconds: localPosition, preferredTimescale: 600),
+                    toleranceBefore: .zero,
+                    toleranceAfter: .zero
+                ) { [weak self] finished in
+                    Task { @MainActor in
+                        guard let self, !self.stopped else { return }
+                        self.subtitleSwitchTask = nil
+                        self.isWaiting = false
+                        guard finished else {
+                            self.wantsToPlay = false
+                            self.isPlaying = false
+                            self.stateLabel = "Paused"
+                            return
+                        }
+                        if shouldResume {
+                            self.play()
+                        } else {
+                            self.stateLabel = "Paused"
+                        }
+                    }
+                }
+            } catch {
+                guard !Task.isCancelled, !self.stopped else { return }
+                self.subtitleSwitchTask = nil
+                self.isWaiting = false
+                self.wantsToPlay = false
+                self.isPlaying = false
+                self.stateLabel = "Unable to Change Subtitles"
+                self.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
     private func restartSubtitleUpdates() {
         subtitleTask?.cancel()
         subtitleTask = nil
         subtitleCues = []
         activeSubtitleText = nil
-        guard let track = selectedSubtitle, !stopped else { return }
+        guard let track = selectedSubtitle, !track.isBitmap, !stopped else { return }
 
         let offset = streamStartSeconds
         subtitleTask = Task { [weak self] in

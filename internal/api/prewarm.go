@@ -355,6 +355,7 @@ func (s *Server) prewarmedPlaybackAvailable(state *playbackPrewarmState) bool {
 		state.response.ID,
 		state.target.request.StartSeconds,
 		languages,
+		-1,
 		prewarmBufferSeconds,
 	)
 }

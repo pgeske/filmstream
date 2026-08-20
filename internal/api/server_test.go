@@ -101,6 +101,7 @@ type fakeHLSManager struct {
 	subtitleTracks   map[string][]hls.SubtitleTrack
 	probeErrors      map[string]error
 	languages        []string
+	bitmapSubtitle   int
 }
 
 func (f *fakeHLSManager) ProbeSubtitles(_ context.Context, id string) ([]hls.SubtitleTrack, error) {
@@ -110,9 +111,20 @@ func (f *fakeHLSManager) ProbeSubtitles(_ context.Context, id string) ([]hls.Sub
 	return f.subtitleTracks[id], nil
 }
 
-func (f *fakeHLSManager) Start(_ context.Context, id string, start float64, languages []string) (hls.Stream, error) {
+func (f *fakeHLSManager) Start(_ context.Context, id string, start float64, languages []string, bitmapSubtitle int) (hls.Stream, error) {
 	f.languages = append([]string(nil), languages...)
-	return hls.Stream{PlaybackID: id, StartSeconds: start, VideoCodec: "h264"}, nil
+	f.bitmapSubtitle = bitmapSubtitle
+	return hls.Stream{
+		PlaybackID: id, StartSeconds: start, VideoCodec: "h264",
+		BurnedSubtitleIndex: optionalTestIndex(bitmapSubtitle),
+	}, nil
+}
+
+func optionalTestIndex(index int) *int {
+	if index < 0 {
+		return nil
+	}
+	return &index
 }
 
 func (f *fakeHLSManager) StartSubtitle(_ context.Context, playbackID string, index int) error {
@@ -125,7 +137,7 @@ func (f *fakeHLSManager) AssetPath(_, name string) (string, error) {
 	return filepath.Join(f.dir, name), nil
 }
 
-func (f *fakeHLSManager) Prepared(string, float64, []string, int) bool {
+func (f *fakeHLSManager) Prepared(string, float64, []string, int, int) bool {
 	return false
 }
 
@@ -1271,7 +1283,7 @@ func TestFirstTextSubtitleOptionPrefersLiveSupportedRelease(t *testing.T) {
 		{session: &torrentstream.Session{ID: "without-subtitles"}, peers: 12},
 		{session: &torrentstream.Session{ID: "with-subtitles"}, peers: 5},
 	}
-	if index := server.firstTextSubtitleOption(t.Context(), options); index != 1 {
+	if index := server.firstSubtitleOption(t.Context(), options); index != 1 {
 		t.Fatalf("subtitle option = %d, want 1", index)
 	}
 }
@@ -1287,11 +1299,39 @@ func TestHLSAssetsAndCleanup(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "subtitle-6.vtt"), []byte("WEBVTT\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	manager := &fakeHLSManager{dir: dir}
-	server := &Server{hlsManager: manager}
+	manager := &fakeHLSManager{
+		dir: dir,
+		subtitleTracks: map[string][]hls.SubtitleTrack{
+			"abc": {{Index: 6, Language: "en", Codec: "hdmv_pgs_subtitle", Kind: "bitmap"}},
+		},
+	}
+	server := &Server{
+		hlsManager: manager,
+		usenetEngine: &fakeUsenetPlaybackEngine{
+			session: &usenetstream.Session{ID: "abc"},
+		},
+	}
 
-	request := httptest.NewRequest(http.MethodPost, "/v1/playbacks/abc/hls/subtitles/6", nil)
+	request := httptest.NewRequest(http.MethodGet, "/v1/playbacks/abc/hls/subtitles", nil)
 	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"kind":"bitmap"`) {
+		t.Fatalf("subtitle list status = %d, body = %s", response.Code, response.Body.String())
+	}
+
+	request = httptest.NewRequest(
+		http.MethodPost, "/v1/playbacks/abc/hls",
+		strings.NewReader(`{"start_seconds":12,"bitmap_subtitle_index":6}`),
+	)
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || manager.bitmapSubtitle != 6 ||
+		!strings.Contains(response.Body.String(), `"burned_subtitle_index":6`) {
+		t.Fatalf("HLS start status = %d, bitmap = %d, body = %s", response.Code, manager.bitmapSubtitle, response.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodPost, "/v1/playbacks/abc/hls/subtitles/6", nil)
+	response = httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusAccepted || manager.subtitlePlayback != "abc" || manager.subtitleIndex != 6 {
 		t.Fatalf("subtitle start status = %d, playback = %q, index = %d", response.Code, manager.subtitlePlayback, manager.subtitleIndex)

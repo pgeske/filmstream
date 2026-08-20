@@ -27,17 +27,18 @@ const (
 )
 
 type Config struct {
-	DataDir             string
-	FFmpegPath          string
-	FFprobePath         string
-	SourceBaseURL       string
-	StartupTimeout      time.Duration
-	BufferSeconds       int
-	ReadRate            float64
-	SegmentSeconds      int
-	ParkedTTL           time.Duration
-	ParkedResumeTimeout time.Duration
-	Logger              *slog.Logger
+	DataDir               string
+	FFmpegPath            string
+	FFprobePath           string
+	SourceBaseURL         string
+	StartupTimeout        time.Duration
+	BufferSeconds         int
+	ReadRate              float64
+	SegmentSeconds        int
+	ParkedTTL             time.Duration
+	ParkedResumeTimeout   time.Duration
+	Logger                *slog.Logger
+	BitmapSubtitleEncoder string
 }
 
 type Stream struct {
@@ -47,6 +48,7 @@ type Stream struct {
 	DurationSeconds       float64         `json:"duration_seconds,omitempty"`
 	VideoCodec            string          `json:"video_codec"`
 	Subtitles             []SubtitleTrack `json:"subtitles"`
+	BurnedSubtitleIndex   *int            `json:"burned_subtitle_index,omitempty"`
 }
 
 type SubtitleTrack struct {
@@ -55,20 +57,23 @@ type SubtitleTrack struct {
 	Title    string `json:"title,omitempty"`
 	Default  bool   `json:"default,omitempty"`
 	Forced   bool   `json:"forced,omitempty"`
+	Codec    string `json:"codec,omitempty"`
+	Kind     string `json:"kind,omitempty"`
 }
 
 type Manager struct {
-	dataDir             string
-	ffmpegPath          string
-	ffprobePath         string
-	sourceBaseURL       string
-	startupTimeout      time.Duration
-	bufferSeconds       int
-	readRate            float64
-	segmentSeconds      int
-	parkedTTL           time.Duration
-	parkedResumeTimeout time.Duration
-	logger              *slog.Logger
+	dataDir               string
+	ffmpegPath            string
+	ffprobePath           string
+	sourceBaseURL         string
+	startupTimeout        time.Duration
+	bufferSeconds         int
+	readRate              float64
+	segmentSeconds        int
+	parkedTTL             time.Duration
+	parkedResumeTimeout   time.Duration
+	logger                *slog.Logger
+	bitmapSubtitleEncoder string
 
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -85,21 +90,22 @@ type playbackStartLock struct {
 }
 
 type runningStream struct {
-	info           Stream
-	dir            string
-	sourceURL      string
-	requestedStart float64
-	ctx            context.Context
-	cancel         context.CancelFunc
-	done           chan struct{}
-	errMu          sync.RWMutex
-	err            error
-	command        *exec.Cmd
-	processMu      sync.Mutex
-	parked         bool
-	parkedAt       time.Time
-	parkTimer      *time.Timer
-	languages      []string
+	info                Stream
+	dir                 string
+	sourceURL           string
+	requestedStart      float64
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	done                chan struct{}
+	errMu               sync.RWMutex
+	err                 error
+	command             *exec.Cmd
+	processMu           sync.Mutex
+	parked              bool
+	parkedAt            time.Time
+	parkTimer           *time.Timer
+	languages           []string
+	bitmapSubtitleIndex int
 
 	subtitleMu     sync.Mutex
 	subtitleIndex  int
@@ -170,6 +176,12 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
+	if cfg.BitmapSubtitleEncoder == "" {
+		cfg.BitmapSubtitleEncoder = "libx264"
+	}
+	if cfg.BitmapSubtitleEncoder != "libx264" && cfg.BitmapSubtitleEncoder != "h264_nvenc" {
+		return nil, fmt.Errorf("unsupported bitmap subtitle encoder %q", cfg.BitmapSubtitleEncoder)
+	}
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create HLS data directory: %w", err)
 	}
@@ -178,21 +190,22 @@ func New(cfg Config) (*Manager, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
-		dataDir:             cfg.DataDir,
-		ffmpegPath:          ffmpegPath,
-		ffprobePath:         ffprobePath,
-		sourceBaseURL:       strings.TrimRight(cfg.SourceBaseURL, "/"),
-		startupTimeout:      cfg.StartupTimeout,
-		bufferSeconds:       cfg.BufferSeconds,
-		readRate:            cfg.ReadRate,
-		segmentSeconds:      cfg.SegmentSeconds,
-		parkedTTL:           cfg.ParkedTTL,
-		parkedResumeTimeout: cfg.ParkedResumeTimeout,
-		logger:              cfg.Logger,
-		ctx:                 ctx,
-		cancel:              cancel,
-		streams:             make(map[string]*runningStream),
-		startLocks:          make(map[string]*playbackStartLock),
+		dataDir:               cfg.DataDir,
+		ffmpegPath:            ffmpegPath,
+		ffprobePath:           ffprobePath,
+		sourceBaseURL:         strings.TrimRight(cfg.SourceBaseURL, "/"),
+		startupTimeout:        cfg.StartupTimeout,
+		bufferSeconds:         cfg.BufferSeconds,
+		readRate:              cfg.ReadRate,
+		segmentSeconds:        cfg.SegmentSeconds,
+		parkedTTL:             cfg.ParkedTTL,
+		parkedResumeTimeout:   cfg.ParkedResumeTimeout,
+		logger:                cfg.Logger,
+		bitmapSubtitleEncoder: cfg.BitmapSubtitleEncoder,
+		ctx:                   ctx,
+		cancel:                cancel,
+		streams:               make(map[string]*runningStream),
+		startLocks:            make(map[string]*playbackStartLock),
 	}, nil
 }
 
@@ -229,7 +242,13 @@ func (m *Manager) ProbeSubtitles(ctx context.Context, playbackID string) ([]Subt
 	return supportedSubtitles(probe), nil
 }
 
-func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds float64, preferredLanguages []string) (Stream, error) {
+func (m *Manager) Start(
+	ctx context.Context,
+	playbackID string,
+	startSeconds float64,
+	preferredLanguages []string,
+	bitmapSubtitleIndex int,
+) (Stream, error) {
 	if !validPlaybackID(playbackID) {
 		return Stream{}, errors.New("invalid playback ID")
 	}
@@ -238,7 +257,9 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 	}
 	unlockStart := m.lockPlaybackStart(playbackID)
 	defer unlockStart()
-	if stream, matched, err := m.resumePreparedStream(ctx, playbackID, startSeconds, preferredLanguages); matched {
+	if stream, matched, err := m.resumePreparedStream(
+		ctx, playbackID, startSeconds, preferredLanguages, bitmapSubtitleIndex,
+	); matched {
 		return stream, err
 	}
 	m.Stop(playbackID)
@@ -259,6 +280,9 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 		audioLanguage = canonicalLanguage(audio.Tags.Language)
 	}
 	subtitles := supportedSubtitles(probe)
+	if bitmapSubtitleIndex >= 0 && !hasBitmapSubtitle(subtitles, bitmapSubtitleIndex) {
+		return Stream{}, fmt.Errorf("bitmap subtitle track %d is unavailable", bitmapSubtitleIndex)
+	}
 	timelineStart := startSeconds
 	if startSeconds > 0 {
 		if keyframeStart, err := m.probeTimelineStart(ctx, sourceURL, startSeconds); err != nil {
@@ -281,7 +305,7 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 	}
 
 	streamContext, cancel := context.WithCancel(m.ctx)
-	args := m.ffmpegArgs(sourceURL, dir, codec, timelineStart, audioIndex)
+	args := m.ffmpegArgs(sourceURL, dir, codec, timelineStart, audioIndex, bitmapSubtitleIndex)
 	command := exec.CommandContext(streamContext, m.ffmpegPath, args...)
 	command.Stdout = logFile
 	command.Stderr = logFile
@@ -290,21 +314,27 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 		logFile.Close()
 		return Stream{}, fmt.Errorf("start FFmpeg: %w", err)
 	}
+	outputCodec := codec
+	if bitmapSubtitleIndex >= 0 {
+		outputCodec = "h264"
+	}
 	stream := &runningStream{
 		info: Stream{
 			PlaybackID: playbackID, RequestedStartSeconds: startSeconds,
 			StartSeconds: timelineStart, DurationSeconds: duration,
-			VideoCodec: codec, Subtitles: subtitles,
+			VideoCodec: outputCodec, Subtitles: subtitles,
+			BurnedSubtitleIndex: optionalIndex(bitmapSubtitleIndex),
 		},
-		dir:            dir,
-		sourceURL:      sourceURL,
-		requestedStart: startSeconds,
-		ctx:            streamContext,
-		cancel:         cancel,
-		done:           make(chan struct{}),
-		command:        command,
-		languages:      append([]string(nil), preferredLanguages...),
-		subtitleIndex:  -1,
+		dir:                 dir,
+		sourceURL:           sourceURL,
+		requestedStart:      startSeconds,
+		ctx:                 streamContext,
+		cancel:              cancel,
+		done:                make(chan struct{}),
+		command:             command,
+		languages:           append([]string(nil), preferredLanguages...),
+		bitmapSubtitleIndex: bitmapSubtitleIndex,
+		subtitleIndex:       -1,
 	}
 	m.mu.Lock()
 	m.streams[playbackID] = stream
@@ -327,9 +357,9 @@ func (m *Manager) Start(ctx context.Context, playbackID string, startSeconds flo
 		m.Stop(playbackID)
 		return Stream{}, err
 	}
-	m.logger.Info("HLS stream ready", "playback_id", playbackID, "codec", codec,
+	m.logger.Info("HLS stream ready", "playback_id", playbackID, "codec", outputCodec,
 		"audio_stream_index", audioIndex, "audio_language", audioLanguage,
-		"text_subtitle_tracks", len(subtitles),
+		"subtitle_tracks", len(subtitles), "burned_subtitle_index", bitmapSubtitleIndex,
 		"requested_start_seconds", startSeconds, "timeline_start_seconds", timelineStart)
 	return stream.info, nil
 }
@@ -339,12 +369,14 @@ func (m *Manager) resumePreparedStream(
 	playbackID string,
 	startSeconds float64,
 	preferredLanguages []string,
+	bitmapSubtitleIndex int,
 ) (Stream, bool, error) {
 	m.mu.RLock()
 	stream := m.streams[playbackID]
 	m.mu.RUnlock()
 	if stream == nil || math.Abs(stream.requestedStart-startSeconds) > 0.5 ||
-		!equalStrings(stream.languages, preferredLanguages) {
+		!equalStrings(stream.languages, preferredLanguages) ||
+		stream.bitmapSubtitleIndex != bitmapSubtitleIndex {
 		return Stream{}, false, nil
 	}
 
@@ -400,12 +432,19 @@ func (m *Manager) resumePreparedStream(
 	return stream.info, true, nil
 }
 
-func (m *Manager) Prepared(playbackID string, startSeconds float64, preferredLanguages []string, minimumSeconds int) bool {
+func (m *Manager) Prepared(
+	playbackID string,
+	startSeconds float64,
+	preferredLanguages []string,
+	bitmapSubtitleIndex int,
+	minimumSeconds int,
+) bool {
 	m.mu.RLock()
 	stream := m.streams[playbackID]
 	m.mu.RUnlock()
 	if stream == nil || math.Abs(stream.requestedStart-startSeconds) > 0.5 ||
-		!equalStrings(stream.languages, preferredLanguages) {
+		!equalStrings(stream.languages, preferredLanguages) ||
+		stream.bitmapSubtitleIndex != bitmapSubtitleIndex {
 		return false
 	}
 	select {
@@ -495,7 +534,7 @@ func (m *Manager) StartSubtitle(_ context.Context, playbackID string, index int)
 	m.mu.RLock()
 	stream := m.streams[playbackID]
 	m.mu.RUnlock()
-	if stream == nil || !hasSubtitle(stream.info.Subtitles, index) {
+	if stream == nil || !hasTextSubtitle(stream.info.Subtitles, index) {
 		return os.ErrNotExist
 	}
 
@@ -748,7 +787,16 @@ func preferredAudioStream(probe mediaProbe, preferredLanguages []string) (mediaS
 func supportedSubtitles(probe mediaProbe) []SubtitleTrack {
 	var tracks []SubtitleTrack
 	for _, stream := range probe.Streams {
-		if stream.CodecType != "subtitle" || !isTextSubtitleCodec(stream.CodecName) {
+		if stream.CodecType != "subtitle" {
+			continue
+		}
+		kind := ""
+		switch {
+		case isTextSubtitleCodec(stream.CodecName):
+			kind = "text"
+		case isBitmapSubtitleCodec(stream.CodecName):
+			kind = "bitmap"
+		default:
 			continue
 		}
 		tracks = append(tracks, SubtitleTrack{
@@ -757,23 +805,50 @@ func supportedSubtitles(probe mediaProbe) []SubtitleTrack {
 			Title:    strings.TrimSpace(stream.Tags.Title),
 			Default:  stream.Disposition.Default != 0,
 			Forced:   stream.Disposition.Forced != 0,
+			Codec:    strings.ToLower(stream.CodecName),
+			Kind:     kind,
 		})
 	}
 	return tracks
 }
 
-func hasSubtitle(tracks []SubtitleTrack, index int) bool {
+func hasTextSubtitle(tracks []SubtitleTrack, index int) bool {
 	for _, track := range tracks {
-		if track.Index == index {
+		if track.Index == index && track.Kind == "text" {
 			return true
 		}
 	}
 	return false
 }
 
+func hasBitmapSubtitle(tracks []SubtitleTrack, index int) bool {
+	for _, track := range tracks {
+		if track.Index == index && track.Kind == "bitmap" {
+			return true
+		}
+	}
+	return false
+}
+
+func optionalIndex(index int) *int {
+	if index < 0 {
+		return nil
+	}
+	return &index
+}
+
 func isTextSubtitleCodec(codec string) bool {
 	switch strings.ToLower(codec) {
 	case "ass", "mov_text", "ssa", "subrip", "text", "webvtt":
+		return true
+	default:
+		return false
+	}
+}
+
+func isBitmapSubtitleCodec(codec string) bool {
+	switch strings.ToLower(codec) {
+	case "dvb_subtitle", "dvd_subtitle", "hdmv_pgs_subtitle", "xsub":
 		return true
 	default:
 		return false
@@ -803,14 +878,20 @@ func canonicalLanguage(language string) string {
 	return language
 }
 
-func (m *Manager) ffmpegArgs(sourceURL, dir, codec string, startSeconds float64, audioStreamIndex int) []string {
+func (m *Manager) ffmpegArgs(
+	sourceURL string,
+	dir string,
+	codec string,
+	startSeconds float64,
+	audioStreamIndex int,
+	bitmapSubtitleIndex int,
+) []string {
 	// Allow one segment beyond the target buffer to be packaged without rate limiting.
 	// Stream-copied video can only cut on keyframes, so segment lengths may exceed the target.
 	initialBurstSeconds := m.bufferSeconds + m.segmentSeconds
 	args := []string{
 		"-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
 		"-readrate", strconv.FormatFloat(m.readRate, 'f', -1, 64),
-		"-readrate_catchup", strconv.FormatFloat(m.readRate, 'f', -1, 64),
 		"-readrate_initial_burst", strconv.Itoa(initialBurstSeconds),
 	}
 	if startSeconds > 0 {
@@ -822,13 +903,24 @@ func (m *Manager) ffmpegArgs(sourceURL, dir, codec string, startSeconds float64,
 	if audioStreamIndex >= 0 {
 		audioMap = fmt.Sprintf("0:%d?", audioStreamIndex)
 	}
-	args = append(args,
-		"-i", sourceURL,
-		"-map", "0:v:0", "-map", audioMap, "-sn", "-dn",
-		"-c:v", "copy",
-	)
-	if codec == "hevc" {
-		args = append(args, "-tag:v", "hvc1")
+	args = append(args, "-i", sourceURL)
+	if bitmapSubtitleIndex >= 0 {
+		args = append(args,
+			"-filter_complex", fmt.Sprintf("[0:v:0][0:%d]overlay=eof_action=pass[v]", bitmapSubtitleIndex),
+			"-map", "[v]", "-map", audioMap, "-sn", "-dn",
+		)
+		args = append(args, m.bitmapVideoEncoderArgs()...)
+		args = append(args,
+			"-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%d)", m.segmentSeconds),
+		)
+	} else {
+		args = append(args,
+			"-map", "0:v:0", "-map", audioMap, "-sn", "-dn",
+			"-c:v", "copy",
+		)
+		if codec == "hevc" {
+			args = append(args, "-tag:v", "hvc1")
+		}
 	}
 	args = append(args,
 		"-c:a", "aac", "-b:a", "256k", "-ac", "2",
@@ -846,12 +938,25 @@ func (m *Manager) ffmpegArgs(sourceURL, dir, codec string, startSeconds float64,
 	return args
 }
 
+func (m *Manager) bitmapVideoEncoderArgs() []string {
+	if m.bitmapSubtitleEncoder == "h264_nvenc" {
+		return []string{
+			"-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
+			"-rc", "vbr", "-cq", "18", "-b:v", "0", "-maxrate", "16M", "-bufsize", "32M",
+			"-profile:v", "high", "-pix_fmt", "yuv420p",
+		}
+	}
+	return []string{
+		"-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+		"-profile:v", "high", "-pix_fmt", "yuv420p",
+	}
+}
+
 func (m *Manager) subtitleArgs(stream *runningStream, index int) []string {
 	initialBurstSeconds := m.bufferSeconds + m.segmentSeconds
 	args := []string{
 		"-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
 		"-readrate", strconv.FormatFloat(m.readRate, 'f', -1, 64),
-		"-readrate_catchup", strconv.FormatFloat(m.readRate, 'f', -1, 64),
 		"-readrate_initial_burst", strconv.Itoa(initialBurstSeconds),
 	}
 	if stream.requestedStart > 0 {
