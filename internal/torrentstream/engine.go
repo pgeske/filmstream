@@ -33,6 +33,11 @@ const (
 	defaultCleanupInterval = 30 * time.Second
 )
 
+var videoExtensions = map[string]bool{
+	".avi": true, ".m4v": true, ".mkv": true, ".mov": true,
+	".mp4": true, ".mpeg": true, ".mpg": true, ".ts": true, ".webm": true,
+}
+
 type Config struct {
 	DataDir         string
 	ListenPort      int
@@ -175,6 +180,10 @@ func New(cfg Config) (*Engine, error) {
 		unlock()
 		return nil, fmt.Errorf("create torrent data directory: %w", err)
 	}
+	if err := repairSparseCompletedMedia(torrentDataDir, cfg.Logger); err != nil {
+		unlock()
+		return nil, err
+	}
 	clientConfig := torrent.NewDefaultClientConfig()
 	clientConfig.DataDir = torrentDataDir
 	clientConfig.ListenPort = cfg.ListenPort
@@ -238,6 +247,38 @@ func acquireDataDirLock(dataDir string) (*os.File, error) {
 		return nil, fmt.Errorf("filmstream data directory is already in use: %s", dataDir)
 	}
 	return file, nil
+}
+
+// Part-file storage treats a final media path as complete after a restart. Demote
+// sparse final files so missing pieces are downloaded instead of served as zeroes.
+func repairSparseCompletedMedia(dataDir string, logger *slog.Logger) error {
+	return filepath.Walk(dataDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !info.Mode().IsRegular() || strings.HasSuffix(path, ".part") ||
+			!videoExtensions[strings.ToLower(filepath.Ext(path))] || info.Size() == 0 {
+			return nil
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || stat.Blocks*512*2 >= info.Size() {
+			return nil
+		}
+
+		partPath := path + ".part"
+		if _, err := os.Stat(partPath); err == nil {
+			if err := os.Remove(path); err != nil {
+				return fmt.Errorf("remove sparse completed torrent file %s: %w", path, err)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect partial torrent file %s: %w", partPath, err)
+		} else if err := os.Rename(path, partPath); err != nil {
+			return fmt.Errorf("demote sparse completed torrent file %s: %w", path, err)
+		}
+		logger.Warn("demoted sparse completed torrent file for recovery", "file", path,
+			"size_bytes", info.Size(), "allocated_bytes", stat.Blocks*512)
+		return nil
+	})
 }
 
 func (e *Engine) Close() error {
@@ -828,10 +869,6 @@ func (e *Engine) downloadMetainfo(ctx context.Context, torrentURL string) (*meta
 }
 
 func selectVideoFile(files []*torrent.File, fileHint string) (*torrent.File, error) {
-	videoExtensions := map[string]bool{
-		".avi": true, ".m4v": true, ".mkv": true, ".mov": true,
-		".mp4": true, ".mpeg": true, ".mpg": true, ".ts": true, ".webm": true,
-	}
 	var videos []*torrent.File
 	for _, file := range files {
 		if videoExtensions[strings.ToLower(filepath.Ext(file.Path()))] {

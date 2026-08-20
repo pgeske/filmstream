@@ -254,6 +254,38 @@ func TestCleanOnStartRemovesUnmanagedTorrentData(t *testing.T) {
 	}
 }
 
+func TestEngineDemotesSparseCompletedMediaBeforeRestore(t *testing.T) {
+	dataDir := t.TempDir()
+	videoPath := filepath.Join(dataDir, "torrents", "season", "episode.mkv")
+	if err := os.MkdirAll(filepath.Dir(videoPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Create(videoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Seek(16<<20, 0); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte{1}); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := newTestEngine(t, dataDir, Config{})
+	defer engine.Close()
+	if _, err := os.Stat(videoPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("sparse completed path still exists: %v", err)
+	}
+	if _, err := os.Stat(videoPath + ".part"); err != nil {
+		t.Fatalf("recovered partial path does not exist: %v", err)
+	}
+}
+
 func TestCleanOnCloseRemovesManagedTorrentData(t *testing.T) {
 	dataDir := t.TempDir()
 	engine := newTestEngine(t, dataDir, Config{CleanOnClose: true})
