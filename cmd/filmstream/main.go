@@ -77,12 +77,23 @@ func runServer(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	configPath := flags.String("config", os.Getenv("FILMSTREAM_CONFIG"), "path to config file")
 	torrentListenPort := flags.Int("torrent-listen-port", 0, "BitTorrent peer listen port (0 chooses an available port)")
+	bitmapSubtitleEncoder := flags.String(
+		"bitmap-subtitle-encoder", "libx264", "H.264 encoder used to burn bitmap subtitles",
+	)
+	ffmpegPath := flags.String("ffmpeg-path", "", "override the configured FFmpeg executable")
+	ffprobePath := flags.String("ffprobe-path", "", "override the configured FFprobe executable")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err
+	}
+	if *ffmpegPath != "" {
+		cfg.FFmpegPath = *ffmpegPath
+	}
+	if *ffprobePath != "" {
+		cfg.FFprobePath = *ffprobePath
 	}
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return err
@@ -131,15 +142,16 @@ func runServer(args []string) error {
 		return err
 	}
 	hlsManager, hlsErr := hls.New(hls.Config{
-		DataDir:        cfg.HLSDir,
-		FFmpegPath:     cfg.FFmpegPath,
-		FFprobePath:    cfg.FFprobePath,
-		SourceBaseURL:  sourceBaseURL,
-		StartupTimeout: time.Duration(cfg.HLSStartupSeconds) * time.Second,
-		BufferSeconds:  cfg.HLSBufferSeconds,
-		ReadRate:       cfg.HLSReadRate,
-		SegmentSeconds: cfg.HLSSegmentSeconds,
-		Logger:         logger,
+		DataDir:               cfg.HLSDir,
+		FFmpegPath:            cfg.FFmpegPath,
+		FFprobePath:           cfg.FFprobePath,
+		SourceBaseURL:         sourceBaseURL,
+		StartupTimeout:        time.Duration(cfg.HLSStartupSeconds) * time.Second,
+		BufferSeconds:         cfg.HLSBufferSeconds,
+		ReadRate:              cfg.HLSReadRate,
+		SegmentSeconds:        cfg.HLSSegmentSeconds,
+		BitmapSubtitleEncoder: *bitmapSubtitleEncoder,
+		Logger:                logger,
 	})
 	if hlsErr != nil {
 		logger.Warn("native HLS playback disabled", "error", hlsErr)

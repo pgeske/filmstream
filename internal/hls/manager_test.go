@@ -59,7 +59,7 @@ while :; do sleep 1; done
 	}
 	defer manager.Close()
 
-	stream, err := manager.Start(context.Background(), "playback-1", 120, []string{"en", "english"})
+	stream, err := manager.Start(context.Background(), "playback-1", 120, []string{"en", "english"}, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,17 +142,17 @@ while :; do sleep 1; done
 	}
 	defer manager.Close()
 
-	first, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"})
+	first, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.Park(t.Context(), first.PlaybackID, 4); err != nil {
 		t.Fatal(err)
 	}
-	if !manager.Prepared(first.PlaybackID, 0, []string{"en"}, 4) {
+	if !manager.Prepared(first.PlaybackID, 0, []string{"en"}, -1, 4) {
 		t.Fatal("parked stream was not reported as prepared")
 	}
-	second, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"})
+	second, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,14 +220,14 @@ while :; do sleep 1; done
 	}
 	defer manager.Close()
 
-	first, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"})
+	first, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.Park(t.Context(), first.PlaybackID, 4); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.Start(t.Context(), first.PlaybackID, 0, []string{"en"}); err != nil {
+	if _, err := manager.Start(t.Context(), first.PlaybackID, 0, []string{"en"}, -1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -283,7 +283,7 @@ while :; do sleep 1; done
 
 	firstResult := make(chan error, 1)
 	go func() {
-		_, startErr := manager.Start(t.Context(), "playback-1", 60, []string{"en"})
+		_, startErr := manager.Start(t.Context(), "playback-1", 60, []string{"en"}, -1)
 		firstResult <- startErr
 	}()
 	deadline := time.Now().Add(time.Second)
@@ -297,7 +297,7 @@ while :; do sleep 1; done
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	if _, err := manager.Start(t.Context(), "playback-1", 60, []string{"en"}); err != nil {
+	if _, err := manager.Start(t.Context(), "playback-1", 60, []string{"en"}, -1); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-firstResult; err != nil {
@@ -312,7 +312,7 @@ while :; do sleep 1; done
 	}
 }
 
-func TestManagerProbesTextSubtitlesWithoutStartingPlayback(t *testing.T) {
+func TestManagerProbesTextAndBitmapSubtitlesWithoutStartingPlayback(t *testing.T) {
 	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
 cat <<'JSON'
 {"streams":[{"index":2,"codec_name":"subrip","codec_type":"subtitle","tags":{"language":"eng","title":"SDH"}},{"index":3,"codec_name":"hdmv_pgs_subtitle","codec_type":"subtitle"}],"format":{"duration":"7200"}}
@@ -332,7 +332,9 @@ JSON
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tracks) != 1 || tracks[0].Index != 2 || tracks[0].Language != "en" || tracks[0].Title != "SDH" {
+	if len(tracks) != 2 || tracks[0].Index != 2 || tracks[0].Language != "en" ||
+		tracks[0].Title != "SDH" || tracks[0].Kind != "text" ||
+		tracks[1].Index != 3 || tracks[1].Kind != "bitmap" {
 		t.Fatalf("tracks = %+v", tracks)
 	}
 }
@@ -352,16 +354,16 @@ JSON
 		t.Fatal(err)
 	}
 	defer manager.Close()
-	if _, err := manager.Start(context.Background(), "playback-1", 0, nil); err == nil || !strings.Contains(err.Error(), "Dolby Vision") {
+	if _, err := manager.Start(context.Background(), "playback-1", 0, nil, -1); err == nil || !strings.Contains(err.Error(), "Dolby Vision") {
 		t.Fatalf("error = %v", err)
 	}
 }
 
 func TestFFmpegArgsPaceInputAndTagHEVC(t *testing.T) {
 	manager := &Manager{bufferSeconds: 16, readRate: 1.25, segmentSeconds: 4}
-	args := strings.Join(manager.ffmpegArgs("http://source", t.TempDir(), "hevc", 30, 2), " ")
+	args := strings.Join(manager.ffmpegArgs("http://source", t.TempDir(), "hevc", 30, 2, -1), " ")
 	for _, expected := range []string{
-		"-readrate 1.25", "-readrate_catchup 1.25", "-readrate_initial_burst 20", "-noaccurate_seek -ss 30.000", "-map 0:2?", "-c:v copy", "-tag:v hvc1", "-c:a aac",
+		"-readrate 1.25", "-readrate_initial_burst 20", "-noaccurate_seek -ss 30.000", "-map 0:2?", "-c:v copy", "-tag:v hvc1", "-c:a aac",
 	} {
 		if !strings.Contains(args, expected) {
 			t.Fatalf("FFmpeg arguments do not contain %q: %s", expected, args)
@@ -369,6 +371,25 @@ func TestFFmpegArgsPaceInputAndTagHEVC(t *testing.T) {
 	}
 	if strings.Contains(args, "-c:s") {
 		t.Fatalf("video packager includes subtitle conversion: %s", args)
+	}
+}
+
+func TestFFmpegArgsBurnBitmapSubtitlesWithNVENC(t *testing.T) {
+	manager := &Manager{
+		bufferSeconds: 16, readRate: 1.25, segmentSeconds: 4,
+		bitmapSubtitleEncoder: "h264_nvenc",
+	}
+	args := strings.Join(manager.ffmpegArgs("http://source", t.TempDir(), "hevc", 30, 2, 5), " ")
+	for _, expected := range []string{
+		"-filter_complex [0:v:0][0:5]overlay=eof_action=pass[v]", "-map [v]", "-map 0:2?",
+		"-c:v h264_nvenc", "-preset p5", "-cq 18", "-force_key_frames expr:gte(t,n_forced*4)",
+	} {
+		if !strings.Contains(args, expected) {
+			t.Fatalf("bitmap subtitle arguments do not contain %q: %s", expected, args)
+		}
+	}
+	if strings.Contains(args, "-c:v copy") || strings.Contains(args, "-tag:v hvc1") {
+		t.Fatalf("bitmap subtitle packager stream-copies video: %s", args)
 	}
 }
 
@@ -382,7 +403,7 @@ func TestSubtitleArgsAlignToKeyframeTimeline(t *testing.T) {
 	}
 	args := strings.Join(manager.subtitleArgs(stream, 4), " ")
 	for _, expected := range []string{
-		"-readrate_catchup 1.25", "-noaccurate_seek -ss 120.000", "-map 0:4", "-c:s webvtt",
+		"-readrate 1.25", "-noaccurate_seek -ss 120.000", "-map 0:4", "-c:s webvtt",
 		"-output_ts_offset 1.500", "-flush_packets 1 -f webvtt",
 	} {
 		if !strings.Contains(args, expected) {
@@ -446,7 +467,7 @@ esac
 	}
 }
 
-func TestSupportedSubtitlesFiltersImageTracksAndNormalizesLanguages(t *testing.T) {
+func TestSupportedSubtitlesIncludesImageTracksAndNormalizesLanguages(t *testing.T) {
 	probe := mediaProbe{Streams: []mediaStream{
 		{Index: 0, CodecName: "h264", CodecType: "video"},
 		{Index: 3, CodecName: "subrip", CodecType: "subtitle", Tags: struct {
@@ -456,7 +477,9 @@ func TestSupportedSubtitlesFiltersImageTracksAndNormalizesLanguages(t *testing.T
 		{Index: 4, CodecName: "hdmv_pgs_subtitle", CodecType: "subtitle"},
 	}}
 	tracks := supportedSubtitles(probe)
-	if len(tracks) != 1 || tracks[0].Index != 3 || tracks[0].Language != "en" || tracks[0].Title != "SDH" {
+	if len(tracks) != 2 || tracks[0].Index != 3 || tracks[0].Language != "en" ||
+		tracks[0].Title != "SDH" || tracks[0].Kind != "text" ||
+		tracks[1].Index != 4 || tracks[1].Kind != "bitmap" {
 		t.Fatalf("tracks = %+v", tracks)
 	}
 }

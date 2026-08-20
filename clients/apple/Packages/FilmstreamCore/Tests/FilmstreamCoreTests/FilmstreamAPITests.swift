@@ -34,16 +34,20 @@ import Testing
     #expect(recorder.paths == [
         "/v1/playbacks/prewarm",
         "/v1/playbacks",
+        "/v1/playbacks/playback-1/hls/subtitles",
         "/v1/playbacks/playback-1/hls",
         "/v1/playbacks",
+        "/v1/playbacks/playback-2/hls/subtitles",
         "/v1/playbacks/playback-2/hls",
     ])
-    #expect(recorder.startSeconds == [612.5, 612.5, 612.5, 612.5, 612.5])
+    #expect(recorder.startSeconds == [612.5, 612.5, -1, 612.5, 612.5, -1, 612.5])
     #expect(recorder.languages == [
         ["ja", "en", "english"],
         ["ja", "en", "english"],
         [],
+        [],
         ["ja", "en", "english"],
+        [],
         [],
     ])
 }
@@ -87,6 +91,8 @@ private final class APIRequestRecorder: @unchecked Sendable {
         case "/v1/playbacks":
             let response = #"{"id":"playback-\#(currentPlaybackCount)","name":"The Movie","file_name":"movie.mkv","file_size":1000,"stream_url":"https://filmstream.test/v1/playbacks/playback-\#(currentPlaybackCount)/stream"}"#
             return (201, Data(response.utf8))
+        case let path where path.hasSuffix("/hls/subtitles"):
+            return (200, Data("[]".utf8))
         case "/v1/playbacks/playback-1/hls":
             return (502, Data(#"{"error":"probe playback media: exit status 1"}"#.utf8))
         default:

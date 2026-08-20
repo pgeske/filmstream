@@ -371,11 +371,16 @@ public struct HLSSubtitleTrack: Codable, Hashable, Identifiable, Sendable {
     public let title: String?
     public let isDefault: Bool?
     public let isForced: Bool?
+    public let codec: String?
+    public let kind: String?
+
+    public var isBitmap: Bool { kind == "bitmap" }
 
     private enum CodingKeys: String, CodingKey {
         case index, language, title
         case isDefault = "default"
         case isForced = "forced"
+        case codec, kind
     }
 }
 
@@ -388,6 +393,7 @@ public struct HLSPlayback: Codable, Hashable, Identifiable, Sendable {
     public let durationSeconds: Double?
     public let videoCodec: String
     public let subtitles: [HLSSubtitleTrack]?
+    public let burnedSubtitleIndex: Int?
 
     private enum CodingKeys: String, CodingKey {
         case playbackID = "playback_id"
@@ -397,6 +403,7 @@ public struct HLSPlayback: Codable, Hashable, Identifiable, Sendable {
         case durationSeconds = "duration_seconds"
         case videoCodec = "video_codec"
         case subtitles
+        case burnedSubtitleIndex = "burned_subtitle_index"
     }
 }
 
