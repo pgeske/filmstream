@@ -140,7 +140,7 @@ The optional configuration file is `~/.config/filmstream/config.json`:
   "idle_grace_seconds": 120,
   "preferred_resolution": "1080p",
   "preferred_languages": ["en", "english"],
-  "playback_source_mode": "hybrid",
+  "playback_source_mode": "torrent_only",
   "player": "mpv",
   "resolver": {
     "provider": "openai-compatible",
@@ -188,7 +188,7 @@ Managed torrent data is stored beneath `<data_dir>/torrents`, with private resum
 
 Filmstream delegates NNTP article retrieval, yEnc decoding, archive mapping, and provider failover to an internal InfiniDysk service. Filmstream downloads the selected NZB from its Torznab endpoint, submits it through the SABnzbd-compatible API, waits for the virtual media tree, selects the largest supported video, and proxies authenticated WebDAV range requests through the existing playback URL. FFprobe and FFmpeg therefore use the same seekable HTTP contract for either source.
 
-`playback_source_mode` controls movie playback. `hybrid` strongly prefers compatible Usenet releases and falls back to cached or newly ranked torrents. `usenet_only` uses only NZBs for movies, while TV episodes still use torrents. `torrent_only` skips Usenet entirely. Explicit `--magnet` and `--torrent` inputs remain direct overrides.
+`playback_source_mode` controls movie playback and defaults to `torrent_only`. `torrent_only` uses BitTorrent for both movies and TV, does not initialize the Usenet backend, and clears cached NZBs and Usenet failure state at startup. `hybrid` strongly prefers compatible Usenet releases and falls back to cached or newly ranked torrents. `usenet_only` uses only NZBs for movies, while TV episodes still use torrents. Explicit `--magnet` and `--torrent` inputs remain direct overrides.
 
 TV browsing searches every torrent indexer for the requested season and caches the ranked results for ten minutes without mounting or downloading a torrent. Season and TV queries run concurrently, and an explicit episode query is skipped as soon as an eligible full-season pack is found. Playback uses only full-season packs when at least one valid pack is available for a completed season. For the currently airing season, it allows exact individual episodes until the published episode count indicates that the season is complete. Successful torrent metadata is cached under a season identity rather than an episode identity, so subsequent and prefetched episodes reuse the same release and select their own `SxxExx` file from that torrent.
 

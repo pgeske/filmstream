@@ -321,6 +321,30 @@ func (s *Store) SaveUsenet(
 	return entry, nil
 }
 
+func (s *Store) ClearUsenet() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entries, err := os.ReadDir(s.usenetDir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read Usenet playback cache directory: %w", err)
+	}
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) != ".nzb" {
+			continue
+		}
+		if err := os.Remove(filepath.Join(s.usenetDir, entry.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove cached NZB: %w", err)
+		}
+	}
+	for _, path := range []string{s.usenetPath, s.usenetFailuresPath} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove Usenet playback cache: %w", err)
+		}
+	}
+	return nil
+}
+
 func (s *Store) LoadUsenetFailures() (map[string]time.Time, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

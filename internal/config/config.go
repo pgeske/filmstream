@@ -114,7 +114,7 @@ func Defaults() Config {
 		IdleGraceSeconds:    defaultIdleGraceSeconds,
 		PreferredResolution: "1080p",
 		PreferredLanguages:  []string{"en", "english"},
-		PlaybackSourceMode:  PlaybackSourceHybrid,
+		PlaybackSourceMode:  PlaybackSourceTorrentOnly,
 		Player:              "mpv",
 		Indexers: []Indexer{
 			{

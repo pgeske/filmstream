@@ -101,6 +101,12 @@ func runServer(args []string) error {
 	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
 		return err
 	}
+	playbackStore := playbackcache.New(cfg.StateDir)
+	if cfg.PlaybackSourceMode == config.PlaybackSourceTorrentOnly {
+		if err := playbackStore.ClearUsenet(); err != nil {
+			return fmt.Errorf("clear Usenet playback cache: %w", err)
+		}
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	registry, err := indexer.NewRegistry(cfg.Indexers)
@@ -125,13 +131,16 @@ func runServer(args []string) error {
 	}
 	defer engine.Close()
 
-	usenetEngine, err := usenetstream.FromConfig(
-		cfg.Usenet,
-		time.Duration(cfg.IdleGraceSeconds)*time.Second,
-		logger,
-	)
-	if err != nil {
-		return err
+	var usenetEngine *usenetstream.Engine
+	if cfg.PlaybackSourceMode != config.PlaybackSourceTorrentOnly {
+		usenetEngine, err = usenetstream.FromConfig(
+			cfg.Usenet,
+			time.Duration(cfg.IdleGraceSeconds)*time.Second,
+			logger,
+		)
+		if err != nil {
+			return err
+		}
 	}
 	if usenetEngine != nil {
 		defer usenetEngine.Close()
@@ -184,7 +193,7 @@ func runServer(args []string) error {
 	apiServer.SetMetadataProvider(metadataProvider)
 	apiServer.SetRatingsProvider(ratingsProvider)
 	apiServer.SetHistoryStore(history.New(cfg.StateDir))
-	apiServer.SetPlaybackCache(playbackcache.New(cfg.StateDir))
+	apiServer.SetPlaybackCache(playbackStore)
 	if hlsManager != nil {
 		apiServer.SetHLSManager(hlsManager)
 	}
