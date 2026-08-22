@@ -24,7 +24,7 @@ func TestDefaultsMatchLocalMVP(t *testing.T) {
 	if cfg.PreferredResolution != "1080p" {
 		t.Fatalf("resolution = %q", cfg.PreferredResolution)
 	}
-	if cfg.PlaybackSourceMode != PlaybackSourceHybrid {
+	if cfg.PlaybackSourceMode != PlaybackSourceTorrentOnly {
 		t.Fatalf("playback source mode = %q", cfg.PlaybackSourceMode)
 	}
 	if cfg.HLSDir == "" || cfg.FFmpegPath != "ffmpeg" || cfg.FFprobePath != "ffprobe" ||
