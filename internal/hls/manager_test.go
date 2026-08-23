@@ -363,7 +363,9 @@ func TestFFmpegArgsPaceInputAndTagHEVC(t *testing.T) {
 	manager := &Manager{bufferSeconds: 16, readRate: 1.25, segmentSeconds: 4}
 	args := strings.Join(manager.ffmpegArgs("http://source", t.TempDir(), "hevc", 30, 2, -1), " ")
 	for _, expected := range []string{
-		"-readrate 1.25", "-readrate_initial_burst 20", "-noaccurate_seek -ss 30.000", "-map 0:2?", "-c:v copy", "-tag:v hvc1", "-c:a aac",
+		"-copyts -start_at_zero", "-readrate 1.25", "-readrate_initial_burst 20",
+		"-noaccurate_seek -ss 30.000", "-map 0:2?", "-c:v copy", "-tag:v hvc1",
+		"-c:a aac", "-output_ts_offset -30.000", "-avoid_negative_ts make_zero",
 	} {
 		if !strings.Contains(args, expected) {
 			t.Fatalf("FFmpeg arguments do not contain %q: %s", expected, args)
@@ -381,8 +383,10 @@ func TestFFmpegArgsBurnBitmapSubtitlesWithNVENC(t *testing.T) {
 	}
 	args := strings.Join(manager.ffmpegArgs("http://source", t.TempDir(), "hevc", 30, 2, 5), " ")
 	for _, expected := range []string{
-		"-filter_complex [0:v:0][0:5]overlay=eof_action=pass[v]", "-map [v]", "-map 0:2?",
-		"-c:v h264_nvenc", "-preset p5", "-cq 18", "-force_key_frames expr:gte(t,n_forced*4)",
+		"-copyts -start_at_zero", "-filter_complex [0:v:0][0:5]overlay=eof_action=pass[v]",
+		"-map [v]", "-map 0:2?", "-c:v h264_nvenc", "-preset p5", "-cq 18",
+		"-force_key_frames expr:if(isnan(prev_forced_t),1,gte(t,prev_forced_t+4))",
+		"-output_ts_offset -30.000",
 	} {
 		if !strings.Contains(args, expected) {
 			t.Fatalf("bitmap subtitle arguments do not contain %q: %s", expected, args)

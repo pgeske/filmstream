@@ -18,6 +18,7 @@ struct PlayerView: View {
 
     @StateObject private var controller: NativePlaybackController
     @State private var didClose = false
+    @State private var didSaveEndProgress = false
     @State private var isPlaybackChromeVisible = true
     @State private var isSubtitlePickerPresented = false
     @State private var isStartingNextEpisode = false
@@ -322,7 +323,7 @@ struct PlayerView: View {
         revealPlaybackChrome(autoHide: false)
 
         Task { @MainActor in
-            await reportProgress()
+            didSaveEndProgress = await reportProgress()
             do {
                 try await onPlayNext(nextEpisode)
             } catch {
@@ -350,9 +351,11 @@ struct PlayerView: View {
         didClose = true
         let position = controller.positionSeconds
         let duration = controller.durationSeconds
+        // Autoplay already saved completion; a second update would start a duplicate prewarm.
+        let shouldSaveProgress = !didSaveEndProgress
         controller.stop()
         Task {
-            if position > 0, duration > 0 {
+            if shouldSaveProgress, position > 0, duration > 0 {
                 _ = try? await api.updateProgress(
                     for: movie,
                     positionSeconds: position,
@@ -363,17 +366,23 @@ struct PlayerView: View {
         }
     }
 
-    private func reportProgress() async {
+    @discardableResult
+    private func reportProgress() async -> Bool {
         guard !controller.isSeeking,
               controller.positionSeconds > 0,
               controller.durationSeconds > 0 else {
-            return
+            return false
         }
-        _ = try? await api.updateProgress(
-            for: movie,
-            positionSeconds: controller.positionSeconds,
-            durationSeconds: controller.durationSeconds
-        )
+        do {
+            _ = try await api.updateProgress(
+                for: movie,
+                positionSeconds: controller.positionSeconds,
+                durationSeconds: controller.durationSeconds
+            )
+            return true
+        } catch {
+            return false
+        }
     }
 
     private func formatTime(_ seconds: Double) -> String {

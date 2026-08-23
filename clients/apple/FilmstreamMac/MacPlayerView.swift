@@ -17,6 +17,7 @@ struct MacPlayerView: View {
     @StateObject private var controller: MacPlaybackController
     @StateObject private var pictureInPicture = MacPictureInPictureController()
     @State private var didClose = false
+    @State private var didSaveEndProgress = false
     @State private var scrubPosition: Double?
     @State private var isFullScreen = false
     @State private var controlsAreVisible = true
@@ -465,7 +466,7 @@ struct MacPlayerView: View {
         keepControlsVisible()
 
         Task { @MainActor in
-            await reportProgress()
+            didSaveEndProgress = await reportProgress()
             do {
                 try await onPlayNext(nextEpisode)
             } catch {
@@ -480,9 +481,11 @@ struct MacPlayerView: View {
         didClose = true
         let position = controller.positionSeconds
         let duration = controller.durationSeconds
+        // Autoplay already saved completion; a second update would start a duplicate prewarm.
+        let shouldSaveProgress = !didSaveEndProgress
         controller.stop()
         Task {
-            if position > 0, duration > 0 {
+            if shouldSaveProgress, position > 0, duration > 0 {
                 _ = try? await api.updateProgress(
                     for: movie,
                     positionSeconds: position,
@@ -493,17 +496,23 @@ struct MacPlayerView: View {
         }
     }
 
-    private func reportProgress() async {
+    @discardableResult
+    private func reportProgress() async -> Bool {
         guard !controller.isSeeking,
               controller.positionSeconds > 0,
               controller.durationSeconds > 0 else {
-            return
+            return false
         }
-        _ = try? await api.updateProgress(
-            for: movie,
-            positionSeconds: controller.positionSeconds,
-            durationSeconds: controller.durationSeconds
-        )
+        do {
+            _ = try await api.updateProgress(
+                for: movie,
+                positionSeconds: controller.positionSeconds,
+                durationSeconds: controller.durationSeconds
+            )
+            return true
+        } catch {
+            return false
+        }
     }
 
     private func formatTime(_ seconds: Double) -> String {

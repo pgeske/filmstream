@@ -891,12 +891,14 @@ func (m *Manager) ffmpegArgs(
 	initialBurstSeconds := m.bufferSeconds + m.segmentSeconds
 	args := []string{
 		"-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
+		"-copyts", "-start_at_zero",
 		"-readrate", strconv.FormatFloat(m.readRate, 'f', -1, 64),
 		"-readrate_initial_burst", strconv.Itoa(initialBurstSeconds),
 	}
 	if startSeconds > 0 {
-		// Video is stream-copied while audio is transcoded. Keeping pre-roll for both
-		// prevents accurate input seeking from discarding audio before the first video keyframe.
+		// Preserve both streams' source timestamps through the keyframe seek, then shift
+		// the shared timeline to zero. Resetting either stream independently can desync
+		// stream-copied video from transcoded audio.
 		args = append(args, "-noaccurate_seek", "-ss", strconv.FormatFloat(startSeconds, 'f', 3, 64))
 	}
 	audioMap := "0:a:0?"
@@ -911,7 +913,10 @@ func (m *Manager) ffmpegArgs(
 		)
 		args = append(args, m.bitmapVideoEncoderArgs()...)
 		args = append(args,
-			"-force_key_frames", fmt.Sprintf("expr:gte(t,n_forced*%d)", m.segmentSeconds),
+			"-force_key_frames", fmt.Sprintf(
+				"expr:if(isnan(prev_forced_t),1,gte(t,prev_forced_t+%d))",
+				m.segmentSeconds,
+			),
 		)
 	} else {
 		args = append(args,
@@ -924,6 +929,13 @@ func (m *Manager) ffmpegArgs(
 	}
 	args = append(args,
 		"-c:a", "aac", "-b:a", "256k", "-ac", "2",
+	)
+	if startSeconds > 0 {
+		args = append(args,
+			"-output_ts_offset", strconv.FormatFloat(-startSeconds, 'f', 3, 64),
+		)
+	}
+	args = append(args,
 		"-avoid_negative_ts", "make_zero", "-max_muxing_queue_size", "2048",
 		"-f", "hls",
 		"-hls_time", strconv.Itoa(m.segmentSeconds),
