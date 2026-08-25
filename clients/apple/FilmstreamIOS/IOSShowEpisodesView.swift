@@ -10,6 +10,7 @@ struct IOSShowEpisodesView: View {
     @State private var activePlayback: IOSEpisodeBrowserPlaybackSession?
     @State private var isLoading = false
     @State private var preparingEpisodeID: String?
+    @State private var preparationStage: PlaybackPreparationStage?
     @State private var errorMessage: String?
 
     init(details: SeriesDetails) {
@@ -22,13 +23,38 @@ struct IOSShowEpisodesView: View {
             MobileTeaBackground()
 
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 16) {
+                LazyVStack(alignment: .leading, spacing: 18) {
                     seasonPicker
+
+                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                        Text(loadedSeason?.name ?? "Season \(selectedSeasonNumber)")
+                            .font(.title2.weight(.bold))
+                            .foregroundStyle(Color.mobileTeaCream)
+
+                        Spacer()
+
+                        if let preparationStage {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .tint(Color.mobileTeaAccent)
+                                Text(preparationStageLabel(preparationStage))
+                                    .font(.caption.weight(.bold))
+                                    .foregroundStyle(Color.mobileTeaAccentLight)
+                            }
+                        }
+                    }
 
                     if let errorMessage {
                         Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                             .font(.footnote.weight(.semibold))
                             .foregroundStyle(Color.mobileTeaAmber)
+                            .padding(13)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(
+                                Color.mobileTeaPanel.opacity(0.72),
+                                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            )
                     }
 
                     if isLoading {
@@ -51,7 +77,10 @@ struct IOSShowEpisodesView: View {
         }
         .navigationTitle("Episodes & More")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.visible, for: .navigationBar)
         .toolbarBackground(Color.mobileTeaBackground.opacity(0.94), for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
+        .toolbarColorScheme(.dark, for: .navigationBar)
         .task(id: selectedSeasonNumber) {
             await loadSelectedSeason()
         }
@@ -75,22 +104,67 @@ struct IOSShowEpisodesView: View {
     }
 
     private var seasonPicker: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Text(details.show.title)
-                .font(.system(size: 27, weight: .black, design: .rounded))
-                .foregroundStyle(Color.mobileTeaCream)
-                .lineLimit(2)
-
-            Picker("Season", selection: $selectedSeasonNumber) {
-                ForEach(details.seasons) { season in
-                    Text("\(season.name) · \(season.episodeCount) episodes")
-                        .tag(season.number)
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                MobileTeaStreamMark(size: 38)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(details.show.title)
+                        .font(.system(size: 27, weight: .black, design: .rounded))
+                        .foregroundStyle(Color.mobileTeaCream)
+                        .lineLimit(2)
+                    Text(details.show.seasonCountLabel ?? "Episodes")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color.mobileTeaMuted)
                 }
             }
-            .pickerStyle(.menu)
-            .tint(Color.mobileTeaAccentLight)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(details.seasons) { season in
+                        seasonButton(season)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func seasonButton(_ season: SeasonSummary) -> some View {
+        let isSelected = selectedSeasonNumber == season.number
+        return Button {
+            withAnimation(.snappy(duration: 0.2)) {
+                selectedSeasonNumber = season.number
+            }
+        } label: {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(season.name)
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(isSelected ? Color.mobileTeaBackground : Color.mobileTeaCream)
+                Text("\(season.episodeCount) episodes")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(
+                        isSelected
+                            ? Color.mobileTeaBackground.opacity(0.7)
+                            : Color.mobileTeaMuted
+                    )
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(
+                isSelected ? Color.mobileTeaAccentLight : Color.mobileTeaPanel.opacity(0.78),
+                in: RoundedRectangle(cornerRadius: 13, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    .stroke(
+                        isSelected ? Color.mobileTeaCream.opacity(0.28) : Color.mobileTeaCream.opacity(0.09),
+                        lineWidth: 1
+                    )
+            }
+        }
+        .buttonStyle(MobileCardButtonStyle())
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
     private func episodeCard(_ episode: Episode) -> some View {
@@ -105,10 +179,23 @@ struct IOSShowEpisodesView: View {
                     .overlay {
                         if preparingEpisodeID == episode.id {
                             ZStack {
-                                Color.black.opacity(0.5)
+                                Color.black.opacity(0.52)
                                 ProgressView()
-                                    .tint(.white)
+                                    .controlSize(.large)
+                                    .tint(Color.mobileTeaAccentLight)
                             }
+                        } else {
+                            Image(systemName: "play.fill")
+                                .font(.system(size: 18, weight: .bold))
+                                .foregroundStyle(Color.mobileTeaCream)
+                                .frame(width: 50, height: 50)
+                                .background(Color.mobileTeaBackground.opacity(0.84), in: Circle())
+                                .overlay {
+                                    Circle()
+                                        .stroke(Color.mobileTeaAccentLight.opacity(0.72), lineWidth: 1.5)
+                                }
+                                .shadow(color: .black.opacity(0.4), radius: 10, y: 5)
+                                .accessibilityHidden(true)
                         }
                     }
                     .overlay(alignment: .bottom) {
@@ -153,15 +240,20 @@ struct IOSShowEpisodesView: View {
             }
             .padding(13)
             .background(
-                Color.mobileTeaPanel.opacity(0.78),
+                LinearGradient(
+                    colors: [Color.mobileTeaPanelElevated.opacity(0.68), Color.mobileTeaPanel.opacity(0.72)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
                 in: RoundedRectangle(cornerRadius: 20, style: .continuous)
             )
             .overlay {
                 RoundedRectangle(cornerRadius: 20, style: .continuous)
                     .stroke(Color.mobileTeaCream.opacity(0.09), lineWidth: 1)
             }
+            .shadow(color: .black.opacity(0.16), radius: 10, y: 5)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(MobileCardButtonStyle())
         .disabled(preparingEpisodeID != nil)
     }
 
@@ -180,9 +272,21 @@ struct IOSShowEpisodesView: View {
         }
     }
 
+    private func preparationStageLabel(_ stage: PlaybackPreparationStage) -> String {
+        switch stage {
+        case .findingRelease:
+            "Finding Release…"
+        case .bufferingVideo:
+            "Buffering Episode…"
+        }
+    }
+
     private func preparePlayback(for episode: Episode) async {
         preparingEpisodeID = episode.id
-        defer { preparingEpisodeID = nil }
+        defer {
+            preparingEpisodeID = nil
+            preparationStage = nil
+        }
         let movie = episode.playbackMovie(in: details.show)
         let startSeconds = history(for: episode).flatMap {
             !$0.completed && $0.positionSeconds >= 30 ? $0.positionSeconds : nil
@@ -194,7 +298,7 @@ struct IOSShowEpisodesView: View {
             let prepared = try await model.preparePlayback(
                 for: movie,
                 startSeconds: startSeconds,
-                onStage: { _ in }
+                onStage: { preparationStage = $0 }
             )
             let nextEpisode = await nextEpisodeTask.value
             activePlayback = IOSEpisodeBrowserPlaybackSession(

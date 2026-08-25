@@ -48,7 +48,7 @@ struct IOSPlayerView: View {
                 .ignoresSafeArea()
                 .contentShape(Rectangle())
                 .onTapGesture {
-                    revealChrome()
+                    toggleChromeVisibility()
                 }
 
             if let subtitle = controller.activeSubtitleText {
@@ -88,21 +88,21 @@ struct IOSPlayerView: View {
                 .padding(24)
                 .frame(maxWidth: 330)
                 .background(.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 18))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(Color.mobileTeaCream.opacity(0.12), lineWidth: 1)
+                }
             } else if isStartingNextEpisode {
                 VStack(spacing: 12) {
-                    ProgressView()
-                        .controlSize(.large)
-                        .tint(Color.mobileTeaAccent)
+                    IOSPlaybackLoadingIndicator(size: 46)
                     Text("Starting \(nextEpisode?.label ?? "Next Episode")…")
                         .font(.headline)
                 }
                 .padding(24)
                 .background(.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 18))
             } else if controller.isWaiting {
-                ProgressView()
-                    .controlSize(.large)
-                    .tint(Color.mobileTeaAccent)
-                    .padding(22)
+                IOSPlaybackLoadingIndicator(size: 54)
+                    .padding(20)
                     .background(.black.opacity(0.58), in: Circle())
                     .allowsHitTesting(false)
             }
@@ -162,8 +162,13 @@ struct IOSPlayerView: View {
                 Image(systemName: "xmark")
                     .font(.headline.weight(.bold))
                     .frame(width: 44, height: 44)
-                    .background(.black.opacity(0.52), in: Circle())
+                    .background(.black.opacity(0.58), in: Circle())
+                    .overlay {
+                        Circle()
+                            .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                    }
             }
+            .buttonStyle(MobileCardButtonStyle())
             .accessibilityLabel("Close player")
 
             Text(movie.title)
@@ -200,8 +205,13 @@ struct IOSPlayerView: View {
                 Image(systemName: "captions.bubble")
                     .font(.headline)
                     .frame(width: 44, height: 44)
-                    .background(.black.opacity(0.52), in: Circle())
+                    .background(.black.opacity(0.58), in: Circle())
+                    .overlay {
+                        Circle()
+                            .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                    }
             }
+            .buttonStyle(MobileCardButtonStyle())
             .accessibilityLabel("Subtitles")
         }
         .foregroundStyle(.white)
@@ -299,8 +309,14 @@ struct IOSPlayerView: View {
                     prominent ? Color.mobileTeaAccent : Color.white.opacity(0.14),
                     in: Circle()
                 )
+                .overlay {
+                    Circle()
+                        .stroke(Color.white.opacity(prominent ? 0.1 : 0.16), lineWidth: 1)
+                }
+                .shadow(color: .black.opacity(0.24), radius: 8, y: 4)
                 .foregroundStyle(prominent ? Color.mobileTeaBackground : .white)
         }
+        .buttonStyle(MobileCardButtonStyle())
         .accessibilityLabel(label)
     }
 
@@ -325,6 +341,17 @@ struct IOSPlayerView: View {
         scrubPosition = nil
         controller.seek(to: target)
         revealChrome(autoHide: false)
+    }
+
+    private func toggleChromeVisibility() {
+        autoHideTask?.cancel()
+        if isChromeVisible {
+            withAnimation(.easeOut(duration: 0.2)) {
+                isChromeVisible = false
+            }
+        } else {
+            revealChrome()
+        }
     }
 
     private func revealChrome(autoHide: Bool = true) {
@@ -355,6 +382,7 @@ struct IOSPlayerView: View {
             withAnimation(.easeOut(duration: 0.25)) {
                 isChromeVisible = false
             }
+            autoHideTask = nil
         }
     }
 
@@ -437,6 +465,31 @@ struct IOSPlayerView: View {
             return String(format: "%d:%02d:%02d", hours, minutes, remainingSeconds)
         }
         return String(format: "%d:%02d", minutes, remainingSeconds)
+    }
+}
+
+private struct IOSPlaybackLoadingIndicator: View {
+    let size: CGFloat
+    @State private var isRotating = false
+
+    var body: some View {
+        Circle()
+            .trim(from: 0.08, to: 0.82)
+            .stroke(
+                Color.mobileTeaAccent,
+                style: StrokeStyle(lineWidth: max(4, size * 0.1), lineCap: .round)
+            )
+            .frame(width: size, height: size)
+            .rotationEffect(.degrees(isRotating ? 360 : 0))
+            .shadow(color: .black.opacity(0.6), radius: 10)
+            .animation(
+                .linear(duration: 0.9).repeatForever(autoreverses: false),
+                value: isRotating
+            )
+            .onAppear {
+                isRotating = true
+            }
+            .accessibilityLabel("Buffering")
     }
 }
 

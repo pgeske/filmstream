@@ -3,12 +3,15 @@ import SwiftUI
 
 struct IOSRootView: View {
     @Environment(IOSAppModel.self) private var model
+    @State private var selectedTab = IOSRootTab.home
 
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             NavigationStack {
-                IOSHomeView()
-                    .navigationDestination(for: Movie.self) { movie in
+                IOSHomeView {
+                    selectedTab = .search
+                }
+                .navigationDestination(for: Movie.self) { movie in
                         if movie.isShow {
                             IOSShowDetailView(show: movie)
                         } else {
@@ -19,6 +22,7 @@ struct IOSRootView: View {
             .tabItem {
                 Label("Home", systemImage: "house.fill")
             }
+            .tag(IOSRootTab.home)
 
             NavigationStack {
                 IOSSearchView()
@@ -33,23 +37,33 @@ struct IOSRootView: View {
             .tabItem {
                 Label("Search", systemImage: "magnifyingglass")
             }
+            .tag(IOSRootTab.search)
         }
         .tint(Color.mobileTeaAccent)
+        .toolbarBackground(Color.mobileTeaBackground.opacity(0.96), for: .tabBar)
+        .toolbarBackground(.visible, for: .tabBar)
+        .toolbarColorScheme(.dark, for: .tabBar)
         .task {
             await model.loadHome()
         }
     }
 }
 
+private enum IOSRootTab: Hashable {
+    case home
+    case search
+}
+
 struct IOSHomeView: View {
     @Environment(IOSAppModel.self) private var model
+    let onOpenSearch: () -> Void
 
     var body: some View {
         ZStack {
             MobileTeaBackground()
 
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 32) {
+                LazyVStack(alignment: .leading, spacing: 36) {
                     header
                     continueWatchingSection
                     ForEach(model.discoverySections) { section in
@@ -59,6 +73,16 @@ struct IOSHomeView: View {
                         Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                             .font(.footnote.weight(.semibold))
                             .foregroundStyle(Color.mobileTeaAmber)
+                            .padding(14)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(
+                                Color.mobileTeaPanel.opacity(0.72),
+                                in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            )
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                    .stroke(Color.mobileTeaAmber.opacity(0.24), lineWidth: 1)
+                            }
                             .padding(.horizontal, 18)
                     }
                     Text("Media data and images provided by TMDB.")
@@ -66,17 +90,14 @@ struct IOSHomeView: View {
                         .foregroundStyle(Color.mobileTeaMuted.opacity(0.75))
                         .padding(.horizontal, 18)
                 }
-                .padding(.top, 18)
-                .padding(.bottom, 30)
+                .padding(.top, 10)
+                .padding(.bottom, 110)
             }
             .refreshable {
                 await model.loadHome()
             }
         }
-        .navigationTitle("Home")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(Color.mobileTeaBackground.opacity(0.94), for: .navigationBar)
-        .toolbarBackground(.visible, for: .navigationBar)
+        .toolbar(.hidden, for: .navigationBar)
     }
 
     private var header: some View {
@@ -114,7 +135,7 @@ struct IOSHomeView: View {
                                     contentRating: model.ratings(for: movie)?.contentRating
                                 )
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(MobileCardButtonStyle())
                             .task(id: movie.id) {
                                 await model.loadRatings(for: movie)
                             }
@@ -122,7 +143,9 @@ struct IOSHomeView: View {
                     }
                     .padding(.horizontal, 18)
                     .padding(.vertical, 5)
+                    .scrollTargetLayout()
                 }
+                .scrollTargetBehavior(.viewAligned(limitBehavior: .alwaysByOne))
             }
         }
     }
@@ -143,7 +166,7 @@ struct IOSHomeView: View {
                                     contentRating: model.ratings(for: movie)?.contentRating
                                 )
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(MobileCardButtonStyle())
                             .task(id: movie.id) {
                                 await model.loadRatings(for: movie)
                             }
@@ -151,7 +174,9 @@ struct IOSHomeView: View {
                     }
                     .padding(.horizontal, 18)
                     .padding(.vertical, 5)
+                    .scrollTargetLayout()
                 }
+                .scrollTargetBehavior(.viewAligned(limitBehavior: .alwaysByOne))
             }
         }
     }
@@ -168,16 +193,28 @@ struct IOSHomeView: View {
     }
 
     private var emptyContinueWatching: some View {
-        HStack(spacing: 15) {
-            MobileTeaStreamMark(size: 50)
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Your next story starts here")
-                    .font(.headline)
-                    .foregroundStyle(Color.mobileTeaCream)
-                Text("Find a movie or show and TeaStream will remember your place.")
-                    .font(.caption)
-                    .foregroundStyle(Color.mobileTeaMuted)
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 15) {
+                MobileTeaStreamMark(size: 50)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Your next story starts here")
+                        .font(.headline)
+                        .foregroundStyle(Color.mobileTeaCream)
+                    Text("Find a movie or show and TeaStream will remember your place.")
+                        .font(.caption)
+                        .foregroundStyle(Color.mobileTeaMuted)
+                }
             }
+
+            Button(action: onOpenSearch) {
+                Label("Find Something", systemImage: "magnifyingglass")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(Color.mobileTeaBackground)
+                    .padding(.horizontal, 15)
+                    .padding(.vertical, 10)
+                    .background(Color.mobileTeaAccent, in: Capsule())
+            }
+            .buttonStyle(MobileCardButtonStyle())
         }
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)

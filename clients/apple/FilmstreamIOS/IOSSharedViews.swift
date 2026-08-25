@@ -87,11 +87,20 @@ struct MobileSectionHeader: View {
     }
 }
 
+struct MobileCardButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.84 : 1)
+            .scaleEffect(configuration.isPressed ? 0.975 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
 struct MobileMovieCard: View {
     let movie: Movie
     var progress: Double? = nil
     var contentRating: String? = nil
-    var width: CGFloat = 286
+    var width: CGFloat = 300
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -101,7 +110,20 @@ struct MobileMovieCard: View {
                 .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
                 .overlay {
                     RoundedRectangle(cornerRadius: 15, style: .continuous)
-                        .stroke(Color.mobileTeaAccentLight.opacity(0.22), lineWidth: 1)
+                        .stroke(Color.mobileTeaCream.opacity(0.13), lineWidth: 1)
+                }
+                .overlay(alignment: .topTrailing) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.black))
+                        .foregroundStyle(Color.mobileTeaCream)
+                        .frame(width: 30, height: 30)
+                        .background(Color.mobileTeaBackground.opacity(0.78), in: Circle())
+                        .overlay {
+                            Circle()
+                                .stroke(Color.mobileTeaCream.opacity(0.16), lineWidth: 1)
+                        }
+                        .padding(10)
+                        .accessibilityHidden(true)
                 }
                 .overlay(alignment: .bottom) {
                     if let progress, progress > 0 {
@@ -116,13 +138,13 @@ struct MobileMovieCard: View {
             Text(movie.title)
                 .font(.headline.weight(.bold))
                 .foregroundStyle(Color.mobileTeaCream)
-                .lineLimit(1)
+                .lineLimit(2, reservesSpace: true)
                 .frame(width: width, alignment: .leading)
 
             Text(movie.catalogMetadata)
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(Color.mobileTeaMuted)
-                .lineLimit(2)
+                .lineLimit(2, reservesSpace: true)
 
             HStack(spacing: 7) {
                 if let episodeLabel = movie.episodeLabel {
@@ -139,14 +161,13 @@ struct MobileMovieCard: View {
             }
             .font(.caption.weight(.semibold))
             .foregroundStyle(Color.mobileTeaMuted)
+            .frame(height: 16, alignment: .leading)
 
-            if let overview = movie.overview, !overview.isEmpty {
-                Text(overview)
-                    .font(.caption)
-                    .foregroundStyle(Color.mobileTeaCream.opacity(0.72))
-                    .lineLimit(2)
-                    .frame(width: width, alignment: .leading)
-            }
+            Text(movie.overview.flatMap { $0.isEmpty ? nil : $0 } ?? " ")
+                .font(.caption)
+                .foregroundStyle(Color.mobileTeaCream.opacity(0.72))
+                .lineLimit(2, reservesSpace: true)
+                .frame(width: width, alignment: .leading)
         }
         .frame(width: width, alignment: .leading)
         .contentShape(Rectangle())
@@ -184,7 +205,10 @@ private struct MobileShelfArtwork: View {
         }
         .overlay {
             LinearGradient(
-                colors: [.clear, Color.mobileTeaBackground.opacity(0.24)],
+                stops: [
+                    .init(color: .clear, location: 0.5),
+                    .init(color: Color.mobileTeaBackground.opacity(0.34), location: 1),
+                ],
                 startPoint: .top,
                 endPoint: .bottom
             )
@@ -347,6 +371,11 @@ struct MobileDetailButtonStyle: ButtonStyle {
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
                     .stroke(borderColor, lineWidth: 1)
             }
+            .shadow(
+                color: kind == .prominent ? Color.mobileTeaAccent.opacity(0.16) : .clear,
+                radius: 14,
+                y: 7
+            )
             .opacity(configuration.isPressed ? 0.82 : 1)
             .scaleEffect(configuration.isPressed ? 0.985 : 1)
             .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
