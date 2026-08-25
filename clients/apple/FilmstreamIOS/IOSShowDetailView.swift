@@ -17,6 +17,21 @@ struct IOSShowDetailView: View {
     private var history: WatchHistoryEntry? { model.history(for: show) }
     private var ratings: MovieRatings? { model.ratings(for: show) }
 
+    private var metadataSummary: String {
+        let currentShow = details?.show ?? show
+        var values: [String] = []
+        if let genre = currentShow.primaryGenre {
+            values.append(genre)
+        }
+        if let year = currentShow.year {
+            values.append(String(year))
+        }
+        if let seasonCount = currentShow.seasonCountLabel {
+            values.append(seasonCount)
+        }
+        return values.isEmpty ? "Show" : values.joined(separator: " • ")
+    }
+
     var body: some View {
         GeometryReader { geometry in
             ZStack {
@@ -33,9 +48,11 @@ struct IOSShowDetailView: View {
                 .ignoresSafeArea(edges: .top)
             }
         }
-        .navigationTitle(show.title)
+        .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(Color.mobileTeaBackground.opacity(0.9), for: .navigationBar)
+        .toolbar(.visible, for: .navigationBar)
+        .toolbarBackground(.hidden, for: .navigationBar)
+        .toolbarColorScheme(.dark, for: .navigationBar)
         .task(id: show.id) {
             await loadShow()
         }
@@ -76,6 +93,20 @@ struct IOSShowDetailView: View {
                     endPoint: .bottom
                 )
             }
+            .overlay {
+                LinearGradient(
+                    colors: [.black.opacity(0.42), .clear],
+                    startPoint: .top,
+                    endPoint: .center
+                )
+            }
+            .overlay {
+                LinearGradient(
+                    colors: [Color.mobileTeaBackground.opacity(0.34), .clear],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+            }
             .overlay(alignment: .bottomLeading) {
                 Text((details?.show ?? show).title)
                     .font(.system(size: 32, weight: .black, design: .rounded))
@@ -88,17 +119,23 @@ struct IOSShowDetailView: View {
 
     private var content: some View {
         VStack(alignment: .leading, spacing: 18) {
-            Text((details?.show ?? show).catalogMetadata)
+            Text(metadataSummary)
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(Color.mobileTeaMuted)
 
             HStack(spacing: 10) {
-                MobileRatingBadges(ratings: ratings)
-                if let selection = playbackSelection {
-                    Text(selection.episode.label)
-                        .font(.subheadline.weight(.bold))
-                        .foregroundStyle(Color.mobileTeaAccentLight)
+                if let contentRating = ratings?.contentRating {
+                    Text(contentRating)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Color.mobileTeaMuted)
                 }
+                MobileRatingBadges(ratings: ratings)
+            }
+
+            if let selection = playbackSelection {
+                Text("\(selection.isResume ? "Resume" : "Play") \(selection.episode.label)")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(Color.mobileTeaAccentLight)
             }
 
             if let overview = (details?.show ?? show).overview, !overview.isEmpty {
@@ -112,6 +149,12 @@ struct IOSShowDetailView: View {
                 Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                     .font(.footnote.weight(.semibold))
                     .foregroundStyle(Color.mobileTeaAmber)
+                    .padding(13)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        Color.mobileTeaPanel.opacity(0.72),
+                        in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    )
             }
 
             actionButtons
@@ -127,7 +170,8 @@ struct IOSShowDetailView: View {
                 actionLabel(
                     title: primaryButtonTitle,
                     systemImage: "play.fill",
-                    showsProgress: isLoading || isPreparing
+                    showsProgress: isLoading || isPreparing,
+                    progressTint: Color.mobileTeaBackground
                 )
             }
             .buttonStyle(MobileDetailButtonStyle(kind: .prominent))
@@ -185,12 +229,14 @@ struct IOSShowDetailView: View {
     private func actionLabel(
         title: String,
         systemImage: String,
-        showsProgress: Bool = false
+        showsProgress: Bool = false,
+        progressTint: Color = .mobileTeaCream
     ) -> some View {
         HStack(spacing: 11) {
             if showsProgress {
                 ProgressView()
                     .controlSize(.small)
+                    .tint(progressTint)
             } else {
                 Image(systemName: systemImage)
                     .frame(width: 20)

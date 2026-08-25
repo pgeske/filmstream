@@ -50,6 +50,7 @@ struct IOSSearchView: View {
         .tint(Color.mobileTeaAccent)
         .toolbarBackground(Color.mobileTeaBackground.opacity(0.94), for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
+        .toolbarColorScheme(.dark, for: .navigationBar)
         .task(id: query) {
             await searchAfterTypingPause()
         }
@@ -63,7 +64,7 @@ struct IOSSearchView: View {
                     NavigationLink(value: movie) {
                         MobileGridMovieCard(movie: movie)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(MobileCardButtonStyle())
                 }
             }
         } else if isSearching {
@@ -144,17 +145,26 @@ private struct MobileGridMovieCard: View {
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .stroke(Color.mobileTeaCream.opacity(0.12), lineWidth: 1)
                 }
+                .overlay(alignment: .topTrailing) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.black))
+                        .foregroundStyle(Color.mobileTeaCream)
+                        .frame(width: 27, height: 27)
+                        .background(Color.mobileTeaBackground.opacity(0.8), in: Circle())
+                        .padding(9)
+                        .accessibilityHidden(true)
+                }
                 .shadow(color: .black.opacity(0.3), radius: 8, y: 5)
 
             Text(movie.title)
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(Color.mobileTeaCream)
-                .lineLimit(3)
+                .lineLimit(2, reservesSpace: true)
 
             Text(movie.catalogMetadata)
                 .font(.caption)
-                .lineLimit(2)
-            .foregroundStyle(Color.mobileTeaMuted)
+                .foregroundStyle(Color.mobileTeaMuted)
+                .lineLimit(2, reservesSpace: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }

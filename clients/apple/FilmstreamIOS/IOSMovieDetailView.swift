@@ -19,6 +19,17 @@ struct IOSMovieDetailView: View {
         model.ratings(for: movie)
     }
 
+    private var metadataSummary: String {
+        var values = [movie.genreSummary ?? "Movie"]
+        if let year = movie.year {
+            values.append(String(year))
+        }
+        if let contentRating = ratings?.contentRating {
+            values.append(contentRating)
+        }
+        return values.joined(separator: " • ")
+    }
+
     var body: some View {
         GeometryReader { geometry in
             ZStack {
@@ -35,9 +46,11 @@ struct IOSMovieDetailView: View {
                 .ignoresSafeArea(edges: .top)
             }
         }
-        .navigationTitle(movie.title)
+        .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbarBackground(Color.mobileTeaBackground.opacity(0.9), for: .navigationBar)
+        .toolbar(.visible, for: .navigationBar)
+        .toolbarBackground(.hidden, for: .navigationBar)
+        .toolbarColorScheme(.dark, for: .navigationBar)
         .task(id: movie.id) {
             async let ratings: Void = model.loadRatings(for: movie)
             async let prewarm: Void = model.prewarmPlayback(
@@ -78,6 +91,13 @@ struct IOSMovieDetailView: View {
                     endPoint: .trailing
                 )
             }
+            .overlay {
+                LinearGradient(
+                    colors: [.black.opacity(0.42), .clear],
+                    startPoint: .top,
+                    endPoint: .center
+                )
+            }
             .overlay(alignment: .bottomLeading) {
                 Text(movie.title)
                     .font(.system(size: 32, weight: .black, design: .rounded))
@@ -90,24 +110,16 @@ struct IOSMovieDetailView: View {
 
     private var content: some View {
         VStack(alignment: .leading, spacing: 18) {
-            HStack(spacing: 9) {
-                Text(movie.genreSummary ?? "Movie")
-                if let year = movie.year {
-                    Text("•")
-                    Text(String(year))
-                }
-                if let contentRating = ratings?.contentRating {
-                    Text("•")
-                    Text(contentRating)
-                }
+            VStack(alignment: .leading, spacing: 6) {
+                Text(metadataSummary)
+                    .foregroundStyle(Color.mobileTeaMuted)
+
                 if let history, history.progress > 0 {
-                    Text("•")
                     Text("\(Int(history.progress * 100))% watched")
                         .foregroundStyle(Color.mobileTeaAccentLight)
                 }
             }
             .font(.subheadline.weight(.semibold))
-            .foregroundStyle(Color.mobileTeaMuted)
 
             MobileRatingBadges(ratings: ratings)
 
@@ -122,6 +134,12 @@ struct IOSMovieDetailView: View {
                 Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                     .font(.footnote.weight(.semibold))
                     .foregroundStyle(Color.mobileTeaAmber)
+                    .padding(13)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        Color.mobileTeaPanel.opacity(0.72),
+                        in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    )
             }
 
             actionButtons
@@ -144,7 +162,8 @@ struct IOSMovieDetailView: View {
                 actionLabel(
                     title: primaryButtonTitle,
                     systemImage: "play.fill",
-                    showsProgress: isPreparing
+                    showsProgress: isPreparing,
+                    progressTint: Color.mobileTeaBackground
                 )
             }
             .buttonStyle(MobileDetailButtonStyle(kind: .prominent))
@@ -186,12 +205,14 @@ struct IOSMovieDetailView: View {
     private func actionLabel(
         title: String,
         systemImage: String,
-        showsProgress: Bool = false
+        showsProgress: Bool = false,
+        progressTint: Color = .mobileTeaCream
     ) -> some View {
         HStack(spacing: 11) {
             if showsProgress {
                 ProgressView()
                     .controlSize(.small)
+                    .tint(progressTint)
             } else {
                 Image(systemName: systemImage)
                     .frame(width: 20)
