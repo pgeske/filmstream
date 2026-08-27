@@ -606,29 +606,66 @@ func (s *Server) continueWatchHistory(ctx context.Context, entries []history.Ent
 				seriesEntries = append(seriesEntries, candidate)
 			}
 		}
-		if resumable := firstResumableEpisode(seriesEntries); resumable != nil {
-			result = append(result, *resumable)
+		anchor, ok := latestMeaningfulEpisode(seriesEntries)
+		if !ok {
 			continue
 		}
-		if next, ok := s.nextUnwatchedEpisode(ctx, entry, seriesEntries); ok {
+		if anchor.CanContinue() {
+			result = append(result, anchor)
+			continue
+		}
+		if next, ok := s.nextEpisodeAfter(ctx, anchor, seriesEntries); ok {
 			result = append(result, next)
 		}
 	}
 	return result
 }
 
-func firstResumableEpisode(entries []history.Entry) *history.Entry {
-	for i := range entries {
-		if entries[i].CanContinue() {
-			return &entries[i]
+func latestMeaningfulEpisode(entries []history.Entry) (history.Entry, bool) {
+	var latest history.Entry
+	found := false
+	for _, entry := range entries {
+		if entry.SeasonNumber <= 0 || entry.EpisodeNumber <= 0 || (!entry.Completed && !entry.CanContinue()) {
+			continue
+		}
+		if !found || newerEpisodeActivity(entry, latest) {
+			latest = entry
+			found = true
 		}
 	}
-	return nil
+	return latest, found
 }
 
-func (s *Server) nextUnwatchedEpisode(
+func newerEpisodeActivity(candidate, current history.Entry) bool {
+	// A newer timestamp is explicit playback intent, including an older episode replay.
+	if !candidate.UpdatedAt.Equal(current.UpdatedAt) {
+		return candidate.UpdatedAt.After(current.UpdatedAt)
+	}
+	if comparison := compareEpisodePosition(
+		candidate.SeasonNumber, candidate.EpisodeNumber,
+		current.SeasonNumber, current.EpisodeNumber,
+	); comparison != 0 {
+		return comparison > 0
+	}
+	if candidate.Completed != current.Completed {
+		return candidate.Completed
+	}
+	if candidate.MediaID != current.MediaID {
+		return candidate.MediaID < current.MediaID
+	}
+	return candidate.ID < current.ID
+}
+
+func compareEpisodePosition(season, episode, otherSeason, otherEpisode int) int {
+	if season != otherSeason {
+		return season - otherSeason
+	}
+	return episode - otherEpisode
+}
+
+func (s *Server) nextEpisodeAfter(
 	ctx context.Context,
-	latest history.Entry,
+	anchor history.Entry,
 	entries []history.Entry,
 ) (history.Entry, bool) {
 	s.metadataMu.RLock()
@@ -637,27 +674,47 @@ func (s *Server) nextUnwatchedEpisode(
 	if !ok {
 		return history.Entry{}, false
 	}
-	show, err := provider.Show(ctx, latest.SeriesID)
+	show, err := provider.Show(ctx, anchor.SeriesID)
 	if err != nil {
 		return history.Entry{}, false
 	}
-	completed := make(map[string]bool)
-	for _, entry := range entries {
-		if entry.Completed {
-			completed[entry.MediaID] = true
+	showID := firstNonEmpty(show.ID, anchor.SeriesID)
+	seasonSummaries := append([]metadata.SeasonSummary(nil), show.Seasons...)
+	sort.Slice(seasonSummaries, func(i, j int) bool {
+		return seasonSummaries[i].Number < seasonSummaries[j].Number
+	})
+	today := time.Now().UTC().Format(time.DateOnly)
+	for _, summary := range seasonSummaries {
+		if summary.Number < anchor.SeasonNumber || (summary.AirDate != "" && summary.AirDate > today) {
+			continue
 		}
-	}
-	for _, summary := range show.Seasons {
-		season, err := provider.Season(ctx, show.ID, summary.Number)
+		season, err := provider.Season(ctx, showID, summary.Number)
 		if err != nil {
 			continue
 		}
-		for _, episode := range season.Episodes {
-			if completed[episode.ID] {
+		episodes := append([]metadata.Episode(nil), season.Episodes...)
+		sort.Slice(episodes, func(i, j int) bool {
+			return compareEpisodePosition(
+				episodes[i].SeasonNumber, episodes[i].EpisodeNumber,
+				episodes[j].SeasonNumber, episodes[j].EpisodeNumber,
+			) < 0
+		})
+		for _, episode := range episodes {
+			if episode.EpisodeNumber <= 0 || (episode.AirDate != "" && episode.AirDate > today) {
 				continue
 			}
-			return history.Entry{
-				ID:              latest.ID,
+			if compareEpisodePosition(
+				episode.SeasonNumber, episode.EpisodeNumber,
+				anchor.SeasonNumber, anchor.EpisodeNumber,
+			) <= 0 {
+				continue
+			}
+			saved, hasSaved := historyForEpisode(entries, episode)
+			if hasSaved && saved.Completed {
+				continue
+			}
+			next := history.Entry{
+				ID:              anchor.ID,
 				MediaID:         episode.ID,
 				MediaType:       string(metadata.MediaTypeShow),
 				Title:           show.Title,
@@ -667,16 +724,38 @@ func (s *Server) nextUnwatchedEpisode(
 				BackdropURL:     firstNonEmpty(episode.StillURL, show.BackdropURL),
 				Genres:          show.Genres,
 				NumberOfSeasons: show.NumberOfSeasons,
-				SeriesID:        show.ID,
+				SeriesID:        showID,
 				SeriesTitle:     show.Title,
 				SeasonNumber:    episode.SeasonNumber,
 				EpisodeNumber:   episode.EpisodeNumber,
 				EpisodeTitle:    episode.Title,
-				UpdatedAt:       latest.UpdatedAt,
-			}, true
+				UpdatedAt:       anchor.UpdatedAt,
+			}
+			if hasSaved && saved.CanContinue() {
+				next.PositionSeconds = saved.PositionSeconds
+				next.DurationSeconds = saved.DurationSeconds
+			}
+			return next, true
 		}
 	}
 	return history.Entry{}, false
+}
+
+func historyForEpisode(entries []history.Entry, episode metadata.Episode) (history.Entry, bool) {
+	var latest history.Entry
+	found := false
+	for _, entry := range entries {
+		matchesID := episode.ID != "" && entry.MediaID == episode.ID
+		matchesPosition := entry.SeasonNumber == episode.SeasonNumber && entry.EpisodeNumber == episode.EpisodeNumber
+		if !matchesID && !matchesPosition {
+			continue
+		}
+		if !found || newerEpisodeActivity(entry, latest) {
+			latest = entry
+			found = true
+		}
+	}
+	return latest, found
 }
 
 func (s *Server) enrichWatchHistory(ctx context.Context, entries []history.Entry) []history.Entry {

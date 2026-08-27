@@ -58,57 +58,159 @@ public struct FilmstreamAPI: Sendable {
         history: [WatchHistoryEntry]
     ) async throws -> EpisodePlaybackSelection {
         let showHistory = history
-            .filter { $0.seriesID == details.show.id }
-            .sorted { $0.updatedAt > $1.updatedAt }
-
-        if let resumable = showHistory.first(where: {
-            !$0.completed && $0.positionSeconds >= 30 && $0.seasonNumber != nil && $0.episodeNumber != nil
-        }),
-           let seasonNumber = resumable.seasonNumber,
-           let episodeNumber = resumable.episodeNumber {
-            let showSeason = try await season(seasonNumber, for: details.show.id)
-            if let episode = showSeason.episodes.first(where: { $0.episodeNumber == episodeNumber }) {
-                return EpisodePlaybackSelection(episode: episode, startSeconds: resumable.positionSeconds)
+            .filter {
+                $0.seriesID == details.show.id
+                    && $0.seasonNumber != nil
+                    && $0.episodeNumber != nil
+                    && ($0.completed || $0.positionSeconds >= 30)
             }
+            .sorted(by: Self.historyActivityComesBefore)
+        let today = Self.today
+        guard let anchor = showHistory.first,
+              let anchorSeason = anchor.seasonNumber,
+              let anchorEpisode = anchor.episodeNumber else {
+            return EpisodePlaybackSelection(
+                episode: try await firstAiredEpisode(in: details, by: today),
+                startSeconds: 0
+            )
         }
 
-        let completedIDs = Set(showHistory.filter(\.completed).compactMap(\.mediaID))
-        var firstEpisode: Episode?
-        for summary in details.seasons.sorted(by: { $0.number < $1.number }) {
+        for summary in details.seasons.sorted(by: { $0.number < $1.number })
+        where summary.number >= anchorSeason && Self.hasAired(summary.airDate, by: today) {
             let showSeason = try await season(summary.number, for: details.show.id)
-            if firstEpisode == nil {
-                firstEpisode = showSeason.episodes.first
-            }
-            if let episode = showSeason.episodes.first(where: { !completedIDs.contains($0.id) }) {
-                return EpisodePlaybackSelection(episode: episode, startSeconds: 0)
+            let episodes = showSeason.episodes
+                .filter { Self.hasAired($0.airDate, by: today) }
+                .sorted(by: Self.episodeComesBefore)
+            for episode in episodes {
+                let comparison = Self.compareEpisode(
+                    season: episode.seasonNumber,
+                    episode: episode.episodeNumber,
+                    toSeason: anchorSeason,
+                    toEpisode: anchorEpisode
+                )
+                if comparison == 0, !anchor.completed {
+                    return EpisodePlaybackSelection(
+                        episode: episode,
+                        startSeconds: anchor.positionSeconds
+                    )
+                }
+                guard comparison > 0 else { continue }
+                let saved = showHistory.first(where: {
+                    $0.mediaID == episode.id
+                        || ($0.seasonNumber == episode.seasonNumber
+                            && $0.episodeNumber == episode.episodeNumber)
+                })
+                guard saved?.completed != true else { continue }
+                let startSeconds = saved?.positionSeconds ?? 0
+                return EpisodePlaybackSelection(
+                    episode: episode,
+                    startSeconds: startSeconds >= 30 ? startSeconds : 0
+                )
             }
         }
-        guard let firstEpisode else {
-            throw FilmstreamError.decoding("This show has no available episodes.")
-        }
-        return EpisodePlaybackSelection(episode: firstEpisode, startSeconds: 0)
+        return EpisodePlaybackSelection(
+            episode: try await firstAiredEpisode(in: details, by: today),
+            startSeconds: 0
+        )
     }
 
     public func nextEpisode(
         after episode: Episode,
         in details: SeriesDetails
     ) async throws -> Episode? {
+        let today = Self.today
         for summary in details.seasons.sorted(by: { $0.number < $1.number })
-        where summary.number >= episode.seasonNumber {
+        where summary.number >= episode.seasonNumber && Self.hasAired(summary.airDate, by: today) {
             let showSeason = try await season(summary.number, for: details.show.id)
-            if summary.number == episode.seasonNumber {
-                if let next = showSeason.episodes.first(where: {
-                    $0.episodeNumber > episode.episodeNumber
-                }) {
-                    return next
-                }
-                continue
-            }
-            if let first = showSeason.episodes.first {
-                return first
+            let next = showSeason.episodes
+                .filter { Self.hasAired($0.airDate, by: today) }
+                .sorted(by: Self.episodeComesBefore)
+                .first(where: {
+                    Self.compareEpisode(
+                        season: $0.seasonNumber,
+                        episode: $0.episodeNumber,
+                        toSeason: episode.seasonNumber,
+                        toEpisode: episode.episodeNumber
+                    ) > 0
+                })
+            if let next {
+                return next
             }
         }
         return nil
+    }
+
+    private func firstAiredEpisode(
+        in details: SeriesDetails,
+        by today: String
+    ) async throws -> Episode {
+        for summary in details.seasons.sorted(by: { $0.number < $1.number })
+        where Self.hasAired(summary.airDate, by: today) {
+            let showSeason = try await season(summary.number, for: details.show.id)
+            let episode = showSeason.episodes
+                .filter { Self.hasAired($0.airDate, by: today) }
+                .sorted(by: Self.episodeComesBefore)
+                .first
+            if let episode {
+                return episode
+            }
+        }
+        throw FilmstreamError.decoding("This show has no available episodes.")
+    }
+
+    private static var today: String {
+        String(ISO8601DateFormatter().string(from: Date()).prefix(10))
+    }
+
+    private static func hasAired(_ airDate: String?, by today: String) -> Bool {
+        guard let airDate, !airDate.isEmpty else { return true }
+        return airDate <= today
+    }
+
+    private static func historyActivityComesBefore(
+        _ candidate: WatchHistoryEntry,
+        _ current: WatchHistoryEntry
+    ) -> Bool {
+        if candidate.updatedAt != current.updatedAt {
+            return candidate.updatedAt > current.updatedAt
+        }
+        let comparison = compareEpisode(
+            season: candidate.seasonNumber ?? 0,
+            episode: candidate.episodeNumber ?? 0,
+            toSeason: current.seasonNumber ?? 0,
+            toEpisode: current.episodeNumber ?? 0
+        )
+        if comparison != 0 {
+            return comparison > 0
+        }
+        if candidate.completed != current.completed {
+            return candidate.completed
+        }
+        if candidate.mediaID != current.mediaID {
+            return (candidate.mediaID ?? "") < (current.mediaID ?? "")
+        }
+        return candidate.id < current.id
+    }
+
+    private static func episodeComesBefore(_ candidate: Episode, _ current: Episode) -> Bool {
+        compareEpisode(
+            season: candidate.seasonNumber,
+            episode: candidate.episodeNumber,
+            toSeason: current.seasonNumber,
+            toEpisode: current.episodeNumber
+        ) < 0
+    }
+
+    private static func compareEpisode(
+        season: Int,
+        episode: Int,
+        toSeason otherSeason: Int,
+        toEpisode otherEpisode: Int
+    ) -> Int {
+        if season != otherSeason {
+            return season - otherSeason
+        }
+        return episode - otherEpisode
     }
 
     public func ratings(for movie: Movie) async throws -> MovieRatings {

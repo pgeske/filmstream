@@ -73,7 +73,10 @@ func (s *Store) List() ([]Entry, error) {
 		return nil, err
 	}
 	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].UpdatedAt.After(entries[j].UpdatedAt)
+		if !entries[i].UpdatedAt.Equal(entries[j].UpdatedAt) {
+			return entries[i].UpdatedAt.After(entries[j].UpdatedAt)
+		}
+		return entries[i].ID < entries[j].ID
 	})
 	return entries, nil
 }

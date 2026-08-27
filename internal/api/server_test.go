@@ -217,17 +217,24 @@ func (fakeMetadata) Show(_ context.Context, id string) (metadata.Show, error) {
 			ID: id, MediaType: metadata.MediaTypeShow, Title: "Top Rated Show",
 			OriginalLanguage: "ja", Year: 2020, NumberOfSeasons: 3,
 		},
-		Seasons: []metadata.SeasonSummary{{Number: 1, Name: "Season 1", EpisodeCount: 8}},
+		Seasons: []metadata.SeasonSummary{
+			{Number: 1, Name: "Season 1", EpisodeCount: 2},
+			{Number: 2, Name: "Season 2", EpisodeCount: 3},
+		},
 	}, nil
 }
 
 func (fakeMetadata) Season(_ context.Context, id string, number int) (metadata.Season, error) {
-	if id != "tmdb-tv:3" || number != 1 {
+	if id != "tmdb-tv:3" {
 		return metadata.Season{}, errors.New("season not found")
 	}
-	return metadata.Season{
-		SeriesID: id, SeriesTitle: "Top Rated Show", Number: number, Name: "Season 1",
-		Episodes: []metadata.Episode{
+	season := metadata.Season{
+		SeriesID: id, SeriesTitle: "Top Rated Show", Number: number,
+		Name: fmt.Sprintf("Season %d", number),
+	}
+	switch number {
+	case 1:
+		season.Episodes = []metadata.Episode{
 			{
 				ID: "tmdb-tv:3:s1:e1", SeriesID: id, SeriesTitle: "Top Rated Show",
 				SeasonNumber: 1, EpisodeNumber: 1, Title: "Pilot",
@@ -236,8 +243,26 @@ func (fakeMetadata) Season(_ context.Context, id string, number int) (metadata.S
 				ID: "tmdb-tv:3:s1:e2", SeriesID: id, SeriesTitle: "Top Rated Show",
 				SeasonNumber: 1, EpisodeNumber: 2, Title: "Second",
 			},
-		},
-	}, nil
+		}
+	case 2:
+		season.Episodes = []metadata.Episode{
+			{
+				ID: "tmdb-tv:3:s2:e1", SeriesID: id, SeriesTitle: "Top Rated Show",
+				SeasonNumber: 2, EpisodeNumber: 1, Title: "Season Two Premiere",
+			},
+			{
+				ID: "tmdb-tv:3:s2:e3", SeriesID: id, SeriesTitle: "Top Rated Show",
+				SeasonNumber: 2, EpisodeNumber: 3, Title: "Season Two Third",
+			},
+			{
+				ID: "tmdb-tv:3:s2:e4", SeriesID: id, SeriesTitle: "Top Rated Show",
+				SeasonNumber: 2, EpisodeNumber: 4, Title: "Future Episode", AirDate: "2999-01-01",
+			},
+		}
+	default:
+		return metadata.Season{}, errors.New("season not found")
+	}
+	return season, nil
 }
 
 func (airingMetadata) Search(_ context.Context, _ string) ([]metadata.Movie, error) {
@@ -1312,7 +1337,7 @@ func TestShowCatalogReturnsSeasonsAndEpisodes(t *testing.T) {
 	server := &Server{metadataProvider: fakeMetadata{}}
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/catalog/shows/tmdb-tv:3", nil))
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"number_of_seasons":3`) || !strings.Contains(response.Body.String(), `"episode_count":8`) {
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"number_of_seasons":3`) || !strings.Contains(response.Body.String(), `"episode_count":2`) {
 		t.Fatalf("show status = %d, body = %s", response.Code, response.Body.String())
 	}
 
@@ -1405,6 +1430,131 @@ func TestCompletedEpisodeContinuesWithFirstUnwatchedEpisode(t *testing.T) {
 	}
 }
 
+func TestRecentSeasonProgressDoesNotBackfillEarlierUnwatchedSeasons(t *testing.T) {
+	tests := []struct {
+		name             string
+		position         float64
+		wantMediaID      string
+		wantStartSeconds float64
+	}{
+		{name: "partial episode resumes", position: 500, wantMediaID: "tmdb-tv:3:s2:e1", wantStartSeconds: 500},
+		{name: "completed episode advances across a numbering gap", position: 950, wantMediaID: "tmdb-tv:3:s2:e3"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := history.New(t.TempDir())
+			_, err := store.RecordProgress(history.Entry{
+				MediaID: "tmdb-tv:3:s2:e1", MediaType: "show", Title: "Top Rated Show",
+				SeriesID: "tmdb-tv:3", SeriesTitle: "Top Rated Show", SeasonNumber: 2,
+				EpisodeNumber: 1, EpisodeTitle: "Season Two Premiere",
+				PositionSeconds: test.position, DurationSeconds: 1000,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries := requestContinueWatchHistory(t, &Server{historyStore: store, metadataProvider: fakeMetadata{}})
+			if len(entries) != 1 || entries[0].MediaID != test.wantMediaID || entries[0].PositionSeconds != test.wantStartSeconds {
+				t.Fatalf("continue entries = %+v", entries)
+			}
+		})
+	}
+}
+
+func TestCompletedEpisodeContinuesAcrossSeasonBoundary(t *testing.T) {
+	store := history.New(t.TempDir())
+	_, err := store.RecordProgress(history.Entry{
+		MediaID: "tmdb-tv:3:s1:e2", MediaType: "show", Title: "Top Rated Show",
+		SeriesID: "tmdb-tv:3", SeriesTitle: "Top Rated Show", SeasonNumber: 1,
+		EpisodeNumber: 2, EpisodeTitle: "Second", PositionSeconds: 950, DurationSeconds: 1000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := requestContinueWatchHistory(t, &Server{historyStore: store, metadataProvider: fakeMetadata{}})
+	if len(entries) != 1 || entries[0].MediaID != "tmdb-tv:3:s2:e1" {
+		t.Fatalf("continue entries = %+v", entries)
+	}
+}
+
+func TestEpisodeContinuationUsesLatestMeaningfulActivity(t *testing.T) {
+	old := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC)
+	recent := old.Add(time.Hour)
+	tests := []struct {
+		name      string
+		entries   []history.Entry
+		wantMedia string
+		wantStart float64
+	}{
+		{
+			name: "newer completion wins over stale partial progress",
+			entries: []history.Entry{
+				{ID: "s1-partial", MediaID: "tmdb-tv:3:s1:e2", SeriesID: "tmdb-tv:3", SeasonNumber: 1, EpisodeNumber: 2, PositionSeconds: 400, DurationSeconds: 1000, UpdatedAt: old},
+				{ID: "s2-complete", MediaID: "tmdb-tv:3:s2:e1", SeriesID: "tmdb-tv:3", SeasonNumber: 2, EpisodeNumber: 1, PositionSeconds: 950, DurationSeconds: 1000, Completed: true, UpdatedAt: recent},
+			},
+			wantMedia: "tmdb-tv:3:s2:e3",
+		},
+		{
+			name: "equal timestamps prefer later chronology",
+			entries: []history.Entry{
+				{ID: "s1-partial", MediaID: "tmdb-tv:3:s1:e2", SeriesID: "tmdb-tv:3", SeasonNumber: 1, EpisodeNumber: 2, PositionSeconds: 400, DurationSeconds: 1000, UpdatedAt: recent},
+				{ID: "s2-complete", MediaID: "tmdb-tv:3:s2:e1", SeriesID: "tmdb-tv:3", SeasonNumber: 2, EpisodeNumber: 1, PositionSeconds: 950, DurationSeconds: 1000, Completed: true, UpdatedAt: recent},
+			},
+			wantMedia: "tmdb-tv:3:s2:e3",
+		},
+		{
+			name: "recent partial replay resumes the older episode",
+			entries: []history.Entry{
+				{ID: "s2-complete", MediaID: "tmdb-tv:3:s2:e1", SeriesID: "tmdb-tv:3", SeasonNumber: 2, EpisodeNumber: 1, Completed: true, UpdatedAt: old},
+				{ID: "s1-replay", MediaID: "tmdb-tv:3:s1:e1", SeriesID: "tmdb-tv:3", SeasonNumber: 1, EpisodeNumber: 1, PositionSeconds: 300, DurationSeconds: 1000, UpdatedAt: recent},
+			},
+			wantMedia: "tmdb-tv:3:s1:e1", wantStart: 300,
+		},
+		{
+			name: "completed replay advances from the explicit replay anchor",
+			entries: []history.Entry{
+				{ID: "s2-complete", MediaID: "tmdb-tv:3:s2:e1", SeriesID: "tmdb-tv:3", SeasonNumber: 2, EpisodeNumber: 1, Completed: true, UpdatedAt: old},
+				{ID: "s1-replay", MediaID: "tmdb-tv:3:s1:e1", SeriesID: "tmdb-tv:3", SeasonNumber: 1, EpisodeNumber: 1, Completed: true, UpdatedAt: recent},
+			},
+			wantMedia: "tmdb-tv:3:s1:e2",
+		},
+	}
+	server := &Server{metadataProvider: fakeMetadata{}}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			entries := server.continueWatchHistory(t.Context(), test.entries)
+			if len(entries) != 1 || entries[0].MediaID != test.wantMedia || entries[0].PositionSeconds != test.wantStart {
+				t.Fatalf("continue entries = %+v", entries)
+			}
+		})
+	}
+}
+
+func TestCompletedEpisodeDoesNotContinueToUnairedEpisode(t *testing.T) {
+	entries := (&Server{metadataProvider: fakeMetadata{}}).continueWatchHistory(t.Context(), []history.Entry{{
+		ID: "s2-complete", MediaID: "tmdb-tv:3:s2:e3", SeriesID: "tmdb-tv:3",
+		SeasonNumber: 2, EpisodeNumber: 3, Completed: true, UpdatedAt: time.Now(),
+	}})
+	if len(entries) != 0 {
+		t.Fatalf("continue entries = %+v", entries)
+	}
+}
+
+func requestContinueWatchHistory(t *testing.T, server *Server) []history.Entry {
+	t.Helper()
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/watch-history?continue=true", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Entries []history.Entry `json:"entries"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	return payload.Entries
+}
+
 func TestEpisodeHistoryAndSeriesRemoval(t *testing.T) {
 	store := history.New(t.TempDir())
 	server := &Server{historyStore: store}
@@ -1430,6 +1580,9 @@ func TestEpisodeHistoryAndSeriesRemoval(t *testing.T) {
 	entries, err = store.List()
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("entries after series removal = %+v, error = %v", entries, err)
+	}
+	if entries = requestContinueWatchHistory(t, server); len(entries) != 0 {
+		t.Fatalf("continue entries after series removal = %+v", entries)
 	}
 }
 
