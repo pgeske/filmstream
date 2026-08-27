@@ -83,7 +83,7 @@ The home screens pair Continue Watching with mixed movie/show TMDB-powered Popul
 - `POST /v1/playbacks/{id}/hls` for incremental AVPlayer-compatible HLS;
 - `DELETE /v1/playbacks/{id}/hls` to stop packaging and remove temporary segments;
 - `GET /v1/watch-history?continue=true` for movie and next-episode home progress;
-- `GET /v1/watch-history` for first-unwatched episode selection;
+- `GET /v1/watch-history` for complete movie and episode progress;
 - `PUT /v1/watch-history` to sync movie or episode progress; and
 - `DELETE /v1/watch-history/{id}` to clear a movie or series resume point.
 
@@ -97,6 +97,6 @@ Configure the server's optional `metadata` provider with a TMDB API read token t
 
 Long cold starts distinguish Finding a Release from Buffering Video instead of showing one indefinite preparation state. Detail pages show only IMDb and Rotten Tomatoes scores; TMDB votes remain catalog-ranking metadata rather than user-facing ratings. Top Rated requires substantially more votes so established movies and shows are favored over obscure new entries.
 
-A movie with saved progress presents explicit Resume, Play from Beginning, and Remove from Continue Watching actions. A show resumes its active episode or selects the first unwatched episode, labels the primary action with `Sx Ex`, and adds Episodes & More. The episode browser uses a season sidebar on tvOS and platform-native touch or pointer layouts on iPhone and Mac. Removing a show clears progress for the series; playing it again starts fresh and resumes normal episode tracking.
+A movie with saved progress presents explicit Resume, Play from Beginning, and Remove from Continue Watching actions. A show anchors continuation to its latest meaningful playback activity: an unfinished episode resumes, while a completed episode advances to the next aired episode across gaps and season boundaries instead of backfilling earlier unwatched seasons. Explicitly replaying an older episode makes that newer activity the anchor. The primary action includes the selected `Sx Ex`, and Episodes & More opens the episode browser with a season sidebar on tvOS and platform-native touch or pointer layouts on iPhone and Mac. Removing a show clears all progress for the series; playing it again starts fresh and resumes normal episode tracking.
 
 Media data and images are provided by TMDB. This product uses the TMDB API but is not endorsed or certified by TMDB. External rating data is provided by OMDb.
