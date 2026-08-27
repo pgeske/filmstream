@@ -180,7 +180,9 @@ struct MacPlayerView: View {
                 } catch {
                     break
                 }
-                await reportProgress()
+                if !isStartingNextEpisode {
+                    await reportProgress()
+                }
             }
         }
     }
@@ -481,6 +483,7 @@ struct MacPlayerView: View {
         didClose = true
         let position = controller.positionSeconds
         let duration = controller.durationSeconds
+        let activeSubtitle = controller.selectedSubtitle
         // Autoplay already saved completion; a second update would start a duplicate prewarm.
         let shouldSaveProgress = !didSaveEndProgress
         controller.stop()
@@ -489,7 +492,8 @@ struct MacPlayerView: View {
                 _ = try? await api.updateProgress(
                     for: movie,
                     positionSeconds: position,
-                    durationSeconds: duration
+                    durationSeconds: duration,
+                    activeSubtitle: activeSubtitle
                 )
             }
             try? await api.stopNativePlayback(prepared.playback.id)
@@ -507,7 +511,8 @@ struct MacPlayerView: View {
             _ = try await api.updateProgress(
                 for: movie,
                 positionSeconds: controller.positionSeconds,
-                durationSeconds: controller.durationSeconds
+                durationSeconds: controller.durationSeconds,
+                activeSubtitle: controller.selectedSubtitle
             )
             return true
         } catch {
@@ -785,6 +790,7 @@ private final class MacPlaybackController: ObservableObject {
     private var seekTask: Task<Void, Never>?
     private var subtitleTask: Task<Void, Never>?
     private var subtitleSwitchTask: Task<Void, Never>?
+    private var playbackFailureTask: Task<Void, Never>?
     private var subtitleCues: [SubtitleCue] = []
     private var seekGeneration = 0
     private var seekOriginSeconds: Double
@@ -832,6 +838,7 @@ private final class MacPlaybackController: ObservableObject {
                 guard let self, !self.stopped, !self.isSeeking else { return }
                 switch player.timeControlStatus {
                 case .playing:
+                    self.cancelPlaybackFailure()
                     self.isPlaying = true
                     self.isWaiting = false
                     self.stateLabel = "Playing"
@@ -839,7 +846,9 @@ private final class MacPlaybackController: ObservableObject {
                     self.isPlaying = self.wantsToPlay
                     self.isWaiting = true
                     self.stateLabel = "Buffering…"
+                    self.schedulePlaybackFailure()
                 case .paused:
+                    self.cancelPlaybackFailure()
                     self.isPlaying = false
                     self.isWaiting = false
                     self.stateLabel = "Paused"
@@ -853,6 +862,7 @@ private final class MacPlaybackController: ObservableObject {
 
     func play() {
         guard !stopped else { return }
+        errorMessage = nil
         wantsToPlay = true
         isPlaying = true
         didReachEnd = false
@@ -916,11 +926,37 @@ private final class MacPlaybackController: ObservableObject {
 
     func selectSubtitle(_ track: HLSSubtitleTrack?) {
         selectedSubtitle = track
-        let defaults = UserDefaults.standard
-        defaults.set(track != nil, forKey: "filmstream.subtitles.enabled")
-        defaults.set(track?.language, forKey: "filmstream.subtitles.language")
-        defaults.set(track?.title, forKey: "filmstream.subtitles.title")
+        HLSSubtitleTrack.savePreference(track)
         switchSubtitleStreamIfNeeded()
+    }
+
+    private func schedulePlaybackFailure() {
+        guard playbackFailureTask == nil, wantsToPlay, !stopped else { return }
+        playbackFailureTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: NativePlaybackConfiguration.stallTimeout)
+            } catch {
+                return
+            }
+            guard let self,
+                  !self.stopped,
+                  self.wantsToPlay,
+                  self.player.timeControlStatus != .playing else {
+                return
+            }
+            self.wantsToPlay = false
+            self.isPlaying = false
+            self.isWaiting = false
+            self.stateLabel = "Unable to Play Stream"
+            self.errorMessage = "The stream did not begin playing. Close the player and try this episode again."
+            self.player.pause()
+            self.playbackFailureTask = nil
+        }
+    }
+
+    private func cancelPlaybackFailure() {
+        playbackFailureTask?.cancel()
+        playbackFailureTask = nil
     }
 
     func stop() {
@@ -933,6 +969,7 @@ private final class MacPlaybackController: ObservableObject {
         subtitleTask = nil
         subtitleSwitchTask?.cancel()
         subtitleSwitchTask = nil
+        cancelPlaybackFailure()
         if let itemEndObserver {
             NotificationCenter.default.removeObserver(itemEndObserver)
             self.itemEndObserver = nil
@@ -1147,15 +1184,7 @@ private final class MacPlaybackController: ObservableObject {
     }
 
     private static func preferredSubtitle(in tracks: [HLSSubtitleTrack]) -> HLSSubtitleTrack? {
-        let defaults = UserDefaults.standard
-        if defaults.object(forKey: "filmstream.subtitles.enabled") == nil {
-            return tracks.first(where: { $0.isForced == true })
-        }
-        guard defaults.bool(forKey: "filmstream.subtitles.enabled") else { return nil }
-        let language = defaults.string(forKey: "filmstream.subtitles.language")
-        let title = defaults.string(forKey: "filmstream.subtitles.title")
-        return tracks.first(where: { $0.language == language && $0.title == title })
-            ?? tracks.first(where: { $0.language == language })
+        HLSSubtitleTrack.savedPreference(in: tracks)
     }
 
     private func installItem(url: URL) {
@@ -1166,11 +1195,12 @@ private final class MacPlaybackController: ObservableObject {
         }
         didReachEnd = false
         let item = AVPlayerItem(url: url)
-        item.preferredForwardBufferDuration = 30
+        NativePlaybackConfiguration.configure(item)
         statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             Task { @MainActor in
                 guard let self, !self.stopped else { return }
                 if item.status == .failed {
+                    self.cancelPlaybackFailure()
                     self.isWaiting = false
                     self.isPlaying = false
                     self.wantsToPlay = false

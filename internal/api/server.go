@@ -69,6 +69,16 @@ type CreatePlaybackResponse struct {
 	Selected  *catalog.RankedCandidate `json:"selected,omitempty"`
 }
 
+type playbackSubtitleSelection struct {
+	Mode     string `json:"mode,omitempty"`
+	Index    int    `json:"index,omitempty"`
+	Language string `json:"language,omitempty"`
+	Title    string `json:"title,omitempty"`
+	Codec    string `json:"codec,omitempty"`
+	Default  bool   `json:"default,omitempty"`
+	Forced   bool   `json:"forced,omitempty"`
+}
+
 type playbackSession struct {
 	ID       string
 	Name     string
@@ -756,27 +766,33 @@ func (s *Server) updateWatchProgress(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 	var request struct {
-		MediaID         string   `json:"media_id,omitempty"`
-		MediaType       string   `json:"media_type,omitempty"`
-		Title           string   `json:"title"`
-		Year            int      `json:"year,omitempty"`
-		Overview        string   `json:"overview,omitempty"`
-		PosterURL       string   `json:"poster_url,omitempty"`
-		BackdropURL     string   `json:"backdrop_url,omitempty"`
-		Genres          []string `json:"genres,omitempty"`
-		NumberOfSeasons int      `json:"number_of_seasons,omitempty"`
-		SeriesID        string   `json:"series_id,omitempty"`
-		SeriesTitle     string   `json:"series_title,omitempty"`
-		SeasonNumber    int      `json:"season_number,omitempty"`
-		EpisodeNumber   int      `json:"episode_number,omitempty"`
-		EpisodeTitle    string   `json:"episode_title,omitempty"`
-		PositionSeconds float64  `json:"position_seconds"`
-		DurationSeconds float64  `json:"duration_seconds,omitempty"`
+		MediaID           string                    `json:"media_id,omitempty"`
+		MediaType         string                    `json:"media_type,omitempty"`
+		Title             string                    `json:"title"`
+		Year              int                       `json:"year,omitempty"`
+		Overview          string                    `json:"overview,omitempty"`
+		PosterURL         string                    `json:"poster_url,omitempty"`
+		BackdropURL       string                    `json:"backdrop_url,omitempty"`
+		Genres            []string                  `json:"genres,omitempty"`
+		NumberOfSeasons   int                       `json:"number_of_seasons,omitempty"`
+		SeriesID          string                    `json:"series_id,omitempty"`
+		SeriesTitle       string                    `json:"series_title,omitempty"`
+		SeasonNumber      int                       `json:"season_number,omitempty"`
+		EpisodeNumber     int                       `json:"episode_number,omitempty"`
+		EpisodeTitle      string                    `json:"episode_title,omitempty"`
+		PositionSeconds   float64                   `json:"position_seconds"`
+		DurationSeconds   float64                   `json:"duration_seconds,omitempty"`
+		SubtitleSelection playbackSubtitleSelection `json:"subtitle_selection,omitempty"`
 	}
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request: "+err.Error())
+		return
+	}
+	subtitleSelection, err := normalizedSubtitleSelection(request.SubtitleSelection)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	entry, err := s.historyStore.RecordProgress(history.Entry{
@@ -802,7 +818,7 @@ func (s *Server) updateWatchProgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if entry.SeriesID != "" {
-		go s.queueNextEpisodePrewarm(entry)
+		go s.queueNextEpisodePrewarm(entry, subtitleSelection)
 	}
 	writeJSON(w, http.StatusOK, entry)
 }

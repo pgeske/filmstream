@@ -376,6 +376,38 @@ public struct HLSSubtitleTrack: Codable, Hashable, Identifiable, Sendable {
 
     public var isBitmap: Bool { kind == "bitmap" }
 
+    public static func savedPreference(in tracks: [HLSSubtitleTrack]) -> HLSSubtitleTrack? {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: "filmstream.subtitles.enabled") == nil {
+            return tracks.first(where: { $0.isForced == true })
+        }
+        guard defaults.bool(forKey: "filmstream.subtitles.enabled") else { return nil }
+        let language = defaults.string(forKey: "filmstream.subtitles.language")
+        let title = defaults.string(forKey: "filmstream.subtitles.title")
+        let kind = defaults.string(forKey: "filmstream.subtitles.kind")
+        let selected: HLSSubtitleTrack?
+        if let kind {
+            selected = tracks.first(where: {
+                $0.kind == kind && $0.language == language && $0.title == title
+            }) ?? tracks.first(where: { $0.kind == kind && $0.language == language })
+                ?? tracks.first(where: { $0.language == language && $0.title == title })
+                ?? tracks.first(where: { $0.language == language })
+        } else {
+            selected = tracks.first(where: { $0.language == language && $0.title == title })
+                ?? tracks.first(where: { $0.language == language })
+            defaults.set(selected?.kind, forKey: "filmstream.subtitles.kind")
+        }
+        return selected
+    }
+
+    public static func savePreference(_ track: HLSSubtitleTrack?) {
+        let defaults = UserDefaults.standard
+        defaults.set(track != nil, forKey: "filmstream.subtitles.enabled")
+        defaults.set(track?.language, forKey: "filmstream.subtitles.language")
+        defaults.set(track?.title, forKey: "filmstream.subtitles.title")
+        defaults.set(track?.kind, forKey: "filmstream.subtitles.kind")
+    }
+
     private enum CodingKeys: String, CodingKey {
         case index, language, title
         case isDefault = "default"
@@ -440,8 +472,14 @@ public struct WatchProgress: Encodable, Sendable {
     public let episodeTitle: String?
     public let positionSeconds: Double
     public let durationSeconds: Double
+    private let subtitleSelection: WatchSubtitleSelection
 
-    public init(movie: Movie, positionSeconds: Double, durationSeconds: Double) {
+    public init(
+        movie: Movie,
+        positionSeconds: Double,
+        durationSeconds: Double,
+        activeSubtitle: HLSSubtitleTrack? = nil
+    ) {
         mediaID = movie.id
         mediaType = movie.mediaType
         title = movie.title
@@ -458,6 +496,7 @@ public struct WatchProgress: Encodable, Sendable {
         episodeTitle = movie.episodeTitle
         self.positionSeconds = positionSeconds
         self.durationSeconds = durationSeconds
+        subtitleSelection = WatchSubtitleSelection(track: activeSubtitle)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -474,5 +513,32 @@ public struct WatchProgress: Encodable, Sendable {
         case episodeTitle = "episode_title"
         case positionSeconds = "position_seconds"
         case durationSeconds = "duration_seconds"
+        case subtitleSelection = "subtitle_selection"
+    }
+}
+
+private struct WatchSubtitleSelection: Encodable, Sendable {
+    let mode: String
+    let index: Int?
+    let language: String?
+    let title: String?
+    let codec: String?
+    let isDefault: Bool
+    let isForced: Bool
+
+    init(track: HLSSubtitleTrack?) {
+        mode = track == nil ? "off" : (track?.isBitmap == true ? "bitmap" : "text")
+        index = track?.index
+        language = track?.language
+        title = track?.title
+        codec = track?.codec
+        isDefault = track?.isDefault == true
+        isForced = track?.isForced == true
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case mode, index, language, title, codec
+        case isDefault = "default"
+        case isForced = "forced"
     }
 }

@@ -75,18 +75,29 @@ type Manager struct {
 	logger                *slog.Logger
 	bitmapSubtitleEncoder string
 
-	ctx        context.Context
-	cancel     context.CancelFunc
-	mu         sync.RWMutex
-	streams    map[string]*runningStream
-	startMu    sync.Mutex
-	startLocks map[string]*playbackStartLock
-	closeOnce  sync.Once
+	ctx         context.Context
+	cancel      context.CancelFunc
+	mu          sync.RWMutex
+	streams     map[string]*runningStream
+	startMu     sync.Mutex
+	startLocks  map[string]*playbackStartLock
+	probeMu     sync.Mutex
+	probes      map[string]*playbackProbe
+	probeWG     sync.WaitGroup
+	probeClosed bool
+	closeOnce   sync.Once
 }
 
 type playbackStartLock struct {
 	mu   sync.Mutex
 	refs int
+}
+
+type playbackProbe struct {
+	done   chan struct{}
+	cancel context.CancelFunc
+	probe  mediaProbe
+	err    error
 }
 
 type runningStream struct {
@@ -206,6 +217,7 @@ func New(cfg Config) (*Manager, error) {
 		cancel:                cancel,
 		streams:               make(map[string]*runningStream),
 		startLocks:            make(map[string]*playbackStartLock),
+		probes:                make(map[string]*playbackProbe),
 	}, nil
 }
 
@@ -235,7 +247,7 @@ func (m *Manager) ProbeSubtitles(ctx context.Context, playbackID string) ([]Subt
 		return nil, errors.New("invalid playback ID")
 	}
 	sourceURL := m.sourceBaseURL + "/v1/playbacks/" + playbackID + "/stream"
-	probe, err := m.probe(ctx, sourceURL)
+	probe, err := m.probePlayback(ctx, playbackID, sourceURL)
 	if err != nil {
 		return nil, err
 	}
@@ -262,10 +274,10 @@ func (m *Manager) Start(
 	); matched {
 		return stream, err
 	}
-	m.Stop(playbackID)
+	m.stopPlaybackStream(playbackID)
 
 	sourceURL := m.sourceBaseURL + "/v1/playbacks/" + playbackID + "/stream"
-	probe, err := m.probe(ctx, sourceURL)
+	probe, err := m.probePlayback(ctx, playbackID, sourceURL)
 	if err != nil {
 		return Stream{}, err
 	}
@@ -400,7 +412,7 @@ func (m *Manager) resumePreparedStream(
 		if err := stream.command.Process.Signal(syscall.SIGCONT); err != nil {
 			stream.processMu.Unlock()
 			m.logger.Warn("resume prepared HLS stream", "playback_id", playbackID, "error", err)
-			m.Stop(playbackID)
+			m.stopPlaybackStream(playbackID)
 			return Stream{}, false, nil
 		}
 		stream.parked = false
@@ -418,7 +430,7 @@ func (m *Manager) resumePreparedStream(
 		if err := m.waitForPlaylistGrowth(ctx, stream, bufferedSegments); err != nil {
 			m.logger.Warn("prepared HLS source did not resume; rebuilding stream",
 				"playback_id", playbackID, "error", err)
-			m.Stop(playbackID)
+			m.stopPlaybackStream(playbackID)
 			return Stream{}, false, nil
 		}
 	}
@@ -459,6 +471,11 @@ func (m *Manager) Prepared(
 }
 
 func (m *Manager) Park(ctx context.Context, playbackID string, minimumSeconds int) error {
+	unlockStart := m.lockPlaybackStart(playbackID)
+	defer unlockStart()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m.mu.RLock()
 	stream := m.streams[playbackID]
 	m.mu.RUnlock()
@@ -474,6 +491,9 @@ func (m *Manager) Park(ctx context.Context, playbackID string, minimumSeconds in
 
 	stream.processMu.Lock()
 	defer stream.processMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m.mu.RLock()
 	isCurrent := m.streams[playbackID] == stream
 	m.mu.RUnlock()
@@ -602,6 +622,11 @@ func (m *Manager) AssetPath(playbackID, name string) (string, error) {
 }
 
 func (m *Manager) Stop(playbackID string) {
+	m.stopPlaybackStream(playbackID)
+	m.forgetProbe(playbackID)
+}
+
+func (m *Manager) stopPlaybackStream(playbackID string) {
 	m.mu.Lock()
 	stream := m.streams[playbackID]
 	delete(m.streams, playbackID)
@@ -653,6 +678,7 @@ func (m *Manager) stopSubtitleLocked(stream *runningStream) {
 func (m *Manager) Close() error {
 	m.closeOnce.Do(func() {
 		m.cancel()
+		m.closeProbes()
 		m.mu.RLock()
 		ids := make([]string, 0, len(m.streams))
 		for id := range m.streams {
@@ -667,6 +693,88 @@ func (m *Manager) Close() error {
 		}
 	})
 	return nil
+}
+
+func (m *Manager) probePlayback(
+	parent context.Context,
+	playbackID string,
+	sourceURL string,
+) (mediaProbe, error) {
+	if err := parent.Err(); err != nil {
+		return mediaProbe{}, err
+	}
+
+	m.probeMu.Lock()
+	if m.probeClosed {
+		m.probeMu.Unlock()
+		return mediaProbe{}, errors.New("HLS manager is closed")
+	}
+	cached := m.probes[playbackID]
+	if cached == nil {
+		probeContext, cancel := context.WithCancel(m.ctx)
+		cached = &playbackProbe{done: make(chan struct{}), cancel: cancel}
+		m.probes[playbackID] = cached
+		m.probeWG.Add(1)
+		go m.runPlaybackProbe(probeContext, playbackID, sourceURL, cached)
+	}
+	m.probeMu.Unlock()
+
+	select {
+	case <-parent.Done():
+		return mediaProbe{}, parent.Err()
+	case <-cached.done:
+		return cached.probe, cached.err
+	}
+}
+
+func (m *Manager) runPlaybackProbe(
+	ctx context.Context,
+	playbackID string,
+	sourceURL string,
+	cached *playbackProbe,
+) {
+	defer m.probeWG.Done()
+	probe, err := m.probe(ctx, sourceURL)
+
+	m.probeMu.Lock()
+	if m.probes[playbackID] != cached {
+		probe = mediaProbe{}
+		if err == nil {
+			err = context.Canceled
+		}
+	} else if err != nil {
+		delete(m.probes, playbackID)
+	}
+	cached.probe = probe
+	cached.err = err
+	cached.cancel()
+	close(cached.done)
+	m.probeMu.Unlock()
+}
+
+func (m *Manager) forgetProbe(playbackID string) {
+	m.probeMu.Lock()
+	cached := m.probes[playbackID]
+	delete(m.probes, playbackID)
+	m.probeMu.Unlock()
+	if cached != nil {
+		cached.cancel()
+	}
+}
+
+func (m *Manager) closeProbes() {
+	m.probeMu.Lock()
+	m.probeClosed = true
+	cached := make([]*playbackProbe, 0, len(m.probes))
+	for playbackID, probe := range m.probes {
+		delete(m.probes, playbackID)
+		cached = append(cached, probe)
+	}
+	m.probeMu.Unlock()
+	for _, probe := range cached {
+		probe.cancel()
+	}
+	m.probeWG.Wait()
 }
 
 func (m *Manager) probe(parent context.Context, sourceURL string) (mediaProbe, error) {

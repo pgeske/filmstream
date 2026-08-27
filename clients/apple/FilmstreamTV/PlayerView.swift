@@ -216,7 +216,9 @@ struct PlayerView: View {
                 } catch {
                     break
                 }
-                await reportProgress()
+                if !isStartingNextEpisode {
+                    await reportProgress()
+                }
             }
         }
     }
@@ -349,8 +351,10 @@ struct PlayerView: View {
     private func closePlayback() {
         guard !didClose else { return }
         didClose = true
+        let playbackID = controller.playbackID
         let position = controller.positionSeconds
         let duration = controller.durationSeconds
+        let activeSubtitle = controller.selectedSubtitle
         // Autoplay already saved completion; a second update would start a duplicate prewarm.
         let shouldSaveProgress = !didSaveEndProgress
         controller.stop()
@@ -359,10 +363,11 @@ struct PlayerView: View {
                 _ = try? await api.updateProgress(
                     for: movie,
                     positionSeconds: position,
-                    durationSeconds: duration
+                    durationSeconds: duration,
+                    activeSubtitle: activeSubtitle
                 )
             }
-            try? await api.stopNativePlayback(controller.playbackID)
+            try? await api.stopNativePlayback(playbackID)
         }
     }
 
@@ -377,7 +382,8 @@ struct PlayerView: View {
             _ = try await api.updateProgress(
                 for: movie,
                 positionSeconds: controller.positionSeconds,
-                durationSeconds: controller.durationSeconds
+                durationSeconds: controller.durationSeconds,
+                activeSubtitle: controller.selectedSubtitle
             )
             return true
         } catch {
@@ -643,6 +649,7 @@ private final class NativePlaybackController: ObservableObject {
     private var subtitleTask: Task<Void, Never>?
     private var subtitleSwitchTask: Task<Void, Never>?
     private var bufferingRecoveryTask: Task<Void, Never>?
+    private var playbackFailureTask: Task<Void, Never>?
     private var subtitleCues: [SubtitleCue] = []
     private var seekGeneration = 0
     private var seekOriginSeconds: Double
@@ -717,6 +724,7 @@ private final class NativePlaybackController: ObservableObject {
                 case .playing:
                     self.bufferingRecoveryTask?.cancel()
                     self.bufferingRecoveryTask = nil
+                    self.cancelPlaybackFailure()
                     self.isPlaying = true
                     self.isWaiting = false
                     self.stateLabel = "Playing"
@@ -725,9 +733,13 @@ private final class NativePlaybackController: ObservableObject {
                     self.isWaiting = true
                     self.stateLabel = self.isRecovering ? "Reconnecting…" : "Buffering…"
                     self.scheduleBufferingRecovery()
+                    self.schedulePlaybackFailure()
                 case .paused:
-                    self.bufferingRecoveryTask?.cancel()
-                    self.bufferingRecoveryTask = nil
+                    if !self.isRecovering {
+                        self.bufferingRecoveryTask?.cancel()
+                        self.bufferingRecoveryTask = nil
+                        self.cancelPlaybackFailure()
+                    }
                     self.isPlaying = false
                     self.isWaiting = self.isRecovering
                     self.stateLabel = self.isRecovering ? "Reconnecting…" : "Paused"
@@ -742,6 +754,7 @@ private final class NativePlaybackController: ObservableObject {
 
     func play() {
         guard !stopped else { return }
+        errorMessage = nil
         wantsToPlay = true
         isPlaying = true
         didReachEnd = false
@@ -860,6 +873,7 @@ private final class NativePlaybackController: ObservableObject {
         stateLabel = "Paused"
         bufferingRecoveryTask?.cancel()
         bufferingRecoveryTask = nil
+        cancelPlaybackFailure()
         player.pause()
     }
 
@@ -880,7 +894,7 @@ private final class NativePlaybackController: ObservableObject {
         guard wantsToPlay, !isRecovering, !isSeeking, !wasInterrupted else { return }
         bufferingRecoveryTask = Task { @MainActor [weak self] in
             do {
-                try await Task.sleep(for: .seconds(12))
+                try await Task.sleep(for: NativePlaybackConfiguration.recoveryDelay)
             } catch {
                 return
             }
@@ -892,15 +906,46 @@ private final class NativePlaybackController: ObservableObject {
                 return
             }
             await self.recoverPlayback(reusePreparedStream: false)
+            self.bufferingRecoveryTask = nil
         }
+    }
+
+    private func schedulePlaybackFailure() {
+        guard playbackFailureTask == nil, wantsToPlay, !stopped else { return }
+        playbackFailureTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: NativePlaybackConfiguration.stallTimeout)
+            } catch {
+                return
+            }
+            guard let self,
+                  !self.stopped,
+                  self.wantsToPlay,
+                  self.player.timeControlStatus != .playing else {
+                return
+            }
+            self.bufferingRecoveryTask?.cancel()
+            self.bufferingRecoveryTask = nil
+            self.isRecovering = false
+            self.wantsToPlay = false
+            self.isPlaying = false
+            self.isWaiting = false
+            self.stateLabel = "Unable to Play Stream"
+            self.errorMessage = "The stream did not begin playing. Close the player and try this episode again."
+            self.player.pause()
+            self.playbackFailureTask = nil
+        }
+    }
+
+    private func cancelPlaybackFailure() {
+        playbackFailureTask?.cancel()
+        playbackFailureTask = nil
     }
 
     private func recoverPlayback(reusePreparedStream: Bool) async {
         guard !stopped, !isRecovering else { return }
         isRecovering = true
         wasInterrupted = false
-        bufferingRecoveryTask?.cancel()
-        bufferingRecoveryTask = nil
         isWaiting = true
         stateLabel = "Reconnecting…"
         errorMessage = nil
@@ -965,22 +1010,20 @@ private final class NativePlaybackController: ObservableObject {
                 }
             }
         } catch {
-            guard !stopped else { return }
+            guard !Task.isCancelled, !stopped else { return }
             isRecovering = false
             isWaiting = false
             isPlaying = false
             wantsToPlay = false
             stateLabel = "Unable to Reconnect"
             errorMessage = error.localizedDescription
+            cancelPlaybackFailure()
         }
     }
 
     func selectSubtitle(_ track: HLSSubtitleTrack?) {
         selectedSubtitle = track
-        let defaults = UserDefaults.standard
-        defaults.set(track != nil, forKey: "filmstream.subtitles.enabled")
-        defaults.set(track?.language, forKey: "filmstream.subtitles.language")
-        defaults.set(track?.title, forKey: "filmstream.subtitles.title")
+        HLSSubtitleTrack.savePreference(track)
         switchSubtitleStreamIfNeeded()
     }
 
@@ -996,6 +1039,7 @@ private final class NativePlaybackController: ObservableObject {
         subtitleSwitchTask = nil
         bufferingRecoveryTask?.cancel()
         bufferingRecoveryTask = nil
+        cancelPlaybackFailure()
         deactivateMediaSession()
         if let itemEndObserver {
             NotificationCenter.default.removeObserver(itemEndObserver)
@@ -1254,15 +1298,7 @@ private final class NativePlaybackController: ObservableObject {
     }
 
     private static func preferredSubtitle(in tracks: [HLSSubtitleTrack]) -> HLSSubtitleTrack? {
-        let defaults = UserDefaults.standard
-        if defaults.object(forKey: "filmstream.subtitles.enabled") == nil {
-            return tracks.first(where: { $0.isForced == true })
-        }
-        guard defaults.bool(forKey: "filmstream.subtitles.enabled") else { return nil }
-        let language = defaults.string(forKey: "filmstream.subtitles.language")
-        let title = defaults.string(forKey: "filmstream.subtitles.title")
-        return tracks.first(where: { $0.language == language && $0.title == title })
-            ?? tracks.first(where: { $0.language == language })
+        HLSSubtitleTrack.savedPreference(in: tracks)
     }
 
     private func installItem(url: URL) {
@@ -1273,11 +1309,12 @@ private final class NativePlaybackController: ObservableObject {
         }
         didReachEnd = false
         let item = AVPlayerItem(url: url)
-        item.preferredForwardBufferDuration = 30
+        NativePlaybackConfiguration.configure(item)
         statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             Task { @MainActor in
                 guard let self, !self.stopped else { return }
                 if item.status == .failed {
+                    self.cancelPlaybackFailure()
                     self.isWaiting = false
                     self.isPlaying = false
                     self.wantsToPlay = false

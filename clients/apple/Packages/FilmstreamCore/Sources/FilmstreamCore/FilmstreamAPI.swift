@@ -192,7 +192,7 @@ public struct FilmstreamAPI: Sendable {
         var selectedBitmapIndex = bitmapSubtitleIndex
         if useSavedSubtitlePreference {
             let tracks = try await subtitleTracks(playbackID: playback.id)
-            let savedSubtitle = Self.savedSubtitle(in: tracks)
+            let savedSubtitle = HLSSubtitleTrack.savedPreference(in: tracks)
             selectedBitmapIndex = savedSubtitle?.isBitmap == true ? savedSubtitle?.index : nil
         }
         let hls: HLSPlayback = try await send(
@@ -221,7 +221,10 @@ public struct FilmstreamAPI: Sendable {
                 useSavedSubtitlePreference: useSavedSubtitlePreference
             )
         } catch let error as FilmstreamError {
-            guard case let .server(status, _) = error, status == 502 else { throw error }
+            guard case let .server(status, _) = error,
+                  status == 404 || status == 502 else {
+                throw error
+            }
             let replacement = try await createPlayback(for: movie, startSeconds: startSeconds)
             return try await prepareNativePlayback(
                 replacement,
@@ -241,18 +244,6 @@ public struct FilmstreamAPI: Sendable {
         request.httpMethod = "DELETE"
         request.timeoutInterval = 15
         let _: HealthResponse = try await send(request)
-    }
-
-    private static func savedSubtitle(in tracks: [HLSSubtitleTrack]) -> HLSSubtitleTrack? {
-        let defaults = UserDefaults.standard
-        if defaults.object(forKey: "filmstream.subtitles.enabled") == nil {
-            return tracks.first(where: { $0.isForced == true })
-        }
-        guard defaults.bool(forKey: "filmstream.subtitles.enabled") else { return nil }
-        let language = defaults.string(forKey: "filmstream.subtitles.language")
-        let title = defaults.string(forKey: "filmstream.subtitles.title")
-        return tracks.first(where: { $0.language == language && $0.title == title })
-            ?? tracks.first(where: { $0.language == language })
     }
 
     public func startSubtitle(playbackID: String, track: HLSSubtitleTrack) async throws {
@@ -300,7 +291,8 @@ public struct FilmstreamAPI: Sendable {
     public func updateProgress(
         for movie: Movie,
         positionSeconds: Double,
-        durationSeconds: Double
+        durationSeconds: Double,
+        activeSubtitle: HLSSubtitleTrack? = nil
     ) async throws -> WatchHistoryEntry {
         try await send(
             path: "v1/watch-history",
@@ -308,7 +300,8 @@ public struct FilmstreamAPI: Sendable {
             body: WatchProgress(
                 movie: movie,
                 positionSeconds: positionSeconds,
-                durationSeconds: durationSeconds
+                durationSeconds: durationSeconds,
+                activeSubtitle: activeSubtitle
             )
         )
     }
