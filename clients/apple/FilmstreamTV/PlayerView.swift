@@ -905,8 +905,8 @@ private final class NativePlaybackController: ObservableObject {
                   self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate else {
                 return
             }
-            await self.recoverPlayback(reusePreparedStream: false)
             self.bufferingRecoveryTask = nil
+            await self.recoverPlayback(reusePreparedStream: false)
         }
     }
 
