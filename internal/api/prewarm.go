@@ -13,6 +13,7 @@ import (
 
 	"github.com/pgeske/filmstream/internal/catalog"
 	"github.com/pgeske/filmstream/internal/history"
+	"github.com/pgeske/filmstream/internal/hls"
 	"github.com/pgeske/filmstream/internal/metadata"
 )
 
@@ -24,22 +25,25 @@ const (
 )
 
 type playbackPrewarmTarget struct {
-	request  CreatePlaybackRequest
-	source   string
-	priority bool
-	seed     *CreatePlaybackResponse
+	request           CreatePlaybackRequest
+	source            string
+	priority          bool
+	seed              *CreatePlaybackResponse
+	subtitleSelection playbackSubtitleSelection
 }
 
 type playbackPrewarmState struct {
-	target        playbackPrewarmTarget
-	playbackReady chan struct{}
-	response      CreatePlaybackResponse
-	err           error
-	claimed       bool
-	bufferReady   bool
-	bufferedAt    time.Time
-	cancel        context.CancelFunc
-	parkCancel    context.CancelFunc
+	target              playbackPrewarmTarget
+	playbackReady       chan struct{}
+	response            CreatePlaybackResponse
+	err                 error
+	claimed             bool
+	bufferReady         bool
+	bufferedAt          time.Time
+	bitmapSubtitleIndex int
+	cancel              context.CancelFunc
+	parkCancel          context.CancelFunc
+	parkDone            chan struct{}
 }
 
 func (s *Server) StartPlaybackPrewarmer(ctx context.Context, baseURL string) {
@@ -100,7 +104,7 @@ func (s *Server) claimPrewarmedPlayback(ctx context.Context, request CreatePlayb
 	}
 	s.prewarmMu.Lock()
 	state := s.prewarmStates[key]
-	if state == nil || !matchingPrewarmTarget(state.target.request, request) {
+	if state == nil || !matchingPrewarmRequest(state.target.request, request) {
 		s.prewarmMu.Unlock()
 		return CreatePlaybackResponse{}, false
 	}
@@ -116,18 +120,32 @@ func (s *Server) claimPrewarmedPlayback(ctx context.Context, request CreatePlayb
 	s.prewarmMu.Lock()
 	state = s.prewarmStates[key]
 	if state == nil || state.err != nil || state.response.ID == "" ||
-		!matchingPrewarmTarget(state.target.request, request) {
+		!matchingPrewarmRequest(state.target.request, request) {
 		s.prewarmMu.Unlock()
 		return CreatePlaybackResponse{}, false
 	}
 	state.claimed = true
-	if state.parkCancel != nil {
-		state.parkCancel()
-	}
+	parkCancel := state.parkCancel
+	parkDone := state.parkDone
 	delete(s.prewarmStates, key)
 	response := state.response
 	s.prewarmMu.Unlock()
 
+	if parkCancel != nil {
+		parkCancel()
+	}
+	if parkDone != nil {
+		select {
+		case <-parkDone:
+		case <-ctx.Done():
+			state.cancel()
+			go func() {
+				<-parkDone
+				s.stopPreparedPlayback(response.ID)
+			}()
+			return CreatePlaybackResponse{}, false
+		}
+	}
 	if !s.playbackExists(response.ID) {
 		return CreatePlaybackResponse{}, false
 	}
@@ -150,7 +168,7 @@ func (s *Server) queuePlaybackPrewarm(target playbackPrewarmTarget) {
 		s.prewarmMu.Unlock()
 		return
 	}
-	if existing := s.prewarmStates[key]; existing != nil && matchingPrewarmTarget(existing.target.request, target.request) {
+	if existing := s.prewarmStates[key]; existing != nil && matchingQueuedPrewarmTarget(existing.target, target) {
 		if existing.response.ID == "" || !existing.bufferReady {
 			s.prewarmMu.Unlock()
 			return
@@ -163,12 +181,19 @@ func (s *Server) queuePlaybackPrewarm(target playbackPrewarmTarget) {
 	stalePlaybackID := ""
 	if existing := s.prewarmStates[key]; existing != nil {
 		stalePlaybackID = existing.response.ID
+		// A subtitle-mode change only needs new HLS packaging, not another source session.
+		if target.seed == nil && existing.bufferReady && stalePlaybackID != "" &&
+			matchingPrewarmRequest(existing.target.request, target.request) {
+			seed := existing.response
+			target.seed = &seed
+		}
 		delete(s.prewarmStates, key)
 		existing.cancel()
 	}
 	stateContext, cancel := context.WithCancel(s.prewarmContext)
 	state := &playbackPrewarmState{
 		target: target, playbackReady: make(chan struct{}), cancel: cancel,
+		bitmapSubtitleIndex: -1,
 	}
 	s.prewarmStates[key] = state
 	s.prewarmMu.Unlock()
@@ -208,19 +233,27 @@ func (s *Server) runPlaybackPrewarm(ctx context.Context, key string, state *play
 		}
 		return
 	}
+	bitmapSubtitleIndex := s.bitmapSubtitleIndexForPrewarm(
+		ctx, response.ID, state.target.subtitleSelection,
+	)
 	s.prewarmMu.Lock()
+	state.bitmapSubtitleIndex = bitmapSubtitleIndex
 	claimed := state.claimed
 	s.prewarmMu.Unlock()
 	if claimed || ctx.Err() != nil {
 		return
 	}
 
+	hlsRequest := map[string]any{"start_seconds": state.target.request.StartSeconds}
+	if bitmapSubtitleIndex >= 0 {
+		hlsRequest["bitmap_subtitle_index"] = bitmapSubtitleIndex
+	}
 	var stream any
 	if err := s.prewarmJSON(
 		ctx,
 		http.MethodPost,
 		fmt.Sprintf("/v1/playbacks/%s/hls", response.ID),
-		map[string]float64{"start_seconds": state.target.request.StartSeconds},
+		hlsRequest,
 		&stream,
 		false,
 	); err != nil {
@@ -235,6 +268,7 @@ func (s *Server) runPlaybackPrewarm(ctx context.Context, key string, state *play
 		return
 	}
 	parkContext, parkCancel := context.WithCancel(ctx)
+	parkDone := make(chan struct{})
 	s.prewarmMu.Lock()
 	if state.claimed || s.prewarmStates[key] != state {
 		s.prewarmMu.Unlock()
@@ -242,6 +276,7 @@ func (s *Server) runPlaybackPrewarm(ctx context.Context, key string, state *play
 		return
 	}
 	state.parkCancel = parkCancel
+	state.parkDone = parkDone
 	s.prewarmMu.Unlock()
 	var parked map[string]string
 	err := s.prewarmJSON(
@@ -255,6 +290,8 @@ func (s *Server) runPlaybackPrewarm(ctx context.Context, key string, state *play
 	parkCancel()
 	s.prewarmMu.Lock()
 	state.parkCancel = nil
+	state.parkDone = nil
+	close(parkDone)
 	claimed = state.claimed
 	if err == nil && s.prewarmStates[key] == state && !claimed {
 		state.bufferReady = true
@@ -355,9 +392,116 @@ func (s *Server) prewarmedPlaybackAvailable(state *playbackPrewarmState) bool {
 		state.response.ID,
 		state.target.request.StartSeconds,
 		languages,
-		-1,
+		state.bitmapSubtitleIndex,
 		prewarmBufferSeconds,
 	)
+}
+
+func normalizedSubtitleSelection(
+	selection playbackSubtitleSelection,
+) (playbackSubtitleSelection, error) {
+	mode := strings.ToLower(strings.TrimSpace(selection.Mode))
+	switch mode {
+	case "", "off":
+		return playbackSubtitleSelection{Mode: "off"}, nil
+	case "text":
+		return playbackSubtitleSelection{Mode: "text"}, nil
+	case "bitmap":
+		if selection.Index < 0 {
+			return playbackSubtitleSelection{}, errors.New("invalid bitmap subtitle selection")
+		}
+		selection.Mode = mode
+		selection.Language = strings.ToLower(strings.TrimSpace(selection.Language))
+		selection.Title = strings.TrimSpace(selection.Title)
+		selection.Codec = strings.ToLower(strings.TrimSpace(selection.Codec))
+		return selection, nil
+	default:
+		return playbackSubtitleSelection{}, fmt.Errorf("invalid subtitle selection mode %q", mode)
+	}
+}
+
+func matchingBitmapSubtitleSelection(left, right playbackSubtitleSelection) bool {
+	leftBitmap := strings.EqualFold(strings.TrimSpace(left.Mode), "bitmap")
+	rightBitmap := strings.EqualFold(strings.TrimSpace(right.Mode), "bitmap")
+	if !leftBitmap || !rightBitmap {
+		return leftBitmap == rightBitmap
+	}
+	leftLanguage := normalizedSubtitleMetadata(left.Language)
+	rightLanguage := normalizedSubtitleMetadata(right.Language)
+	leftTitle := normalizedSubtitleMetadata(left.Title)
+	rightTitle := normalizedSubtitleMetadata(right.Title)
+	if leftLanguage != rightLanguage || leftTitle != rightTitle ||
+		normalizedSubtitleMetadata(left.Codec) != normalizedSubtitleMetadata(right.Codec) ||
+		left.Default != right.Default || left.Forced != right.Forced {
+		return false
+	}
+	return leftLanguage != "" || leftTitle != "" || left.Index == right.Index
+}
+
+func (s *Server) bitmapSubtitleIndexForPrewarm(
+	ctx context.Context,
+	playbackID string,
+	selection playbackSubtitleSelection,
+) int {
+	if !strings.EqualFold(strings.TrimSpace(selection.Mode), "bitmap") {
+		return -1
+	}
+	s.hlsMu.RLock()
+	manager := s.hlsManager
+	s.hlsMu.RUnlock()
+	if manager == nil {
+		return -1
+	}
+	tracks, err := manager.ProbeSubtitles(ctx, playbackID)
+	if err != nil {
+		return -1
+	}
+	return matchingBitmapSubtitleIndex(tracks, selection)
+}
+
+func matchingBitmapSubtitleIndex(
+	tracks []hls.SubtitleTrack,
+	selection playbackSubtitleSelection,
+) int {
+	if !strings.EqualFold(strings.TrimSpace(selection.Mode), "bitmap") {
+		return -1
+	}
+	language := normalizedSubtitleMetadata(selection.Language)
+	title := normalizedSubtitleMetadata(selection.Title)
+	codec := normalizedSubtitleMetadata(selection.Codec)
+	languageFallback := -1
+	for _, track := range tracks {
+		if track.Kind != "bitmap" {
+			continue
+		}
+		trackLanguage := normalizedSubtitleMetadata(track.Language)
+		trackTitle := normalizedSubtitleMetadata(track.Title)
+		trackCodec := normalizedSubtitleMetadata(track.Codec)
+		if language != "" {
+			if trackLanguage != language {
+				continue
+			}
+			if title != "" && trackTitle == title {
+				return track.Index
+			}
+			if languageFallback < 0 {
+				languageFallback = track.Index
+			}
+			continue
+		}
+		if title != "" && trackTitle == title {
+			return track.Index
+		}
+		if title == "" && track.Index == selection.Index &&
+			(codec == "" || trackCodec == codec) {
+			return track.Index
+		}
+	}
+	return languageFallback
+}
+
+func normalizedSubtitleMetadata(value string) string {
+	return strings.ToLower(strings.Join(strings.Fields(value), " "))
 }
 
 func (s *Server) prewarmJSON(
@@ -451,7 +595,10 @@ func (s *Server) originalAudioLanguages(ctx context.Context, seriesID string) []
 	return languages
 }
 
-func (s *Server) queueNextEpisodePrewarm(current history.Entry) {
+func (s *Server) queueNextEpisodePrewarm(
+	current history.Entry,
+	subtitleSelection playbackSubtitleSelection,
+) {
 	s.prewarmMu.Lock()
 	ctx := s.prewarmContext
 	s.prewarmMu.Unlock()
@@ -463,6 +610,7 @@ func (s *Server) queueNextEpisodePrewarm(current history.Entry) {
 	if next, ok := s.nextEpisodeForPrewarming(lookupContext, current); ok {
 		target := s.prewarmTargetForHistory(lookupContext, next)
 		target.priority = true
+		target.subtitleSelection = subtitleSelection
 		s.queuePlaybackPrewarm(target)
 	}
 }
@@ -565,10 +713,15 @@ func playbackPrewarmKey(request CreatePlaybackRequest) string {
 	return ""
 }
 
-func matchingPrewarmTarget(left, right CreatePlaybackRequest) bool {
+func matchingPrewarmRequest(left, right CreatePlaybackRequest) bool {
 	return playbackPrewarmKey(left) == playbackPrewarmKey(right) &&
 		absFloat(left.StartSeconds-right.StartSeconds) <= 1 &&
 		equalStringLists(left.Preferences.Languages, right.Preferences.Languages)
+}
+
+func matchingQueuedPrewarmTarget(left, right playbackPrewarmTarget) bool {
+	return matchingPrewarmRequest(left.request, right.request) &&
+		matchingBitmapSubtitleSelection(left.subtitleSelection, right.subtitleSelection)
 }
 
 func equalStringLists(left, right []string) bool {

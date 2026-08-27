@@ -239,7 +239,7 @@ while :; do sleep 1; done
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Count(string(packagerCalls), "x") != 2 || strings.Count(string(probeCalls), "x") != 2 {
+	if strings.Count(string(packagerCalls), "x") != 2 || strings.Count(string(probeCalls), "x") != 1 {
 		t.Fatalf("packager calls = %q, probe calls = %q", packagerCalls, probeCalls)
 	}
 }
@@ -336,6 +336,197 @@ JSON
 		tracks[0].Title != "SDH" || tracks[0].Kind != "text" ||
 		tracks[1].Index != 3 || tracks[1].Kind != "bitmap" {
 		t.Fatalf("tracks = %+v", tracks)
+	}
+}
+
+func TestManagerReusesSubtitleProbeWhenStartingPlayback(t *testing.T) {
+	probeCount := filepath.Join(t.TempDir(), "probe-count")
+	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
+printf 'x\n' >> %q
+cat <<'JSON'
+{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]},{"index":3,"codec_name":"subrip","codec_type":"subtitle","tags":{"language":"eng"}}],"format":{"duration":"7200"}}
+JSON
+`, probeCount))
+	ffmpeg := writeExecutable(t, "ffmpeg", `#!/bin/sh
+for last do :; done
+dir=$(dirname "$last")
+printf 'init' > "$dir/init.mp4"
+printf 'segment' > "$dir/segment-000000.m4s"
+cat > "$dir/index.m3u8" <<'PLAYLIST'
+#EXTM3U
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:4.0,
+segment-000000.m4s
+PLAYLIST
+while :; do sleep 1; done
+`)
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943", StartupTimeout: 5 * time.Second,
+		BufferSeconds: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	tracks, err := manager.ProbeSubtitles(t.Context(), "playback-1")
+	if err != nil || len(tracks) != 1 {
+		t.Fatalf("tracks = %+v, error = %v", tracks, err)
+	}
+	stream, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stream.Subtitles) != 1 || stream.Subtitles[0].Index != tracks[0].Index {
+		t.Fatalf("stream subtitles = %+v, probed tracks = %+v", stream.Subtitles, tracks)
+	}
+	probeCalls, err := os.ReadFile(probeCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(probeCalls), "x") != 1 {
+		t.Fatalf("probe calls = %q", probeCalls)
+	}
+}
+
+func TestManagerSharesConcurrentProbeAndClearsItOnStop(t *testing.T) {
+	probeCount := filepath.Join(t.TempDir(), "probe-count")
+	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
+printf 'x\n' >> %q
+sleep 0.1
+cat <<'JSON'
+{"streams":[{"index":2,"codec_name":"subrip","codec_type":"subtitle"}],"format":{"duration":"7200"}}
+JSON
+`, probeCount))
+	ffmpeg := writeExecutable(t, "ffmpeg", "#!/bin/sh\nexit 1\n")
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	const callers = 8
+	start := make(chan struct{})
+	results := make(chan error, callers)
+	for range callers {
+		go func() {
+			<-start
+			_, probeErr := manager.ProbeSubtitles(t.Context(), "playback-1")
+			results <- probeErr
+		}()
+	}
+	close(start)
+	for range callers {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	probeCalls, err := os.ReadFile(probeCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(probeCalls), "x") != 1 {
+		t.Fatalf("concurrent probe calls = %q", probeCalls)
+	}
+
+	manager.Stop("playback-1")
+	if _, err := manager.ProbeSubtitles(t.Context(), "playback-1"); err != nil {
+		t.Fatal(err)
+	}
+	probeCalls, err = os.ReadFile(probeCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(probeCalls), "x") != 2 {
+		t.Fatalf("probe calls after stop = %q", probeCalls)
+	}
+}
+
+func TestManagerStopCancelsInProgressProbe(t *testing.T) {
+	probeCount := filepath.Join(t.TempDir(), "probe-count")
+	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
+printf 'x\n' >> %q
+calls=$(wc -l < %q)
+if [ "$calls" -eq 1 ]; then exec sleep 10; fi
+cat <<'JSON'
+{"streams":[{"index":2,"codec_name":"subrip","codec_type":"subtitle"}],"format":{"duration":"7200"}}
+JSON
+`, probeCount, probeCount))
+	ffmpeg := writeExecutable(t, "ffmpeg", "#!/bin/sh\nexit 1\n")
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	result := make(chan error, 1)
+	go func() {
+		_, probeErr := manager.ProbeSubtitles(t.Context(), "playback-1")
+		result <- probeErr
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if contents, readErr := os.ReadFile(probeCount); readErr == nil && len(contents) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("media probe did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	manager.Stop("playback-1")
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("canceled probe succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled probe did not stop")
+	}
+	if _, err := manager.ProbeSubtitles(t.Context(), "playback-1"); err != nil {
+		t.Fatal(err)
+	}
+	probeCalls, err := os.ReadFile(probeCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(probeCalls), "x") != 2 {
+		t.Fatalf("probe calls after cancellation = %q", probeCalls)
+	}
+}
+
+func TestCanceledParkCannotStopPlaybackAfterAutoplayStarts(t *testing.T) {
+	ffprobe := writeExecutable(t, "ffprobe", "#!/bin/sh\nexit 1\n")
+	ffmpeg := writeExecutable(t, "ffmpeg", "#!/bin/sh\nexit 1\n")
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	// Holding the lifecycle lock models autoplay entering Start before the
+	// prewarmer reaches Park. Once the claim cancels Park, it must not run late.
+	unlockStart := manager.lockPlaybackStart("next-playback")
+	ctx, cancel := context.WithCancel(t.Context())
+	result := make(chan error, 1)
+	go func() {
+		result <- manager.Park(ctx, "next-playback", 30)
+	}()
+	cancel()
+	unlockStart()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("park error = %v, want context cancellation", err)
 	}
 }
 

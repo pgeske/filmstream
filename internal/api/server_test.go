@@ -538,6 +538,12 @@ func TestParkHLSPlayback(t *testing.T) {
 	}
 }
 
+func TestNextEpisodePrewarmKeepsThirtySecondBuffer(t *testing.T) {
+	if prewarmBufferSeconds != 30 {
+		t.Fatalf("prewarm buffer = %d", prewarmBufferSeconds)
+	}
+}
+
 func TestCreatePlaybackJoinsInProgressPrewarm(t *testing.T) {
 	var createRequests atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -674,7 +680,7 @@ func TestSeasonPackPreferenceAllowsCurrentIncompleteSeasonFallback(t *testing.T)
 	}
 }
 
-func TestClaimPrewarmedPlaybackCancelsPendingPark(t *testing.T) {
+func TestAutoplayClaimWaitsForCanceledPrewarmParkBeforeOldPlaybackCloses(t *testing.T) {
 	registry, err := indexer.NewRegistry(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -692,17 +698,54 @@ func TestClaimPrewarmedPlaybackCancelsPendingPark(t *testing.T) {
 	}
 	ready := make(chan struct{})
 	close(ready)
-	var parkCanceled atomic.Bool
+	parkCanceled := make(chan struct{})
+	parkDone := make(chan struct{})
 	request := CreatePlaybackRequest{MediaID: "tmdb:1", Query: "The Movie", StartSeconds: 600}
 	server.prewarmStates["tmdb:1"] = &playbackPrewarmState{
 		target: playbackPrewarmTarget{request: request}, playbackReady: ready,
 		response: CreatePlaybackResponse{ID: "warm-playback"},
-		cancel:   func() {}, parkCancel: func() { parkCanceled.Store(true) },
+		cancel:   func() {}, parkCancel: func() { close(parkCanceled) }, parkDone: parkDone,
 	}
 
-	response, ok := server.claimPrewarmedPlayback(t.Context(), request)
-	if !ok || response.ID != "warm-playback" || !parkCanceled.Load() {
-		t.Fatalf("response = %+v, claimed = %v, park canceled = %v", response, ok, parkCanceled.Load())
+	type claimResult struct {
+		response CreatePlaybackResponse
+		ok       bool
+	}
+	claimed := make(chan claimResult, 1)
+	go func() {
+		response, ok := server.claimPrewarmedPlayback(t.Context(), request)
+		claimed <- claimResult{response: response, ok: ok}
+	}()
+	select {
+	case <-parkCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("autoplay did not cancel the pending park")
+	}
+	select {
+	case result := <-claimed:
+		t.Fatalf("claim returned before park exited: %+v", result)
+	default:
+	}
+
+	// The next player may start only after the canceled prewarm can no longer park it.
+	close(parkDone)
+	result := <-claimed
+	if !result.ok || result.response.ID != "warm-playback" {
+		t.Fatalf("response = %+v, claimed = %v", result.response, result.ok)
+	}
+
+	// SwiftUI tears the completed player down after replacing it. Its close must
+	// remain scoped to the old playback rather than canceling the claimed episode.
+	manager := &fakeHLSManager{}
+	server.hlsManager = manager
+	closeResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(closeResponse, httptest.NewRequest(
+		http.MethodDelete, "/v1/playbacks/old-playback/hls", nil,
+	))
+	if closeResponse.Code != http.StatusOK || manager.stopped != "old-playback" ||
+		result.response.ID != "warm-playback" {
+		t.Fatalf("close status = %d, stopped = %q, next = %q",
+			closeResponse.Code, manager.stopped, result.response.ID)
 	}
 }
 
@@ -725,6 +768,165 @@ func TestNextEpisodeIsIncludedInPrewarming(t *testing.T) {
 	})
 	if !ok || next.MediaID != "tmdb-tv:3:s1:e2" || next.SeasonNumber != 1 || next.EpisodeNumber != 2 {
 		t.Fatalf("next episode = %+v, found = %v", next, ok)
+	}
+}
+
+func TestDuplicateProgressKeepsOneNextEpisodeSourcePrewarm(t *testing.T) {
+	var createRequests atomic.Int32
+	parked := make(chan struct{}, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/playbacks":
+			createRequests.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{"id":"next-playback","name":"The Show","file_name":"episode.mkv","file_size":1000,"source":"torrent","stream_url":"http://127.0.0.1/stream"}`)
+		case "/v1/playbacks/next-playback/hls":
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case "/v1/playbacks/next-playback/hls/park":
+			select {
+			case parked <- struct{}{}:
+			default:
+			}
+			fmt.Fprint(w, `{"status":"parked"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	server := &Server{
+		metadataProvider: fakeMetadata{},
+		logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		prewarmStates:    make(map[string]*playbackPrewarmState),
+		prewarmSlots:     make(chan struct{}, 1),
+		prewarmBaseURL:   upstream.URL,
+		prewarmClient:    upstream.Client(),
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	server.prewarmContext = ctx
+	current := history.Entry{
+		MediaID: "tmdb-tv:3:s1:e1", MediaType: "show", Title: "Top Rated Show",
+		SeriesID: "tmdb-tv:3", SeriesTitle: "Top Rated Show", SeasonNumber: 1, EpisodeNumber: 1,
+	}
+	selection := playbackSubtitleSelection{Mode: "off"}
+	server.queueNextEpisodePrewarm(current, selection)
+	server.queueNextEpisodePrewarm(current, selection)
+
+	select {
+	case <-parked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("next-episode prewarm did not finish")
+	}
+	if createRequests.Load() != 1 {
+		t.Fatalf("next-episode source creations = %d, want 1", createRequests.Load())
+	}
+}
+
+func TestBitmapSubtitlePrewarmMatchesMetadataAcrossTrackIndexes(t *testing.T) {
+	selection := playbackSubtitleSelection{
+		Mode: "bitmap", Index: 6, Language: "en", Title: "English SDH",
+		Codec: "hdmv_pgs_subtitle",
+	}
+	tracks := []hls.SubtitleTrack{
+		{Index: 6, Language: "ja", Title: "Japanese", Codec: "hdmv_pgs_subtitle", Kind: "bitmap"},
+		{Index: 3, Language: "en", Title: "English", Codec: "subrip", Kind: "text"},
+		{Index: 8, Language: "en", Title: "English", Codec: "hdmv_pgs_subtitle", Kind: "bitmap"},
+		{Index: 9, Language: "en", Title: "English SDH", Codec: "hdmv_pgs_subtitle", Kind: "bitmap"},
+	}
+	if index := matchingBitmapSubtitleIndex(tracks, selection); index != 9 {
+		t.Fatalf("matching bitmap subtitle index = %d, want 9", index)
+	}
+	if index := matchingBitmapSubtitleIndex(tracks[:2], selection); index != -1 {
+		t.Fatalf("unavailable bitmap subtitle index = %d, want -1", index)
+	}
+	selection.Mode = "text"
+	if index := matchingBitmapSubtitleIndex(tracks, selection); index != -1 {
+		t.Fatalf("text subtitle prewarm index = %d, want -1", index)
+	}
+}
+
+func TestPlaybackPrewarmStartsMatchedBitmapSubtitle(t *testing.T) {
+	hlsRequests := make(chan struct {
+		startSeconds   float64
+		bitmapSubtitle int
+	}, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/playbacks":
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{"id":"warm-playback","name":"The Show","file_name":"episode.mkv","file_size":1000,"source":"usenet","stream_url":"http://127.0.0.1/stream"}`)
+		case "/v1/playbacks/warm-playback/hls":
+			var request struct {
+				StartSeconds        float64 `json:"start_seconds"`
+				BitmapSubtitleIndex int     `json:"bitmap_subtitle_index"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			hlsRequests <- struct {
+				startSeconds   float64
+				bitmapSubtitle int
+			}{request.StartSeconds, request.BitmapSubtitleIndex}
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case "/v1/playbacks/warm-playback/hls/park":
+			fmt.Fprint(w, `{"status":"parked"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	registry, err := indexer.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	torrentEngine, err := torrentstream.New(torrentstream.Config{
+		DataDir: t.TempDir(), MetadataTimeout: time.Second, CleanOnClose: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer torrentEngine.Close()
+	server := New(registry, torrentEngine, catalog.Preferences{}, slog.Default())
+	server.usenetEngine = &fakeUsenetPlaybackEngine{
+		session: &usenetstream.Session{ID: "warm-playback", Name: "The Show", FileName: "episode.mkv"},
+	}
+	server.hlsManager = &fakeHLSManager{subtitleTracks: map[string][]hls.SubtitleTrack{
+		"warm-playback": {
+			{Index: 6, Language: "ja", Title: "Japanese", Codec: "hdmv_pgs_subtitle", Kind: "bitmap"},
+			{Index: 9, Language: "en", Title: "English SDH", Codec: "hdmv_pgs_subtitle", Kind: "bitmap"},
+		},
+	}}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	server.prewarmContext = ctx
+	server.prewarmBaseURL = upstream.URL
+	server.prewarmClient = upstream.Client()
+	server.queuePlaybackPrewarm(playbackPrewarmTarget{
+		request: CreatePlaybackRequest{
+			MediaID: "tmdb-tv:3:s1:e2", MediaType: "show", Query: "The Show",
+			SeriesID: "tmdb-tv:3", SeasonNumber: 1, EpisodeNumber: 2,
+		},
+		priority: true,
+		subtitleSelection: playbackSubtitleSelection{
+			Mode: "bitmap", Index: 6, Language: "en", Title: "English SDH",
+			Codec: "hdmv_pgs_subtitle",
+		},
+	})
+
+	select {
+	case request := <-hlsRequests:
+		if request.startSeconds != 0 || request.bitmapSubtitle != 9 {
+			t.Fatalf("HLS prewarm request = %+v", request)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for HLS prewarm request")
 	}
 }
 
