@@ -1,7 +1,9 @@
 package playbackcache
 
 import (
+	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -109,6 +111,53 @@ func TestSaveAndLookupCachedUsenetPlayback(t *testing.T) {
 	}
 	if strings.Contains(string(cacheJSON), "apikey=secret") {
 		t.Fatal("Usenet playback cache JSON contains a private source URL")
+	}
+}
+
+func TestClearUsenetPreservesTorrentCache(t *testing.T) {
+	store := New(t.TempDir())
+	torrent, err := store.Save(
+		"tmdb:1", "The Movie", 2001,
+		catalog.RankedCandidate{Candidate: catalog.Candidate{Protocol: catalog.ProtocolTorrent}},
+		[]byte("torrent"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	usenet, err := store.SaveUsenet(
+		"tmdb:2", "Another Movie", 2002,
+		catalog.RankedCandidate{Candidate: catalog.Candidate{Protocol: catalog.ProtocolUsenet}},
+		[]byte("nzb"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphanNZB := filepath.Join(store.usenetDir, "orphan.nzb")
+	if err := os.WriteFile(orphanNZB, []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveUsenetFailures(map[string]time.Time{
+		"usenet:active": time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.ClearUsenet(); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.Lookup("tmdb:1", "The Movie", 2001); err != nil || !found {
+		t.Fatalf("torrent cache found = %v, error = %v", found, err)
+	}
+	if _, found, err := store.LookupUsenet("tmdb:2", "Another Movie", 2002); err != nil || found {
+		t.Fatalf("Usenet cache found = %v, error = %v", found, err)
+	}
+	if _, err := os.Stat(torrent.TorrentPath); err != nil {
+		t.Fatalf("preserved torrent cache %s: %v", torrent.TorrentPath, err)
+	}
+	for _, path := range []string{usenet.NZBPath, orphanNZB, store.usenetPath, store.usenetFailuresPath} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("Usenet cache still exists at %s: %v", path, err)
+		}
 	}
 }
 
