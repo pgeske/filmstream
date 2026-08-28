@@ -17,11 +17,11 @@ import (
 )
 
 const (
-	desiredRecommendationCount = 50
-	maxModelCandidates         = 70
-	maxContinueSignals         = 15
-	maxRecentSignals           = 40
-	metadataLookupConcurrency  = 6
+	desiredRecommendationsPerType = 50
+	maxModelCandidatesPerType     = 60
+	maxContinueSignals            = 15
+	maxRecentSignals              = 40
+	metadataLookupConcurrency     = 6
 )
 
 type Model interface {
@@ -75,17 +75,13 @@ func (g *Generator) Generate(ctx context.Context, prompt string) ([]metadata.Mov
 		return nil, errors.New("encode recommendation taste signals")
 	}
 
-	var candidates []modelCandidate
-	for attempt := 0; attempt < 2; attempt++ {
-		content, completeErr := g.model.Complete(ctx, recommendationSystemPrompt, string(encodedInput))
-		if completeErr != nil {
-			return nil, errors.New("recommendation model request failed")
-		}
-		candidates, err = parseModelCandidates(content)
-		if err == nil {
-			break
-		}
+	// A refresh uses one completion containing both media types. Metadata misses are
+	// handled by requesting surplus candidates rather than by calling the model again.
+	content, err := g.model.Complete(ctx, recommendationSystemPrompt, string(encodedInput))
+	if err != nil {
+		return nil, errors.New("recommendation model request failed")
 	}
+	candidates, err := parseModelCandidates(content)
 	if err != nil {
 		return nil, err
 	}
@@ -246,7 +242,8 @@ func parseModelCandidates(content string) ([]modelCandidate, error) {
 
 	currentYear := time.Now().Year()
 	seen := make(map[string]struct{})
-	candidates := make([]modelCandidate, 0, min(len(response.Candidates), maxModelCandidates))
+	shows := make([]modelCandidate, 0, min(len(response.Candidates), maxModelCandidatesPerType))
+	movies := make([]modelCandidate, 0, min(len(response.Candidates), maxModelCandidatesPerType))
 	for _, candidate := range response.Candidates {
 		candidate.Title = strings.TrimSpace(candidate.Title)
 		if candidate.Title == "" || candidate.Year < 0 || candidate.Year > currentYear+2 ||
@@ -261,14 +258,25 @@ func parseModelCandidates(content string) ([]modelCandidate, error) {
 			continue
 		}
 		seen[key] = struct{}{}
-		candidates = append(candidates, candidate)
-		if len(candidates) == maxModelCandidates {
-			break
+		switch candidate.MediaType {
+		case metadata.MediaTypeShow:
+			if len(shows) < maxModelCandidatesPerType {
+				shows = append(shows, candidate)
+			}
+		case metadata.MediaTypeMovie:
+			if len(movies) < maxModelCandidatesPerType {
+				movies = append(movies, candidate)
+			}
 		}
 	}
-	if len(candidates) == 0 {
+	if len(shows)+len(movies) == 0 {
 		return nil, errors.New("recommendation model returned no valid candidates")
 	}
+	// Grouping here makes metadata validation and the persisted API order stable even
+	// when the model interleaves types or puts a long surplus of one type first.
+	candidates := make([]modelCandidate, 0, len(shows)+len(movies))
+	candidates = append(candidates, shows...)
+	candidates = append(candidates, movies...)
 	return candidates, nil
 }
 
@@ -321,13 +329,21 @@ func (g *Generator) resolveMetadata(ctx context.Context, candidates []modelCandi
 	}
 	close(jobs)
 	workers.Wait()
+	if ctx.Err() != nil {
+		return nil, errors.New("recommendation metadata lookup canceled")
+	}
 
-	items := make([]metadata.Movie, 0, min(desiredRecommendationCount, len(candidates)))
+	shows := make([]metadata.Movie, 0, min(desiredRecommendationsPerType, len(candidates)))
+	movies := make([]metadata.Movie, 0, min(desiredRecommendationsPerType, len(candidates)))
 	seenIDs := make(map[string]struct{})
-	failedLookups := 0
-	for _, lookup := range lookups {
+	failedLookups := map[metadata.MediaType]int{
+		metadata.MediaTypeShow:  0,
+		metadata.MediaTypeMovie: 0,
+	}
+	for index, lookup := range lookups {
+		mediaType := candidates[index].MediaType
 		if lookup.failed {
-			failedLookups++
+			failedLookups[mediaType]++
 			continue
 		}
 		movie := lookup.movie
@@ -335,18 +351,38 @@ func (g *Generator) resolveMetadata(ctx context.Context, candidates []modelCandi
 		if id == "" || watched.contains(movie) {
 			continue
 		}
-		if _, exists := seenIDs[id]; exists || len(items) == desiredRecommendationCount {
+		if _, exists := seenIDs[id]; exists {
+			continue
+		}
+
+		var typeItems *[]metadata.Movie
+		switch mediaType {
+		case metadata.MediaTypeShow:
+			typeItems = &shows
+		case metadata.MediaTypeMovie:
+			typeItems = &movies
+		}
+		if len(*typeItems) == desiredRecommendationsPerType {
 			continue
 		}
 		seenIDs[id] = struct{}{}
-		items = append(items, movie)
+		*typeItems = append(*typeItems, movie)
 	}
-	if failedLookups > 0 {
-		return nil, errors.New("recommendation metadata lookup failed")
+
+	// Successful misses may legitimately leave a niche media type short. A failed
+	// lookup is safe to ignore only after that type has reached its independent cap;
+	// otherwise a transient type-specific outage could replace a healthy cached list
+	// with a badly lopsided result.
+	if (failedLookups[metadata.MediaTypeShow] > 0 && len(shows) < desiredRecommendationsPerType) ||
+		(failedLookups[metadata.MediaTypeMovie] > 0 && len(movies) < desiredRecommendationsPerType) {
+		return nil, errors.New("recommendation metadata lookup failed before validation completed")
 	}
-	if len(items) == 0 {
+	if len(shows)+len(movies) == 0 {
 		return nil, errors.New("recommendation metadata did not validate any candidates")
 	}
+	items := make([]metadata.Movie, 0, len(shows)+len(movies))
+	items = append(items, shows...)
+	items = append(items, movies...)
 	return items, nil
 }
 
@@ -430,10 +466,11 @@ Return JSON only in this exact shape:
 {"candidates":[{"title":"Canonical English title","year":2001,"media_type":"movie"}]}
 
 Rules:
-- Produce 60 to 70 strong candidates when enough titles exist so metadata validation can yield about 50 recommendations.
-- Mix movies and television shows, balancing the mix according to the user's evidence and stated preferences.
+- In this single response, produce about 60 strong television show candidates and about 60 strong movie candidates when enough fitting titles exist. Each type is validated independently to yield up to 50 recommendations after metadata misses, deduplication, and watched-title exclusions.
+- Put all television show candidates first, followed by all movie candidates, while keeping every candidate in the one candidates array.
+- Tailor both media types to the user's evidence and stated preferences. A category may be shorter when the user's tastes genuinely provide fewer strong choices.
 - Prefer titles the user has not seen. Never return a title present in Continue Watching or recent history.
 - Use official English titles when available and the original movie release year or television premiere year. Use 0 only when the year is genuinely unknown.
 - media_type must be exactly "movie" or "show". Never recommend an individual episode.
-- Keep the list varied rather than filling it with one franchise, genre, creator, or era.
+- Keep each type varied rather than filling it with one franchise, genre, creator, or era.
 - Do not include reasons, explanations, markdown, or keys other than candidates, title, year, and media_type.`

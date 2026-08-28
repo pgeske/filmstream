@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -63,7 +64,8 @@ func TestGeneratorUsesDeterministicTasteSignalsAndExcludesWatchedTitles(t *testi
 		{"title":"Watched Film","year":2001,"media_type":"movie"},
 		{"title":"Fresh Show","year":2019,"media_type":"show"},
 		{"title":"Fresh Show Alias","year":2019,"media_type":"show"},
-		{"title":"Fresh Film","year":2020,"media_type":"movie"}
+		{"title":"Fresh Film","year":2020,"media_type":"movie"},
+		{"title":" Fresh Film ","year":2020,"media_type":"movie"}
 	]}`}
 	provider := &generatorTestMetadata{search: func(title string) ([]metadata.Movie, error) {
 		switch title {
@@ -101,6 +103,12 @@ func TestGeneratorUsesDeterministicTasteSignalsAndExcludesWatchedTitles(t *testi
 	if len(items) != 2 || items[0].ID != "tmdb-tv:fresh" || items[1].ID != "tmdb:fresh" {
 		t.Fatalf("items = %+v", items)
 	}
+	if model.calls.Load() != 1 {
+		t.Fatalf("model calls = %d, want one completion for both media types", model.calls.Load())
+	}
+	if !strings.Contains(model.system, "about 60 strong television show candidates and about 60 strong movie candidates") {
+		t.Fatalf("system prompt does not request a per-type candidate surplus: %q", model.system)
+	}
 	if provider.calls.Load() != 4 {
 		t.Fatalf("metadata calls = %d", provider.calls.Load())
 	}
@@ -122,13 +130,95 @@ func TestGeneratorUsesDeterministicTasteSignalsAndExcludesWatchedTitles(t *testi
 	}
 }
 
-func TestGeneratorBoundsMetadataLookupsAndOutput(t *testing.T) {
-	candidates := make([]modelCandidate, 0, maxModelCandidates+5)
-	for index := 0; index < maxModelCandidates+5; index++ {
-		candidates = append(candidates, modelCandidate{
-			Title: fmt.Sprintf("Title %02d", index), Year: 2000, MediaType: metadata.MediaTypeMovie,
+func TestGeneratorCapsEachMediaTypeWithoutStarvation(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		primaryType metadata.MediaType
+	}{
+		{name: "movie-heavy output", primaryType: metadata.MediaTypeMovie},
+		{name: "show-heavy output", primaryType: metadata.MediaTypeShow},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			primaryLabel := "Movie"
+			secondaryType := metadata.MediaTypeShow
+			secondaryLabel := "Show"
+			if test.primaryType == metadata.MediaTypeShow {
+				primaryLabel = "Show"
+				secondaryType = metadata.MediaTypeMovie
+				secondaryLabel = "Movie"
+			}
+			candidates := make([]modelCandidate, 0, maxModelCandidatesPerType*2+10)
+			for index := 0; index < maxModelCandidatesPerType+10; index++ {
+				candidates = append(candidates, modelCandidate{
+					Title: fmt.Sprintf("%s %03d", primaryLabel, index),
+					Year:  2000, MediaType: test.primaryType,
+				})
+			}
+			for index := 0; index < maxModelCandidatesPerType; index++ {
+				candidates = append(candidates, modelCandidate{
+					Title: fmt.Sprintf("%s %03d", secondaryLabel, index),
+					Year:  2000, MediaType: secondaryType,
+				})
+			}
+			content, err := json.Marshal(struct {
+				Candidates []modelCandidate `json:"candidates"`
+			}{Candidates: candidates})
+			if err != nil {
+				t.Fatal(err)
+			}
+			model := &generatorTestModel{content: string(content)}
+			provider := &generatorTestMetadata{search: func(title string) ([]metadata.Movie, error) {
+				time.Sleep(time.Millisecond)
+				mediaType := metadata.MediaTypeMovie
+				if strings.HasPrefix(title, "Show ") {
+					mediaType = metadata.MediaTypeShow
+				}
+				return []metadata.Movie{{
+					ID: string(mediaType) + ":" + title, MediaType: mediaType, Title: title, Year: 2000,
+				}}, nil
+			}}
+
+			items, err := NewGenerator(model, provider, generatorTestHistory{}).Generate(t.Context(), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(items) != desiredRecommendationsPerType*2 {
+				t.Fatalf("items = %d", len(items))
+			}
+			for index, item := range items {
+				wantType := metadata.MediaTypeShow
+				wantTitle := fmt.Sprintf("Show %03d", index)
+				if index >= desiredRecommendationsPerType {
+					wantType = metadata.MediaTypeMovie
+					wantTitle = fmt.Sprintf("Movie %03d", index-desiredRecommendationsPerType)
+				}
+				if item.MediaType != wantType || item.Title != wantTitle {
+					t.Fatalf("item %d = %+v, want %s %q", index, item, wantType, wantTitle)
+				}
+			}
+			if model.calls.Load() != 1 {
+				t.Fatalf("model calls = %d", model.calls.Load())
+			}
+			if provider.calls.Load() != maxModelCandidatesPerType*2 {
+				t.Fatalf("metadata calls = %d", provider.calls.Load())
+			}
+			if provider.peak.Load() > metadataLookupConcurrency {
+				t.Fatalf("peak metadata concurrency = %d", provider.peak.Load())
+			}
 		})
 	}
+}
+
+func TestGeneratorAllowsPartialMetadataFailuresAfterTypeCapIsFilled(t *testing.T) {
+	candidates := make([]modelCandidate, 0, desiredRecommendationsPerType+2)
+	for index := 0; index <= desiredRecommendationsPerType; index++ {
+		candidates = append(candidates, modelCandidate{
+			Title: fmt.Sprintf("Show %03d", index), Year: 2000, MediaType: metadata.MediaTypeShow,
+		})
+	}
+	candidates = append(candidates, modelCandidate{
+		Title: "Only Film", Year: 2001, MediaType: metadata.MediaTypeMovie,
+	})
 	content, err := json.Marshal(struct {
 		Candidates []modelCandidate `json:"candidates"`
 	}{Candidates: candidates})
@@ -137,32 +227,37 @@ func TestGeneratorBoundsMetadataLookupsAndOutput(t *testing.T) {
 	}
 	model := &generatorTestModel{content: string(content)}
 	provider := &generatorTestMetadata{search: func(title string) ([]metadata.Movie, error) {
-		time.Sleep(2 * time.Millisecond)
-		return []metadata.Movie{{ID: "tmdb:" + title, MediaType: metadata.MediaTypeMovie, Title: title, Year: 2000}}, nil
+		if title == "Show 000" {
+			return nil, errors.New("metadata unavailable")
+		}
+		mediaType := metadata.MediaTypeShow
+		year := 2000
+		if title == "Only Film" {
+			mediaType = metadata.MediaTypeMovie
+			year = 2001
+		}
+		return []metadata.Movie{{
+			ID: string(mediaType) + ":" + title, MediaType: mediaType, Title: title, Year: year,
+		}}, nil
 	}}
 
 	items, err := NewGenerator(model, provider, generatorTestHistory{}).Generate(t.Context(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(items) != desiredRecommendationCount {
-		t.Fatalf("items = %d", len(items))
-	}
-	if provider.calls.Load() != maxModelCandidates {
-		t.Fatalf("metadata calls = %d", provider.calls.Load())
-	}
-	if provider.peak.Load() > metadataLookupConcurrency {
-		t.Fatalf("peak metadata concurrency = %d", provider.peak.Load())
+	if len(items) != desiredRecommendationsPerType+1 || items[0].Title != "Show 001" ||
+		items[desiredRecommendationsPerType].Title != "Only Film" {
+		t.Fatalf("items = %+v", items)
 	}
 }
 
-func TestGeneratorRejectsPartialResultsWhenMetadataCallFails(t *testing.T) {
+func TestGeneratorRejectsIncompleteMediaTypeWhenMetadataCallFails(t *testing.T) {
 	model := &generatorTestModel{content: `{"candidates":[
-		{"title":"Fresh Film","year":2020,"media_type":"movie"},
-		{"title":"Unavailable Film","year":2021,"media_type":"movie"}
+		{"title":"Unavailable Show","year":2021,"media_type":"show"},
+		{"title":"Fresh Film","year":2020,"media_type":"movie"}
 	]}`}
 	provider := &generatorTestMetadata{search: func(title string) ([]metadata.Movie, error) {
-		if title == "Unavailable Film" {
+		if title == "Unavailable Show" {
 			return nil, errors.New("metadata unavailable")
 		}
 		return []metadata.Movie{{ID: "tmdb:fresh", MediaType: metadata.MediaTypeMovie, Title: title, Year: 2020}}, nil
@@ -173,7 +268,7 @@ func TestGeneratorRejectsPartialResultsWhenMetadataCallFails(t *testing.T) {
 	}
 }
 
-func TestGeneratorRetriesInvalidJSONWithoutNetworkCalls(t *testing.T) {
+func TestGeneratorDoesNotRetryInvalidJSONOrCallMetadata(t *testing.T) {
 	model := &generatorTestModel{content: `{"candidates":[]}`}
 	provider := &generatorTestMetadata{search: func(string) ([]metadata.Movie, error) {
 		t.Fatal("metadata should not be called")
@@ -183,7 +278,7 @@ func TestGeneratorRetriesInvalidJSONWithoutNetworkCalls(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected invalid candidate error")
 	}
-	if model.calls.Load() != 2 || provider.calls.Load() != 0 {
+	if model.calls.Load() != 1 || provider.calls.Load() != 0 {
 		t.Fatalf("model calls = %d, metadata calls = %d", model.calls.Load(), provider.calls.Load())
 	}
 }

@@ -2,14 +2,23 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/pgeske/filmstream/internal/metadata"
 	"github.com/pgeske/filmstream/internal/recommendations"
 )
+
+type apiRecommendationGeneratorFunc func(context.Context, string) ([]metadata.Movie, error)
+
+func (f apiRecommendationGeneratorFunc) Generate(ctx context.Context, prompt string) ([]metadata.Movie, error) {
+	return f(ctx, prompt)
+}
 
 func TestRecommendationEndpointsPersistPromptAndReturnEmptyItems(t *testing.T) {
 	stateDir := t.TempDir()
@@ -54,6 +63,70 @@ func TestRecommendationEndpointsPersistPromptAndReturnEmptyItems(t *testing.T) {
 		t.Fatalf("POST status = %d, body = %s", response.Code, response.Body.String())
 	}
 	assertEmptyRecommendationItems(t, response.Body.Bytes())
+}
+
+func TestRecommendationEndpointsKeepPersistedResponseShape(t *testing.T) {
+	stateDir := t.TempDir()
+	service := recommendations.NewService(
+		recommendations.NewStore(stateDir),
+		apiRecommendationGeneratorFunc(func(context.Context, string) ([]metadata.Movie, error) {
+			return []metadata.Movie{
+				{ID: "tmdb-tv:1", MediaType: metadata.MediaTypeShow, Title: "Recommended Show"},
+				{ID: "tmdb:1", MediaType: metadata.MediaTypeMovie, Title: "Recommended Movie"},
+			}, nil
+		}),
+		nil,
+		recommendations.ServiceOptions{},
+	)
+	if _, err := service.SetPrompt("balanced taste"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for service.Snapshot().Refreshing {
+		if time.Now().After(deadline) {
+			t.Fatal("recommendation refresh did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	persistedService := recommendations.NewService(
+		recommendations.NewStore(stateDir), nil, nil, recommendations.ServiceOptions{},
+	)
+	server := &Server{recommendationService: persistedService}
+	requests := []*http.Request{
+		httptest.NewRequest(http.MethodGet, "/v1/recommendations", nil),
+		httptest.NewRequest(
+			http.MethodPut, "/v1/recommendations/prompt", strings.NewReader(`{"prompt":"balanced taste"}`),
+		),
+	}
+	for _, request := range requests {
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, body = %s", request.Method, response.Code, response.Body.String())
+		}
+		var payload map[string]json.RawMessage
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if len(payload) != 4 {
+			t.Fatalf("%s response keys = %v", request.Method, payload)
+		}
+		for _, key := range []string{"generated_at", "prompt", "refreshing", "items"} {
+			if _, exists := payload[key]; !exists {
+				t.Fatalf("%s response is missing %q: %s", request.Method, key, response.Body.String())
+			}
+		}
+		var decoded recommendations.Response
+		if err := json.Unmarshal(response.Body.Bytes(), &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if decoded.Prompt != "balanced taste" || decoded.Refreshing || len(decoded.Items) != 2 ||
+			decoded.Items[0].MediaType != metadata.MediaTypeShow ||
+			decoded.Items[1].MediaType != metadata.MediaTypeMovie {
+			t.Fatalf("%s response = %+v", request.Method, decoded)
+		}
+	}
 }
 
 func TestRecommendationPromptEndpointRejectsOversizedAndUnknownInput(t *testing.T) {
