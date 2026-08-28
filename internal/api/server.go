@@ -22,6 +22,7 @@ import (
 	"github.com/pgeske/filmstream/internal/indexer"
 	"github.com/pgeske/filmstream/internal/metadata"
 	"github.com/pgeske/filmstream/internal/playbackcache"
+	"github.com/pgeske/filmstream/internal/recommendations"
 	"github.com/pgeske/filmstream/internal/resolver"
 	"github.com/pgeske/filmstream/internal/torrentstream"
 	"github.com/pgeske/filmstream/internal/usenetstream"
@@ -164,6 +165,8 @@ type Server struct {
 	playbackResponses map[string]CreatePlaybackResponse
 	usenetFailures    map[string]time.Time
 
+	recommendationService recommendations.Manager
+
 	prewarmMu      sync.Mutex
 	prewarmStates  map[string]*playbackPrewarmState
 	prewarmSlots   chan struct{}
@@ -259,6 +262,10 @@ func (s *Server) SetHistoryStore(store *history.Store) {
 	s.historyStore = store
 }
 
+func (s *Server) SetRecommendationService(service recommendations.Manager) {
+	s.recommendationService = service
+}
+
 func (s *Server) SetPlaybackCache(store *playbackcache.Store) {
 	s.playbackCache = store
 	failures, err := store.LoadUsenetFailures()
@@ -293,6 +300,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/watch-history", s.listWatchHistory)
 	mux.HandleFunc("PUT /v1/watch-history", s.updateWatchProgress)
 	mux.HandleFunc("DELETE /v1/watch-history/{id}", s.removeWatchHistory)
+	mux.HandleFunc("GET /v1/recommendations", s.listRecommendations)
+	mux.HandleFunc("PUT /v1/recommendations/prompt", s.updateRecommendationPrompt)
+	mux.HandleFunc("POST /v1/recommendations/refresh", s.refreshRecommendations)
 	mux.HandleFunc("POST /v1/playbacks", s.createPlayback)
 	mux.HandleFunc("POST /v1/playbacks/prewarm", s.prewarmPlayback)
 	mux.HandleFunc("GET /v1/playbacks/{id}", s.playbackStatus)

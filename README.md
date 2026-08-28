@@ -149,6 +149,9 @@ The optional configuration file is `~/.config/filmstream/config.json`:
     "api_key_file": "~/.config/filmstream/openai-api-key",
     "timeout_seconds": 60
   },
+  "recommendations": {
+    "model": "gpt-5-nano"
+  },
   "metadata": {
     "provider": "tmdb",
     "base_url": "https://api.themoviedb.org/3",
@@ -182,7 +185,7 @@ The optional configuration file is `~/.config/filmstream/config.json`:
 
 Set `FILMSTREAM_CONFIG` to use another path or `FILMSTREAM_SERVER` to use an already-running backend. Set `OMDB_API_KEY` to enable the optional `GET /v1/catalog/ratings` endpoint. When a client opens media details, the server resolves a supplied TMDB movie or show ID to its IMDb ID, queries OMDb, and caches successful results in memory. This avoids misses caused by localized or alternate titles, and the API key never leaves the server.
 
-Managed torrent data is stored beneath `<data_dir>/torrents`, with private resume metadata beside it so required seeding survives normal server restarts. Temporary native-player segments are stored beneath `<hls_dir>` and may be discarded between sessions. Do not place unrelated files in either location. Durable watch progress and private selected-release metadata are stored separately beneath `<state_dir>` with owner-only permissions.
+Managed torrent data is stored beneath `<data_dir>/torrents`, with private resume metadata beside it so required seeding survives normal server restarts. Temporary native-player segments are stored beneath `<hls_dir>` and may be discarded between sessions. Do not place unrelated files in either location. Durable watch progress, personalized recommendations, and private selected-release metadata are stored separately beneath `<state_dir>` with owner-only permissions. Recommendations use the resolver's existing OpenAI-compatible endpoint and credentials; omit `recommendations.model` to use the resolver model, or set it to choose another model from the same provider.
 
 ## Usenet streaming
 
@@ -296,6 +299,9 @@ A 1.0 ratio means one uploaded byte per downloaded byte. Filmstream cannot force
 - `GET /v1/watch-history?continue=true`
 - `PUT /v1/watch-history`
 - `DELETE /v1/watch-history/{id}`
+- `GET /v1/recommendations`
+- `PUT /v1/recommendations/prompt`
+- `POST /v1/recommendations/refresh`
 - `POST /v1/playbacks`
 - `GET /v1/playbacks/{id}`
 - `GET|HEAD /v1/playbacks/{id}/stream`

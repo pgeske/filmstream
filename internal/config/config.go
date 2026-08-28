@@ -51,6 +51,10 @@ type Metadata struct {
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 }
 
+type Recommendations struct {
+	Model string `json:"model,omitempty"`
+}
+
 type Usenet struct {
 	Provider              string `json:"provider,omitempty"`
 	BaseURL               string `json:"base_url,omitempty"`
@@ -90,6 +94,8 @@ type Config struct {
 	Metadata            Metadata  `json:"metadata,omitempty"`
 	Usenet              Usenet    `json:"usenet,omitempty"`
 	Indexers            []Indexer `json:"indexers"`
+
+	Recommendations Recommendations `json:"recommendations,omitempty"`
 }
 
 func Defaults() Config {

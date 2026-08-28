@@ -28,6 +28,7 @@ import (
 	"github.com/pgeske/filmstream/internal/indexer"
 	"github.com/pgeske/filmstream/internal/metadata"
 	"github.com/pgeske/filmstream/internal/playbackcache"
+	"github.com/pgeske/filmstream/internal/recommendations"
 	"github.com/pgeske/filmstream/internal/resolver"
 	"github.com/pgeske/filmstream/internal/torrentstream"
 	"github.com/pgeske/filmstream/internal/usenetstream"
@@ -186,13 +187,27 @@ func runServer(args []string) error {
 	if err != nil {
 		return err
 	}
+	historyStore := history.New(cfg.StateDir)
+	var recommendationGenerator recommendations.ItemGenerator
+	if metadataProvider != nil {
+		recommendationModel, recommendationErr := resolver.ModelFromConfig(cfg.Resolver, cfg.Recommendations.Model)
+		if recommendationErr != nil {
+			logger.Warn("recommendations disabled", "error", recommendationErr)
+		} else if recommendationModel != nil {
+			recommendationGenerator = recommendations.NewGenerator(recommendationModel, metadataProvider, historyStore)
+		}
+	}
+	recommendationService := recommendations.NewService(
+		recommendations.NewStore(cfg.StateDir), recommendationGenerator, logger, recommendations.ServiceOptions{},
+	)
 	apiServer := api.New(registry, engine, defaults, logger)
 	apiServer.SetPlaybackSourceMode(cfg.PlaybackSourceMode)
 	apiServer.SetUsenetEngine(usenetEngine)
 	apiServer.SetMovieResolver(movieResolver)
 	apiServer.SetMetadataProvider(metadataProvider)
 	apiServer.SetRatingsProvider(ratingsProvider)
-	apiServer.SetHistoryStore(history.New(cfg.StateDir))
+	apiServer.SetHistoryStore(historyStore)
+	apiServer.SetRecommendationService(recommendationService)
 	apiServer.SetPlaybackCache(playbackStore)
 	if hlsManager != nil {
 		apiServer.SetHLSManager(hlsManager)
@@ -206,7 +221,22 @@ func runServer(args []string) error {
 		if err != nil {
 			return err
 		}
+		var updatedRecommendationGenerator recommendations.ItemGenerator
+		if metadataProvider != nil {
+			updatedRecommendationModel, err := resolver.ModelFromConfig(
+				updated.Resolver, updated.Recommendations.Model,
+			)
+			if err != nil {
+				return err
+			}
+			if updatedRecommendationModel != nil {
+				updatedRecommendationGenerator = recommendations.NewGenerator(
+					updatedRecommendationModel, metadataProvider, historyStore,
+				)
+			}
+		}
 		apiServer.SetMovieResolver(updatedResolver)
+		recommendationService.SetGenerator(updatedRecommendationGenerator)
 		return nil
 	})
 	apiServer.SetIndexerReloader(func() error {
@@ -224,6 +254,7 @@ func runServer(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	recommendationService.Start(ctx)
 	apiServer.StartPlaybackPrewarmer(ctx, sourceBaseURL)
 	go func() {
 		<-ctx.Done()

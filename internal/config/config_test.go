@@ -101,7 +101,7 @@ func TestUsenetConfigurationValidation(t *testing.T) {
 
 func TestLoadOverlaysDefaults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, []byte(`{"readahead_mib":64,"indexers":[]}`), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(`{"readahead_mib":64,"recommendations":{"model":"curator"},"indexers":[]}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := Load(path)
@@ -113,5 +113,8 @@ func TestLoadOverlaysDefaults(t *testing.T) {
 	}
 	if len(cfg.Indexers) != 0 {
 		t.Fatalf("indexers = %+v", cfg.Indexers)
+	}
+	if cfg.Recommendations.Model != "curator" {
+		t.Fatalf("recommendation model = %q", cfg.Recommendations.Model)
 	}
 }

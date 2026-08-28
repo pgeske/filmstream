@@ -25,6 +25,17 @@ func FromConfig(cfg config.Resolver, dataDir string) (Resolver, error) {
 }
 
 func UncachedFromConfig(cfg config.Resolver) (Resolver, error) {
+	model, err := ModelFromConfig(cfg, "")
+	if err != nil || model == nil {
+		return nil, err
+	}
+	return NewSemantic(model, cfg.Provider, cfg.Model), nil
+}
+
+// ModelFromConfig builds a completion model with the resolver's existing endpoint,
+// credentials, and timeout. modelOverride selects a different model on that same
+// provider without introducing another credential path.
+func ModelFromConfig(cfg config.Resolver, modelOverride string) (Model, error) {
 	if cfg.Provider == "" {
 		return nil, nil
 	}
@@ -43,14 +54,14 @@ func UncachedFromConfig(cfg config.Resolver) (Resolver, error) {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
+	modelName := strings.TrimSpace(modelOverride)
+	if modelName == "" {
+		modelName = cfg.Model
+	}
 
 	switch cfg.Provider {
 	case "openai-compatible":
-		model, err := NewOpenAICompatible(cfg.BaseURL, cfg.Model, apiKey, &http.Client{Timeout: timeout})
-		if err != nil {
-			return nil, err
-		}
-		return NewSemantic(model, cfg.Provider, cfg.Model), nil
+		return NewOpenAICompatible(cfg.BaseURL, modelName, apiKey, &http.Client{Timeout: timeout})
 	default:
 		return nil, fmt.Errorf("unsupported resolver provider %q", cfg.Provider)
 	}
