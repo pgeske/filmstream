@@ -3,6 +3,16 @@ import Foundation
 public enum MediaType: String, Codable, Hashable, Sendable {
     case movie
     case show
+
+    public init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = MediaType(rawValue: value) ?? .movie
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 }
 
 public struct Movie: Codable, Hashable, Identifiable, Sendable {
@@ -201,6 +211,96 @@ public struct Recommendations: Codable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case generatedAt = "generated_at"
         case prompt, refreshing, items
+    }
+}
+
+public enum RecommendationUpdateSource: Sendable {
+    case promptSave
+    case refresh
+}
+
+public extension Recommendations {
+    /// Items with missing or unrecognized media types stay visible in the movie shelf,
+    /// matching Movie's existing non-show fallback behavior.
+    var recommendedShows: [Movie] {
+        items.filter { $0.mediaType == .show }
+    }
+
+    var recommendedMovies: [Movie] {
+        items.filter { $0.mediaType != .show }
+    }
+
+    func isOlderGeneration(than other: Recommendations) -> Bool {
+        guard let generatedAt, let otherGeneratedAt = other.generatedAt else { return false }
+        return generatedAt < otherGeneratedAt
+    }
+
+    func merged(
+        with current: Recommendations?,
+        source: RecommendationUpdateSource
+    ) -> Recommendations {
+        guard let current else { return self }
+
+        if source == .promptSave {
+            let shouldKeepCurrentItems = refreshing || items.isEmpty || isOlderGeneration(than: current)
+            return Recommendations(
+                generatedAt: latestGeneratedAt(comparedWith: current),
+                prompt: prompt,
+                refreshing: refreshing,
+                items: shouldKeepCurrentItems && !current.items.isEmpty ? current.items : items
+            )
+        }
+
+        if isOlderGeneration(than: current) {
+            return Recommendations(
+                generatedAt: current.generatedAt,
+                prompt: current.prompt,
+                refreshing: current.refreshing && refreshing,
+                items: current.items
+            )
+        }
+
+        if refreshing, !current.items.isEmpty {
+            return Recommendations(
+                generatedAt: latestGeneratedAt(comparedWith: current),
+                prompt: items.isEmpty ? current.prompt : prompt,
+                refreshing: true,
+                items: current.items
+            )
+        }
+
+        if items.isEmpty {
+            return Recommendations(
+                generatedAt: current.generatedAt,
+                prompt: current.prompt,
+                refreshing: refreshing,
+                items: current.items
+            )
+        }
+
+        return self
+    }
+
+    func settingRefreshing(_ refreshing: Bool) -> Recommendations {
+        Recommendations(
+            generatedAt: generatedAt,
+            prompt: prompt,
+            refreshing: refreshing,
+            items: items
+        )
+    }
+
+    private func latestGeneratedAt(comparedWith other: Recommendations) -> Date? {
+        switch (generatedAt, other.generatedAt) {
+        case let (generatedAt?, otherGeneratedAt?):
+            max(generatedAt, otherGeneratedAt)
+        case let (generatedAt?, nil):
+            generatedAt
+        case let (nil, otherGeneratedAt?):
+            otherGeneratedAt
+        case (nil, nil):
+            nil
+        }
     }
 }
 

@@ -20,6 +20,69 @@ import Testing
     #expect(undated.items.isEmpty)
 }
 
+@Test func splitsRecommendationShelvesStablyWithUnknownTypesFallingBackToMovies() throws {
+    let data = Data(#"{"prompt":"Mixed picks","refreshing":false,"items":[{"id":"show-1","media_type":"show","title":"First Show"},{"id":"movie-1","media_type":"movie","title":"First Movie"},{"id":"legacy-1","title":"Legacy Pick"},{"id":"future-1","media_type":"limited_series","title":"Future Pick"},{"id":"show-2","media_type":"show","title":"Second Show"}]}"#.utf8)
+    let recommendations = try JSONDecoder().decode(Recommendations.self, from: data)
+
+    #expect(recommendations.recommendedShows.map(\.id) == ["show-1", "show-2"])
+    #expect(recommendations.recommendedMovies.map(\.id) == ["movie-1", "legacy-1", "future-1"])
+    #expect(recommendations.items[3].mediaType == .movie)
+}
+
+@Test func mergesRecommendationGenerationsWithoutDiscardingCachedState() {
+    let current = Recommendations(
+        generatedAt: Date(timeIntervalSince1970: 200),
+        prompt: "Saved taste",
+        refreshing: true,
+        items: [Movie(id: "cached", mediaType: .movie, title: "Cached Pick")]
+    )
+    let emptyPoll = Recommendations(
+        generatedAt: Date(timeIntervalSince1970: 200),
+        prompt: "Stale prompt",
+        refreshing: false,
+        items: []
+    )
+    let olderPoll = Recommendations(
+        generatedAt: Date(timeIntervalSince1970: 100),
+        prompt: "Older prompt",
+        refreshing: false,
+        items: [Movie(id: "older", mediaType: .show, title: "Older Pick")]
+    )
+    let newerPoll = Recommendations(
+        generatedAt: Date(timeIntervalSince1970: 300),
+        prompt: "Saved taste",
+        refreshing: false,
+        items: [Movie(id: "new", mediaType: .show, title: "New Pick")]
+    )
+    let savedPrompt = Recommendations(
+        generatedAt: nil,
+        prompt: "Updated taste",
+        refreshing: true,
+        items: []
+    )
+
+    let mergedEmpty = emptyPoll.merged(with: current, source: .refresh)
+    #expect(mergedEmpty.items.map(\.id) == ["cached"])
+    #expect(mergedEmpty.prompt == "Saved taste")
+    #expect(!mergedEmpty.refreshing)
+
+    let mergedOlder = olderPoll.merged(with: current, source: .refresh)
+    #expect(olderPoll.isOlderGeneration(than: current))
+    #expect(mergedOlder.items.map(\.id) == ["cached"])
+    #expect(!mergedOlder.refreshing)
+
+    let mergedNewer = newerPoll.merged(with: current, source: .refresh)
+    #expect(!newerPoll.isOlderGeneration(than: current))
+    #expect(mergedNewer.items.map(\.id) == ["new"])
+
+    let mergedSave = savedPrompt.merged(with: current, source: .promptSave)
+    #expect(mergedSave.prompt == "Updated taste")
+    #expect(mergedSave.items.map(\.id) == ["cached"])
+    #expect(mergedSave.refreshing)
+    #expect(mergedSave.generatedAt == current.generatedAt)
+    #expect(!savedPrompt.isOlderGeneration(than: current))
+}
+
 @Test func recommendationAPIUsesGetAndPutContractIncludingEmptyPrompt() async throws {
     let recorder = RecommendationRequestRecorder()
     RecommendationURLProtocol.handler = { request in recorder.response(for: request) }

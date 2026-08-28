@@ -30,7 +30,8 @@ final class MacAppModel {
     var activePlayback: MacPlaybackSession?
     private(set) var ratingsByMovieID: [String: MovieRatings] = [:]
     private var requestedRatingIDs: Set<String> = []
-    private var recommendationFollowUpTask: Task<Void, Never>?
+    private let recommendationPoller = RecommendationPoller()
+    private var recommendationOperationID = 0
     var isLoading = false
     var errorMessage: String?
 
@@ -42,6 +43,7 @@ final class MacAppModel {
         isLoading = true
         defer { isLoading = false }
 
+        let recommendationOperationID = self.recommendationOperationID
         async let continueRequest = api.continueWatching()
         async let historyRequest = api.watchHistory()
         async let discoveryRequest = api.discover()
@@ -63,68 +65,82 @@ final class MacAppModel {
             errors.append(error.localizedDescription)
         }
         do {
-            applyRecommendations(try await recommendationRequest)
-            recommendationErrorMessage = nil
+            let response = try await recommendationRequest
+            if recommendationOperationID == self.recommendationOperationID {
+                applyRecommendations(response, source: .refresh)
+                recommendationErrorMessage = nil
+                scheduleRecommendationPolling(
+                    ifNeeded: recommendations?.refreshing == true,
+                    operationID: recommendationOperationID
+                )
+            }
         } catch {
-            recommendationErrorMessage = error.localizedDescription
-            errors.append(error.localizedDescription)
+            if recommendationOperationID == self.recommendationOperationID {
+                recommendationErrorMessage = error.localizedDescription
+                errors.append(error.localizedDescription)
+            }
         }
         errorMessage = errors.first
     }
 
     func updateRecommendationPrompt(_ prompt: String) async throws {
+        recommendationOperationID += 1
+        let operationID = recommendationOperationID
+        recommendationPoller.cancel()
+        recommendations = recommendations?.settingRefreshing(false)
+
         let previousError = recommendationErrorMessage
         let response = try await api.updateRecommendationPrompt(prompt)
-        applyRecommendations(response)
+        guard operationID == recommendationOperationID else { return }
+
+        applyRecommendations(response, source: .promptSave)
         if errorMessage == previousError {
             errorMessage = nil
         }
         recommendationErrorMessage = nil
-        scheduleRecommendationFollowUp(ifNeeded: response.refreshing)
-    }
-
-    private func loadRecommendations() async {
-        do {
-            let previousError = recommendationErrorMessage
-            applyRecommendations(try await api.recommendations())
-            if errorMessage == previousError {
-                errorMessage = nil
-            }
-            recommendationErrorMessage = nil
-        } catch {
-            recommendationErrorMessage = error.localizedDescription
-        }
-    }
-
-    private func applyRecommendations(_ response: Recommendations) {
-        let items: [Movie]
-        if response.refreshing,
-           response.items.isEmpty,
-           let cachedItems = recommendations?.items,
-           !cachedItems.isEmpty {
-            items = cachedItems
-        } else {
-            items = response.items
-        }
-        recommendations = Recommendations(
-            generatedAt: response.generatedAt,
-            prompt: response.prompt,
-            refreshing: response.refreshing,
-            items: items
+        scheduleRecommendationPolling(
+            ifNeeded: recommendations?.refreshing == true,
+            operationID: operationID
         )
     }
 
-    private func scheduleRecommendationFollowUp(ifNeeded: Bool) {
-        recommendationFollowUpTask?.cancel()
-        guard ifNeeded else { return }
-        recommendationFollowUpTask = Task { [weak self] in
-            do {
-                try await Task.sleep(for: .seconds(3))
-            } catch {
-                return
-            }
-            await self?.loadRecommendations()
+    private func applyRecommendations(
+        _ response: Recommendations,
+        source: RecommendationUpdateSource
+    ) {
+        recommendations = response.merged(with: recommendations, source: source)
+    }
+
+    private func scheduleRecommendationPolling(ifNeeded: Bool, operationID: Int) {
+        guard ifNeeded else {
+            recommendationPoller.cancel()
+            return
         }
+
+        recommendationPoller.start(
+            fetch: { [weak self] in
+                guard let self, operationID == self.recommendationOperationID else {
+                    throw CancellationError()
+                }
+                return try await self.api.recommendations()
+            },
+            receive: { [weak self] response in
+                guard let self, operationID == self.recommendationOperationID else { return false }
+                let previousError = self.recommendationErrorMessage
+                self.applyRecommendations(response, source: .refresh)
+                if self.errorMessage == previousError {
+                    self.errorMessage = nil
+                }
+                self.recommendationErrorMessage = nil
+                return self.recommendations?.refreshing == true
+            },
+            onTimeout: { [weak self] in
+                guard let self,
+                      operationID == self.recommendationOperationID,
+                      let recommendations = self.recommendations else { return }
+                self.recommendations = recommendations.settingRefreshing(false)
+            }
+        )
     }
 
     func loadContinueWatching() async {
