@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/pgeske/filmstream/internal/config"
 )
 
 type fakeModel struct {
@@ -58,6 +61,27 @@ func TestOpenAICompatibleJSONMode(t *testing.T) {
 	}
 	if content != `{"candidates":[]}` {
 		t.Fatalf("content = %q", content)
+	}
+}
+
+func TestModelFromConfigUsesResolverCredentialsWithModelOverride(t *testing.T) {
+	keyPath := filepath.Join(t.TempDir(), "openai-api-key")
+	if err := os.WriteFile(keyPath, []byte("shared-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	model, err := ModelFromConfig(config.Resolver{
+		Provider: "openai-compatible", BaseURL: "https://example.test/v1", Model: "resolver-model",
+		APIKeyFile: keyPath,
+	}, "recommendation-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	configured, ok := model.(*OpenAICompatible)
+	if !ok {
+		t.Fatalf("model type = %T", model)
+	}
+	if configured.model != "recommendation-model" || configured.apiKey != "shared-secret" {
+		t.Fatalf("configured model = %q, key = %q", configured.model, configured.apiKey)
 	}
 }
 
