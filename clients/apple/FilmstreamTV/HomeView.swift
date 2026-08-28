@@ -12,7 +12,9 @@ struct HomeView: View {
 
     private let homeTopID = "home-top"
     private let continueShelfID = "continue-watching"
-    private let recommendationShelfID = "recommended-for-you"
+    private let recommendationSectionID = "recommendations"
+    private let recommendedShowsShelfID = "recommended-shows"
+    private let recommendedMoviesShelfID = "recommended-movies"
     private let finalShelfAlignmentSpace: CGFloat = 360
 
     var body: some View {
@@ -26,7 +28,7 @@ struct HomeView: View {
                             header
                                 .id(homeTopID)
                             continueWatchingSection(scrollProxy: scrollProxy)
-                            recommendationSection(scrollProxy: scrollProxy)
+                            recommendationSections(scrollProxy: scrollProxy)
                             ForEach(model.discoverySections) { section in
                                 discoverySection(section, scrollProxy: scrollProxy)
                             }
@@ -151,8 +153,8 @@ struct HomeView: View {
     }
 
     @ViewBuilder
-    private func recommendationSection(scrollProxy: ScrollViewProxy) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
+    private func recommendationSections(scrollProxy: ScrollViewProxy) -> some View {
+        VStack(alignment: .leading, spacing: 30) {
             recommendationHeader
                 .padding(.horizontal, 16)
 
@@ -163,50 +165,78 @@ struct HomeView: View {
                     .padding(.horizontal, 16)
             } else if let recommendations = model.recommendations,
                       !recommendations.items.isEmpty {
-                NetflixMovieShelf(
-                    shelfID: recommendationShelfID,
-                    title: "Recommended for You",
-                    items: recommendations.items.map {
-                        NetflixShelfItem(
-                            movie: $0,
-                            contentRating: model.ratings(for: $0)?.contentRating
-                        )
-                    },
-                    focusBinding: $focusedShelfItem,
-                    preferredEntryFocus: searchReturnFocus,
-                    showsTitle: false,
-                    onFocus: loadRatings,
-                    onHorizontalFocusChange: {
-                        alignShelf(
-                            recommendationShelfID,
-                            scrollProxy: scrollProxy,
-                            animated: false
-                        )
-                    },
-                    onShelfFocusChange: {
-                        updateShelfFocus(
-                            recommendationShelfID,
-                            isFocused: $0,
-                            scrollProxy: scrollProxy
-                        )
-                    }
+                recommendationShelf(
+                    shelfID: recommendedShowsShelfID,
+                    title: "Recommended Shows",
+                    emptyMessage: "No show picks yet.",
+                    items: recommendations.recommendedShows,
+                    scrollProxy: scrollProxy
+                )
+                recommendationShelf(
+                    shelfID: recommendedMoviesShelfID,
+                    title: "Recommended Movies",
+                    emptyMessage: "No movie picks yet.",
+                    items: recommendations.recommendedMovies,
+                    scrollProxy: scrollProxy
                 )
             } else {
                 emptyRecommendations
                     .padding(.horizontal, 16)
             }
         }
-        .id(recommendationShelfID)
+        .id(recommendationSectionID)
+    }
+
+    @ViewBuilder
+    private func recommendationShelf(
+        shelfID: String,
+        title: String,
+        emptyMessage: String,
+        items: [Movie],
+        scrollProxy: ScrollViewProxy
+    ) -> some View {
+        if items.isEmpty {
+            VStack(alignment: .leading, spacing: 16) {
+                shelfTitle(title)
+                Text(emptyMessage)
+                    .font(.title3)
+                    .foregroundStyle(Color.teaMuted)
+                    .frame(maxWidth: .infinity, minHeight: 120, alignment: .leading)
+            }
+            .padding(.horizontal, 16)
+            .id(shelfID)
+        } else {
+            NetflixMovieShelf(
+                shelfID: shelfID,
+                title: title,
+                items: items.map {
+                    NetflixShelfItem(
+                        movie: $0,
+                        contentRating: model.ratings(for: $0)?.contentRating
+                    )
+                },
+                focusBinding: $focusedShelfItem,
+                preferredEntryFocus: searchReturnFocus,
+                onFocus: loadRatings,
+                onHorizontalFocusChange: {
+                    alignShelf(shelfID, scrollProxy: scrollProxy, animated: false)
+                },
+                onShelfFocusChange: {
+                    updateShelfFocus(shelfID, isFocused: $0, scrollProxy: scrollProxy)
+                }
+            )
+            .id(shelfID)
+        }
     }
 
     private var recommendationHeader: some View {
         HStack(spacing: 18) {
-            shelfTitle("Recommended for You")
+            shelfTitle("For You")
             if model.recommendations?.refreshing == true,
                model.recommendations?.items.isEmpty == false {
                 ProgressView()
                     .tint(Color.teaAccent)
-                Text("Updating…")
+                Text("Updating recommendations…")
                     .font(.headline)
                     .foregroundStyle(Color.teaMuted)
             }
@@ -214,7 +244,7 @@ struct HomeView: View {
             Button {
                 isShowingRecommendationPreferences = true
             } label: {
-                Label("Edit Taste", systemImage: "slider.horizontal.3")
+                Label("Tune Recommendations", systemImage: "slider.horizontal.3")
                     .font(.headline.weight(.semibold))
             }
             .buttonStyle(TeaActionButtonStyle())
@@ -246,10 +276,12 @@ struct HomeView: View {
                 .foregroundStyle(Color.teaAccentLight)
                 .frame(width: 76)
             VStack(alignment: .leading, spacing: 8) {
-                Text("Tell TeaStream what you like")
+                Text(hasRecommendationPrompt ? "Recommendations are still brewing" : "Tell TeaStream what you like")
                     .font(.title2.weight(.semibold))
                     .foregroundStyle(Color.teaCream)
-                Text("Share favorite genres, shows, pacing, and things to avoid to build recommendations.")
+                Text(hasRecommendationPrompt
+                    ? "TeaStream will check again the next time Home refreshes."
+                    : "Share favorite genres, shows, pacing, and things to avoid to build recommendations.")
                     .font(.title3)
                     .foregroundStyle(Color.teaMuted)
             }
@@ -257,7 +289,7 @@ struct HomeView: View {
             Button {
                 isShowingRecommendationPreferences = true
             } label: {
-                Label("Set Your Taste", systemImage: "slider.horizontal.3")
+                Label("Tune Recommendations", systemImage: "slider.horizontal.3")
                     .font(.headline.weight(.semibold))
             }
             .buttonStyle(TeaActionButtonStyle(prominent: true))
@@ -277,6 +309,10 @@ struct HomeView: View {
             RoundedRectangle(cornerRadius: 28, style: .continuous)
                 .stroke(Color.teaAccent.opacity(0.18), lineWidth: 1)
         }
+    }
+
+    private var hasRecommendationPrompt: Bool {
+        !(model.recommendations?.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     }
 
     @ViewBuilder

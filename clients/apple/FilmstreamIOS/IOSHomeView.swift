@@ -67,7 +67,7 @@ struct IOSHomeView: View {
                 LazyVStack(alignment: .leading, spacing: 36) {
                     header
                     continueWatchingSection
-                    recommendationSection
+                    recommendationSections
                     ForEach(model.discoverySections) { section in
                         discoverySection(section)
                     }
@@ -159,8 +159,8 @@ struct IOSHomeView: View {
     }
 
     @ViewBuilder
-    private var recommendationSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
+    private var recommendationSections: some View {
+        VStack(alignment: .leading, spacing: 30) {
             recommendationHeader
                 .padding(.horizontal, 18)
 
@@ -171,9 +171,43 @@ struct IOSHomeView: View {
                     .padding(.horizontal, 18)
             } else if let recommendations = model.recommendations,
                       !recommendations.items.isEmpty {
+                recommendationShelf(
+                    title: "Recommended Shows",
+                    emptyMessage: "No show picks yet.",
+                    items: recommendations.recommendedShows
+                )
+                recommendationShelf(
+                    title: "Recommended Movies",
+                    emptyMessage: "No movie picks yet.",
+                    items: recommendations.recommendedMovies
+                )
+            } else {
+                emptyRecommendations
+                    .padding(.horizontal, 18)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func recommendationShelf(
+        title: String,
+        emptyMessage: String,
+        items: [Movie]
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            MobileSectionHeader(title: title)
+                .padding(.horizontal, 18)
+
+            if items.isEmpty {
+                Text(emptyMessage)
+                    .font(.subheadline)
+                    .foregroundStyle(Color.mobileTeaMuted)
+                    .frame(maxWidth: .infinity, minHeight: 90, alignment: .leading)
+                    .padding(.horizontal, 18)
+            } else {
                 ScrollView(.horizontal, showsIndicators: false) {
                     LazyHStack(alignment: .top, spacing: 14) {
-                        ForEach(recommendations.items) { movie in
+                        ForEach(items) { movie in
                             NavigationLink(value: movie) {
                                 MobileMovieCard(
                                     movie: movie,
@@ -191,32 +225,37 @@ struct IOSHomeView: View {
                     .scrollTargetLayout()
                 }
                 .scrollTargetBehavior(.viewAligned(limitBehavior: .alwaysByOne))
-            } else {
-                emptyRecommendations
-                    .padding(.horizontal, 18)
             }
         }
     }
 
     private var recommendationHeader: some View {
-        HStack(spacing: 10) {
-            MobileSectionHeader(title: "Recommended for You")
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 10) {
+                MobileSectionHeader(title: "For You")
+                Spacer()
+                Button {
+                    isShowingRecommendationPreferences = true
+                } label: {
+                    Label("Tune Recommendations", systemImage: "slider.horizontal.3")
+                        .labelStyle(.titleAndIcon)
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(Color.mobileTeaAccentLight)
+                }
+                .buttonStyle(MobileCardButtonStyle())
+            }
+
             if model.recommendations?.refreshing == true,
                model.recommendations?.items.isEmpty == false {
-                ProgressView()
-                    .controlSize(.small)
-                    .tint(Color.mobileTeaAccent)
+                HStack(spacing: 7) {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(Color.mobileTeaAccent)
+                    Text("Updating recommendations…")
+                        .font(.caption2)
+                        .foregroundStyle(Color.mobileTeaMuted)
+                }
             }
-            Spacer()
-            Button {
-                isShowingRecommendationPreferences = true
-            } label: {
-                Label("Edit Taste", systemImage: "slider.horizontal.3")
-                    .labelStyle(.titleAndIcon)
-                    .font(.caption.weight(.bold))
-                    .foregroundStyle(Color.mobileTeaAccentLight)
-            }
-            .buttonStyle(MobileCardButtonStyle())
         }
     }
 
@@ -244,10 +283,12 @@ struct IOSHomeView: View {
                     .foregroundStyle(Color.mobileTeaAccentLight)
                     .frame(width: 50)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Tell TeaStream what you like")
+                    Text(hasRecommendationPrompt ? "Recommendations are still brewing" : "Tell TeaStream what you like")
                         .font(.headline)
                         .foregroundStyle(Color.mobileTeaCream)
-                    Text("Share favorite genres, shows, pacing, and things to avoid to build recommendations.")
+                    Text(hasRecommendationPrompt
+                        ? "TeaStream will check again the next time Home refreshes."
+                        : "Share favorite genres, shows, pacing, and things to avoid to build recommendations.")
                         .font(.caption)
                         .foregroundStyle(Color.mobileTeaMuted)
                 }
@@ -256,7 +297,7 @@ struct IOSHomeView: View {
             Button {
                 isShowingRecommendationPreferences = true
             } label: {
-                Label("Set Your Taste", systemImage: "slider.horizontal.3")
+                Label("Tune Recommendations", systemImage: "slider.horizontal.3")
                     .font(.subheadline.weight(.bold))
                     .foregroundStyle(Color.mobileTeaBackground)
                     .padding(.horizontal, 15)
@@ -279,6 +320,10 @@ struct IOSHomeView: View {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(Color.mobileTeaAccent.opacity(0.18), lineWidth: 1)
         }
+    }
+
+    private var hasRecommendationPrompt: Bool {
+        !(model.recommendations?.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     }
 
     @ViewBuilder

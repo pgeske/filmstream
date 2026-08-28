@@ -97,7 +97,7 @@ private struct MacLibraryView: View {
                 LazyVStack(alignment: .leading, spacing: 38) {
                     header
                     continueWatchingSection
-                    recommendationSection
+                    recommendationSections
                     ForEach(model.discoverySections) { section in
                         discoverySection(section)
                     }
@@ -187,8 +187,8 @@ private struct MacLibraryView: View {
     }
 
     @ViewBuilder
-    private var recommendationSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
+    private var recommendationSections: some View {
+        VStack(alignment: .leading, spacing: 32) {
             recommendationHeader
 
             if (model.isLoading && model.recommendations == nil)
@@ -197,9 +197,39 @@ private struct MacLibraryView: View {
                 recommendationLoadingState
             } else if let recommendations = model.recommendations,
                       !recommendations.items.isEmpty {
+                recommendationShelf(
+                    title: "Recommended Shows",
+                    emptyMessage: "No show picks yet.",
+                    items: recommendations.recommendedShows
+                )
+                recommendationShelf(
+                    title: "Recommended Movies",
+                    emptyMessage: "No movie picks yet.",
+                    items: recommendations.recommendedMovies
+                )
+            } else {
+                emptyRecommendations
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func recommendationShelf(
+        title: String,
+        emptyMessage: String,
+        items: [Movie]
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            sectionHeader(title)
+
+            if items.isEmpty {
+                Text(emptyMessage)
+                    .foregroundStyle(Color.macTeaMuted)
+                    .frame(maxWidth: .infinity, minHeight: 90, alignment: .leading)
+            } else {
                 ScrollView(.horizontal, showsIndicators: false) {
                     LazyHStack(alignment: .top, spacing: 18) {
-                        ForEach(recommendations.items) { movie in
+                        ForEach(items) { movie in
                             MacMovieCard(
                                 movie: movie,
                                 contentRating: model.ratings(for: movie)?.contentRating
@@ -212,21 +242,19 @@ private struct MacLibraryView: View {
                     .padding(.horizontal, 3)
                     .padding(.vertical, 10)
                 }
-            } else {
-                emptyRecommendations
             }
         }
     }
 
     private var recommendationHeader: some View {
         HStack(spacing: 12) {
-            sectionHeader("Recommended for You")
+            sectionHeader("For You")
             if model.recommendations?.refreshing == true,
                model.recommendations?.items.isEmpty == false {
                 ProgressView()
                     .controlSize(.small)
                     .tint(Color.macTeaAccent)
-                Text("Updating…")
+                Text("Updating recommendations…")
                     .font(.caption)
                     .foregroundStyle(Color.macTeaMuted)
             }
@@ -234,7 +262,7 @@ private struct MacLibraryView: View {
             Button {
                 isShowingRecommendationPreferences = true
             } label: {
-                Label("Edit Taste", systemImage: "slider.horizontal.3")
+                Label("Tune Recommendations", systemImage: "slider.horizontal.3")
                     .font(.subheadline.weight(.semibold))
             }
             .buttonStyle(.plain)
@@ -265,17 +293,19 @@ private struct MacLibraryView: View {
                 .foregroundStyle(Color.macTeaAccentLight)
                 .frame(width: 58)
             VStack(alignment: .leading, spacing: 5) {
-                Text("Tell TeaStream what you like")
+                Text(hasRecommendationPrompt ? "Recommendations are still brewing" : "Tell TeaStream what you like")
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(Color.macTeaCream)
-                Text("Share favorite genres, shows, pacing, and things to avoid to build recommendations.")
+                Text(hasRecommendationPrompt
+                    ? "TeaStream will check again the next time Home refreshes."
+                    : "Share favorite genres, shows, pacing, and things to avoid to build recommendations.")
                     .foregroundStyle(Color.macTeaMuted)
             }
             Spacer()
             Button {
                 isShowingRecommendationPreferences = true
             } label: {
-                Label("Set Your Taste", systemImage: "slider.horizontal.3")
+                Label("Tune Recommendations", systemImage: "slider.horizontal.3")
                     .font(.headline.weight(.semibold))
             }
             .buttonStyle(MacTeaActionButtonStyle(prominent: true))
@@ -294,6 +324,10 @@ private struct MacLibraryView: View {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(Color.macTeaAccent.opacity(0.18), lineWidth: 1)
         }
+    }
+
+    private var hasRecommendationPrompt: Bool {
+        !(model.recommendations?.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     }
 
     @ViewBuilder
