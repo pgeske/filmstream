@@ -37,6 +37,11 @@ type fakeResolver struct{}
 
 type fakeMetadata struct{}
 
+type imdbDiscoveryMetadata struct {
+	fakeMetadata
+	calls int
+}
+
 type airingMetadata struct{}
 
 type fakeRatings struct{}
@@ -229,6 +234,12 @@ func (fakeRatings) RatingsByIMDbID(_ context.Context, imdbID string) (metadata.M
 	return metadata.MovieRatings{IMDb: &imdb, RottenTomatoes: &rottenTomatoes, ContentRating: &contentRating}, nil
 }
 
+func (fakeRatings) RatingsForMedia(_ context.Context, _ metadata.Movie) (metadata.MovieRatings, error) {
+	imdb := 8.6
+	votes := 123456
+	return metadata.MovieRatings{IMDb: &imdb, IMDbVotes: &votes}, nil
+}
+
 func (fakeRatings) Ratings(_ context.Context, title string, year int) (metadata.MovieRatings, error) {
 	if title != "The Movie" || year != 2001 {
 		return metadata.MovieRatings{}, nil
@@ -247,6 +258,11 @@ func (partialRatings) RatingsByIMDbID(_ context.Context, _ string) (metadata.Mov
 func (partialRatings) Ratings(_ context.Context, _ string, _ int) (metadata.MovieRatings, error) {
 	rottenTomatoes := 91
 	return metadata.MovieRatings{RottenTomatoes: &rottenTomatoes}, nil
+}
+
+func (provider *imdbDiscoveryMetadata) DiscoverWithRatings(ctx context.Context, collection metadata.Collection, _ metadata.MediaRatingsProvider) ([]metadata.Movie, error) {
+	provider.calls++
+	return provider.Discover(ctx, collection)
 }
 
 func (fakeMetadata) Discover(_ context.Context, collection metadata.Collection) ([]metadata.Movie, error) {
@@ -1382,6 +1398,20 @@ func TestDiscoverCatalogReturnsMixedMediaSections(t *testing.T) {
 	}
 	if payload.Sections[1].ID != "top-rated" || payload.Sections[1].Items[0].Title != "Top Rated Show" || payload.Sections[1].Items[0].MediaType != metadata.MediaTypeShow {
 		t.Fatalf("top rated = %+v", payload.Sections[1])
+	}
+}
+
+func TestDiscoverCatalogUsesIMDbAwareProviderWhenRatingsAreConfigured(t *testing.T) {
+	provider := &imdbDiscoveryMetadata{}
+	server := &Server{metadataProvider: provider, ratingsProvider: fakeRatings{}}
+	request := httptest.NewRequest(http.MethodGet, "/v1/catalog/discover", nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if provider.calls != 2 {
+		t.Fatalf("IMDb-aware discovery calls = %d, want 2", provider.calls)
 	}
 }
 
