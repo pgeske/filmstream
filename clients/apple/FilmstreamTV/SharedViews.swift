@@ -309,6 +309,7 @@ struct NetflixMovieShelf: View {
     let focusBinding: FocusState<NetflixShelfFocus?>.Binding
     var preferredEntryFocus: NetflixShelfFocus?
     var requestsInitialFocus = false
+    var showsTitle = true
     var onFocus: (Movie) -> Void = { _ in }
     var onHorizontalFocusChange: () -> Void = {}
     var onShelfFocusChange: (Bool) -> Void = { _ in }
@@ -317,14 +318,16 @@ struct NetflixMovieShelf: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(title)
-                .font(.system(size: 38, weight: .bold, design: .rounded))
-                .foregroundStyle(Color.teaCream)
-                .padding(.horizontal, 16)
+            if showsTitle {
+                Text(title)
+                    .font(.system(size: 38, weight: .bold, design: .rounded))
+                    .foregroundStyle(Color.teaCream)
+                    .padding(.horizontal, 16)
+            }
 
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(alignment: .top, spacing: 24) {
+                    LazyHStack(alignment: .top, spacing: 24) {
                         // Focus targets stay fixed-size; the trailing slot reserves expansion space.
                         ForEach(items) { item in
                             let isExpanded = expandedMovieID == item.id

@@ -56,6 +56,7 @@ private enum IOSRootTab: Hashable {
 
 struct IOSHomeView: View {
     @Environment(IOSAppModel.self) private var model
+    @State private var isShowingRecommendationPreferences = false
     let onOpenSearch: () -> Void
 
     var body: some View {
@@ -66,6 +67,7 @@ struct IOSHomeView: View {
                 LazyVStack(alignment: .leading, spacing: 36) {
                     header
                     continueWatchingSection
+                    recommendationSection
                     ForEach(model.discoverySections) { section in
                         discoverySection(section)
                     }
@@ -98,6 +100,12 @@ struct IOSHomeView: View {
             }
         }
         .toolbar(.hidden, for: .navigationBar)
+        .sheet(isPresented: $isShowingRecommendationPreferences) {
+            IOSRecommendationPreferencesView(prompt: model.recommendations?.prompt ?? "")
+                .environment(model)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+        }
     }
 
     private var header: some View {
@@ -147,6 +155,129 @@ struct IOSHomeView: View {
                 }
                 .scrollTargetBehavior(.viewAligned(limitBehavior: .alwaysByOne))
             }
+        }
+    }
+
+    @ViewBuilder
+    private var recommendationSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            recommendationHeader
+                .padding(.horizontal, 18)
+
+            if (model.isLoading && model.recommendations == nil)
+                || (model.recommendations?.refreshing == true
+                    && model.recommendations?.items.isEmpty == true) {
+                recommendationLoadingState
+                    .padding(.horizontal, 18)
+            } else if let recommendations = model.recommendations,
+                      !recommendations.items.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    LazyHStack(alignment: .top, spacing: 14) {
+                        ForEach(recommendations.items) { movie in
+                            NavigationLink(value: movie) {
+                                MobileMovieCard(
+                                    movie: movie,
+                                    contentRating: model.ratings(for: movie)?.contentRating
+                                )
+                            }
+                            .buttonStyle(MobileCardButtonStyle())
+                            .task(id: movie.id) {
+                                await model.loadRatings(for: movie)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 5)
+                    .scrollTargetLayout()
+                }
+                .scrollTargetBehavior(.viewAligned(limitBehavior: .alwaysByOne))
+            } else {
+                emptyRecommendations
+                    .padding(.horizontal, 18)
+            }
+        }
+    }
+
+    private var recommendationHeader: some View {
+        HStack(spacing: 10) {
+            MobileSectionHeader(title: "Recommended for You")
+            if model.recommendations?.refreshing == true,
+               model.recommendations?.items.isEmpty == false {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(Color.mobileTeaAccent)
+            }
+            Spacer()
+            Button {
+                isShowingRecommendationPreferences = true
+            } label: {
+                Label("Edit Taste", systemImage: "slider.horizontal.3")
+                    .labelStyle(.titleAndIcon)
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(Color.mobileTeaAccentLight)
+            }
+            .buttonStyle(MobileCardButtonStyle())
+        }
+    }
+
+    private var recommendationLoadingState: some View {
+        HStack(spacing: 14) {
+            ProgressView()
+                .tint(Color.mobileTeaAccent)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Preparing recommendations…")
+                    .font(.headline)
+                    .foregroundStyle(Color.mobileTeaCream)
+                Text("Matching movies and shows to your taste.")
+                    .font(.caption)
+                    .foregroundStyle(Color.mobileTeaMuted)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 150, alignment: .leading)
+    }
+
+    private var emptyRecommendations: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 15) {
+                Image(systemName: "wand.and.stars")
+                    .font(.system(size: 30, weight: .semibold))
+                    .foregroundStyle(Color.mobileTeaAccentLight)
+                    .frame(width: 50)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Tell TeaStream what you like")
+                        .font(.headline)
+                        .foregroundStyle(Color.mobileTeaCream)
+                    Text("Share favorite genres, shows, pacing, and things to avoid to build recommendations.")
+                        .font(.caption)
+                        .foregroundStyle(Color.mobileTeaMuted)
+                }
+            }
+
+            Button {
+                isShowingRecommendationPreferences = true
+            } label: {
+                Label("Set Your Taste", systemImage: "slider.horizontal.3")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(Color.mobileTeaBackground)
+                    .padding(.horizontal, 15)
+                    .padding(.vertical, 10)
+                    .background(Color.mobileTeaAccent, in: Capsule())
+            }
+            .buttonStyle(MobileCardButtonStyle())
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            LinearGradient(
+                colors: [Color.mobileTeaPanelElevated, Color.mobileTeaPanel],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: 20, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(Color.mobileTeaAccent.opacity(0.18), lineWidth: 1)
         }
     }
 

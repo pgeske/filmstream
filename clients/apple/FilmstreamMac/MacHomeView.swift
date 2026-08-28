@@ -86,6 +86,7 @@ private extension MacHomeView {
 
 private struct MacLibraryView: View {
     @Environment(MacAppModel.self) private var model
+    @State private var isShowingRecommendationPreferences = false
     let showSearch: () -> Void
 
     var body: some View {
@@ -96,6 +97,7 @@ private struct MacLibraryView: View {
                 LazyVStack(alignment: .leading, spacing: 38) {
                     header
                     continueWatchingSection
+                    recommendationSection
                     ForEach(model.discoverySections) { section in
                         discoverySection(section)
                     }
@@ -128,6 +130,10 @@ private struct MacLibraryView: View {
         }
         .refreshable {
             await model.loadHome()
+        }
+        .sheet(isPresented: $isShowingRecommendationPreferences) {
+            MacRecommendationPreferencesView(prompt: model.recommendations?.prompt ?? "")
+                .environment(model)
         }
     }
 
@@ -177,6 +183,116 @@ private struct MacLibraryView: View {
                     .padding(.vertical, 10)
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var recommendationSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            recommendationHeader
+
+            if (model.isLoading && model.recommendations == nil)
+                || (model.recommendations?.refreshing == true
+                    && model.recommendations?.items.isEmpty == true) {
+                recommendationLoadingState
+            } else if let recommendations = model.recommendations,
+                      !recommendations.items.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    LazyHStack(alignment: .top, spacing: 18) {
+                        ForEach(recommendations.items) { movie in
+                            MacMovieCard(
+                                movie: movie,
+                                contentRating: model.ratings(for: movie)?.contentRating
+                            )
+                            .task(id: movie.id) {
+                                await model.loadRatings(for: movie)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 3)
+                    .padding(.vertical, 10)
+                }
+            } else {
+                emptyRecommendations
+            }
+        }
+    }
+
+    private var recommendationHeader: some View {
+        HStack(spacing: 12) {
+            sectionHeader("Recommended for You")
+            if model.recommendations?.refreshing == true,
+               model.recommendations?.items.isEmpty == false {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(Color.macTeaAccent)
+                Text("Updating…")
+                    .font(.caption)
+                    .foregroundStyle(Color.macTeaMuted)
+            }
+            Spacer()
+            Button {
+                isShowingRecommendationPreferences = true
+            } label: {
+                Label("Edit Taste", systemImage: "slider.horizontal.3")
+                    .font(.subheadline.weight(.semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Color.macTeaAccentLight)
+        }
+    }
+
+    private var recommendationLoadingState: some View {
+        HStack(spacing: 14) {
+            ProgressView()
+                .tint(Color.macTeaAccent)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Preparing recommendations…")
+                    .font(.headline)
+                    .foregroundStyle(Color.macTeaCream)
+                Text("TeaStream is matching movies and shows to your taste.")
+                    .font(.subheadline)
+                    .foregroundStyle(Color.macTeaMuted)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 150, alignment: .leading)
+    }
+
+    private var emptyRecommendations: some View {
+        HStack(spacing: 20) {
+            Image(systemName: "wand.and.stars")
+                .font(.system(size: 34, weight: .semibold))
+                .foregroundStyle(Color.macTeaAccentLight)
+                .frame(width: 58)
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Tell TeaStream what you like")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(Color.macTeaCream)
+                Text("Share favorite genres, shows, pacing, and things to avoid to build recommendations.")
+                    .foregroundStyle(Color.macTeaMuted)
+            }
+            Spacer()
+            Button {
+                isShowingRecommendationPreferences = true
+            } label: {
+                Label("Set Your Taste", systemImage: "slider.horizontal.3")
+                    .font(.headline.weight(.semibold))
+            }
+            .buttonStyle(MacTeaActionButtonStyle(prominent: true))
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, minHeight: 130)
+        .background(
+            LinearGradient(
+                colors: [Color.macTeaPanelElevated, Color.macTeaPanel],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: 20, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(Color.macTeaAccent.opacity(0.18), lineWidth: 1)
         }
     }
 

@@ -71,10 +71,12 @@ TeaStream defaults to `http://filmstream.home.alyoshukai.com`; each target conta
 
 ## Server capabilities
 
-The home screens pair Continue Watching with mixed movie/show TMDB-powered Popular Now and Top Rated rails. Cards identify the media type, genre, year, and season count where applicable. On tvOS, focused titles expand into cinematic landscape cards and move to the leading shelf position; iPhone and Mac use touch- and pointer-appropriate versions of the same metadata. Movie discovery requires an existing digital, physical, or TV release, so upcoming and theater-only movies stay off the shelf. Search starts automatically after two title characters with a short debounce; selecting any result opens its adaptive details and playback actions. All clients use:
+The home screens pair Continue Watching with a personalized Recommended for You shelf followed by mixed movie/show TMDB-powered Popular Now and Top Rated rails. Recommendation preferences use a focused native editor on each platform and remain server-side, while cached picks stay visible during regeneration. Cards identify the media type, genre, year, and season count where applicable. On tvOS, focused titles expand into cinematic landscape cards and move to the leading shelf position; iPhone and Mac use touch- and pointer-appropriate versions of the same metadata. Movie discovery requires an existing digital, physical, or TV release, so upcoming and theater-only movies stay off the shelf. Search starts automatically after two title characters with a short debounce; selecting any result opens its adaptive details and playback actions. All clients use:
 
 - `GET /v1/catalog/search` for mixed movie/show metadata and artwork;
 - `GET /v1/catalog/discover` for mixed home-screen discovery sections;
+- `GET /v1/recommendations` for personalized movies and shows, prompt state, and refresh status;
+- `PUT /v1/recommendations/prompt` to save the viewer's free-form taste description;
 - `GET /v1/catalog/shows/{id}` for show and season summaries;
 - `GET /v1/catalog/shows/{id}/seasons/{season}` for episode artwork and metadata;
 - `GET /v1/catalog/ratings` for optional IMDb, Rotten Tomatoes, and content ratings;

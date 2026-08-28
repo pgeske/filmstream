@@ -25,9 +25,12 @@ final class MacAppModel {
     var continueWatching: [WatchHistoryEntry] = []
     var watchHistory: [WatchHistoryEntry] = []
     var discoverySections: [DiscoverySection] = []
+    var recommendations: Recommendations?
+    var recommendationErrorMessage: String?
     var activePlayback: MacPlaybackSession?
     private(set) var ratingsByMovieID: [String: MovieRatings] = [:]
     private var requestedRatingIDs: Set<String> = []
+    private var recommendationFollowUpTask: Task<Void, Never>?
     var isLoading = false
     var errorMessage: String?
 
@@ -42,6 +45,7 @@ final class MacAppModel {
         async let continueRequest = api.continueWatching()
         async let historyRequest = api.watchHistory()
         async let discoveryRequest = api.discover()
+        async let recommendationRequest = api.recommendations()
         var errors: [String] = []
         do {
             continueWatching = try await continueRequest
@@ -58,7 +62,69 @@ final class MacAppModel {
         } catch {
             errors.append(error.localizedDescription)
         }
+        do {
+            applyRecommendations(try await recommendationRequest)
+            recommendationErrorMessage = nil
+        } catch {
+            recommendationErrorMessage = error.localizedDescription
+            errors.append(error.localizedDescription)
+        }
         errorMessage = errors.first
+    }
+
+    func updateRecommendationPrompt(_ prompt: String) async throws {
+        let previousError = recommendationErrorMessage
+        let response = try await api.updateRecommendationPrompt(prompt)
+        applyRecommendations(response)
+        if errorMessage == previousError {
+            errorMessage = nil
+        }
+        recommendationErrorMessage = nil
+        scheduleRecommendationFollowUp(ifNeeded: response.refreshing)
+    }
+
+    private func loadRecommendations() async {
+        do {
+            let previousError = recommendationErrorMessage
+            applyRecommendations(try await api.recommendations())
+            if errorMessage == previousError {
+                errorMessage = nil
+            }
+            recommendationErrorMessage = nil
+        } catch {
+            recommendationErrorMessage = error.localizedDescription
+        }
+    }
+
+    private func applyRecommendations(_ response: Recommendations) {
+        let items: [Movie]
+        if response.refreshing,
+           response.items.isEmpty,
+           let cachedItems = recommendations?.items,
+           !cachedItems.isEmpty {
+            items = cachedItems
+        } else {
+            items = response.items
+        }
+        recommendations = Recommendations(
+            generatedAt: response.generatedAt,
+            prompt: response.prompt,
+            refreshing: response.refreshing,
+            items: items
+        )
+    }
+
+    private func scheduleRecommendationFollowUp(ifNeeded: Bool) {
+        recommendationFollowUpTask?.cancel()
+        guard ifNeeded else { return }
+        recommendationFollowUpTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(3))
+            } catch {
+                return
+            }
+            await self?.loadRecommendations()
+        }
     }
 
     func loadContinueWatching() async {

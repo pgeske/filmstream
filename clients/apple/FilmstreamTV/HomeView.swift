@@ -6,11 +6,13 @@ struct HomeView: View {
     @State private var activeShelfID: String?
     @State private var lastFocusedShelfItem: NetflixShelfFocus?
     @State private var searchReturnFocus: NetflixShelfFocus?
+    @State private var isShowingRecommendationPreferences = false
     @FocusState private var focusedShelfItem: NetflixShelfFocus?
     @FocusState private var isSearchFocused: Bool
 
     private let homeTopID = "home-top"
     private let continueShelfID = "continue-watching"
+    private let recommendationShelfID = "recommended-for-you"
     private let finalShelfAlignmentSpace: CGFloat = 360
 
     var body: some View {
@@ -24,6 +26,7 @@ struct HomeView: View {
                             header
                                 .id(homeTopID)
                             continueWatchingSection(scrollProxy: scrollProxy)
+                            recommendationSection(scrollProxy: scrollProxy)
                             ForEach(model.discoverySections) { section in
                                 discoverySection(section, scrollProxy: scrollProxy)
                             }
@@ -49,6 +52,10 @@ struct HomeView: View {
             }
             .task {
                 await model.loadHome()
+            }
+            .sheet(isPresented: $isShowingRecommendationPreferences) {
+                RecommendationPreferencesView(prompt: model.recommendations?.prompt ?? "")
+                    .environment(model)
             }
             .onChange(of: focusedShelfItem) { _, newFocus in
                 guard let newFocus else { return }
@@ -140,6 +147,135 @@ struct HomeView: View {
                 }
             )
             .id(continueShelfID)
+        }
+    }
+
+    @ViewBuilder
+    private func recommendationSection(scrollProxy: ScrollViewProxy) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            recommendationHeader
+                .padding(.horizontal, 16)
+
+            if (model.isLoading && model.recommendations == nil)
+                || (model.recommendations?.refreshing == true
+                    && model.recommendations?.items.isEmpty == true) {
+                recommendationLoadingState
+                    .padding(.horizontal, 16)
+            } else if let recommendations = model.recommendations,
+                      !recommendations.items.isEmpty {
+                NetflixMovieShelf(
+                    shelfID: recommendationShelfID,
+                    title: "Recommended for You",
+                    items: recommendations.items.map {
+                        NetflixShelfItem(
+                            movie: $0,
+                            contentRating: model.ratings(for: $0)?.contentRating
+                        )
+                    },
+                    focusBinding: $focusedShelfItem,
+                    preferredEntryFocus: searchReturnFocus,
+                    showsTitle: false,
+                    onFocus: loadRatings,
+                    onHorizontalFocusChange: {
+                        alignShelf(
+                            recommendationShelfID,
+                            scrollProxy: scrollProxy,
+                            animated: false
+                        )
+                    },
+                    onShelfFocusChange: {
+                        updateShelfFocus(
+                            recommendationShelfID,
+                            isFocused: $0,
+                            scrollProxy: scrollProxy
+                        )
+                    }
+                )
+            } else {
+                emptyRecommendations
+                    .padding(.horizontal, 16)
+            }
+        }
+        .id(recommendationShelfID)
+    }
+
+    private var recommendationHeader: some View {
+        HStack(spacing: 18) {
+            shelfTitle("Recommended for You")
+            if model.recommendations?.refreshing == true,
+               model.recommendations?.items.isEmpty == false {
+                ProgressView()
+                    .tint(Color.teaAccent)
+                Text("Updating…")
+                    .font(.headline)
+                    .foregroundStyle(Color.teaMuted)
+            }
+            Spacer()
+            Button {
+                isShowingRecommendationPreferences = true
+            } label: {
+                Label("Edit Taste", systemImage: "slider.horizontal.3")
+                    .font(.headline.weight(.semibold))
+            }
+            .buttonStyle(TeaActionButtonStyle())
+            .focusEffectDisabled()
+        }
+        .focusSection()
+    }
+
+    private var recommendationLoadingState: some View {
+        HStack(spacing: 18) {
+            ProgressView()
+                .tint(Color.teaAccent)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Preparing recommendations…")
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(Color.teaCream)
+                Text("TeaStream is matching movies and shows to your taste.")
+                    .font(.title3)
+                    .foregroundStyle(Color.teaMuted)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 180, alignment: .leading)
+    }
+
+    private var emptyRecommendations: some View {
+        HStack(spacing: 30) {
+            Image(systemName: "wand.and.stars")
+                .font(.system(size: 54, weight: .semibold))
+                .foregroundStyle(Color.teaAccentLight)
+                .frame(width: 76)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Tell TeaStream what you like")
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(Color.teaCream)
+                Text("Share favorite genres, shows, pacing, and things to avoid to build recommendations.")
+                    .font(.title3)
+                    .foregroundStyle(Color.teaMuted)
+            }
+            Spacer()
+            Button {
+                isShowingRecommendationPreferences = true
+            } label: {
+                Label("Set Your Taste", systemImage: "slider.horizontal.3")
+                    .font(.headline.weight(.semibold))
+            }
+            .buttonStyle(TeaActionButtonStyle(prominent: true))
+            .focusEffectDisabled()
+        }
+        .padding(36)
+        .frame(maxWidth: .infinity, minHeight: 210)
+        .background(
+            LinearGradient(
+                colors: [Color.teaPanelElevated, Color.teaPanel],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            ),
+            in: RoundedRectangle(cornerRadius: 28, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .stroke(Color.teaAccent.opacity(0.18), lineWidth: 1)
         }
     }
 

@@ -35,6 +35,18 @@ public struct FilmstreamAPI: Sendable {
         return response.sections
     }
 
+    public func recommendations() async throws -> Recommendations {
+        try await send(path: "v1/recommendations")
+    }
+
+    public func updateRecommendationPrompt(_ prompt: String) async throws -> Recommendations {
+        try await send(
+            path: "v1/recommendations/prompt",
+            method: "PUT",
+            body: RecommendationPromptUpdate(prompt: prompt)
+        )
+    }
+
     public func seriesDetails(for showID: String) async throws -> SeriesDetails {
         try await send(
             url: baseURL

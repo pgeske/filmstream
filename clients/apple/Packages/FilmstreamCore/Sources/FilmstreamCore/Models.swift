@@ -141,6 +141,77 @@ public struct MovieRatings: Codable, Hashable, Sendable {
     }
 }
 
+public struct Recommendations: Codable, Hashable, Sendable {
+    public let generatedAt: Date?
+    public let prompt: String
+    public let refreshing: Bool
+    public let items: [Movie]
+
+    public init(
+        generatedAt: Date? = nil,
+        prompt: String,
+        refreshing: Bool,
+        items: [Movie]
+    ) {
+        self.generatedAt = generatedAt
+        self.prompt = prompt
+        self.refreshing = refreshing
+        self.items = items
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        prompt = try container.decode(String.self, forKey: .prompt)
+        refreshing = try container.decode(Bool.self, forKey: .refreshing)
+        items = try container.decode([Movie].self, forKey: .items)
+
+        guard let value = try container.decodeIfPresent(String.self, forKey: .generatedAt) else {
+            generatedAt = nil
+            return
+        }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: value) {
+            generatedAt = date
+            return
+        }
+        formatter.formatOptions = [.withInternetDateTime]
+        guard let date = formatter.date(from: value) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .generatedAt,
+                in: container,
+                debugDescription: "Expected an RFC3339 timestamp."
+            )
+        }
+        generatedAt = date
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        if let generatedAt {
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            try container.encode(formatter.string(from: generatedAt), forKey: .generatedAt)
+        }
+        try container.encode(prompt, forKey: .prompt)
+        try container.encode(refreshing, forKey: .refreshing)
+        try container.encode(items, forKey: .items)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case generatedAt = "generated_at"
+        case prompt, refreshing, items
+    }
+}
+
+public struct RecommendationPromptUpdate: Codable, Hashable, Sendable {
+    public let prompt: String
+
+    public init(prompt: String) {
+        self.prompt = prompt
+    }
+}
+
 public struct DiscoverySection: Codable, Hashable, Identifiable, Sendable {
     public let id: String
     public let title: String
