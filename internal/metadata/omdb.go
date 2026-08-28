@@ -15,6 +15,18 @@ import (
 
 const maxOMDbResponseBytes = 1 << 20
 
+type ratingsUnavailableError struct {
+	message string
+}
+
+func (e ratingsUnavailableError) Error() string {
+	return e.message
+}
+
+func (e ratingsUnavailableError) Is(target error) bool {
+	return target == ErrRatingsUnavailable
+}
+
 type OMDb struct {
 	baseURL string
 	apiKey  string
@@ -46,17 +58,29 @@ func NewOMDb(baseURL, apiKey string, client *http.Client) (*OMDb, error) {
 }
 
 func (o *OMDb) Ratings(ctx context.Context, title string, year int) (MovieRatings, error) {
+	return o.ratingsByTitle(ctx, title, year, "movie")
+}
+
+func (o *OMDb) RatingsForMedia(ctx context.Context, item Movie) (MovieRatings, error) {
+	mediaType := "movie"
+	if item.MediaType == MediaTypeShow {
+		mediaType = "series"
+	}
+	return o.ratingsByTitle(ctx, item.Title, item.Year, mediaType)
+}
+
+func (o *OMDb) ratingsByTitle(ctx context.Context, title string, year int, mediaType string) (MovieRatings, error) {
 	title = strings.TrimSpace(title)
 	if title == "" {
 		return MovieRatings{}, errors.New("rating title cannot be empty")
 	}
 	values := make(url.Values)
 	values.Set("t", title)
-	values.Set("type", "movie")
+	values.Set("type", mediaType)
 	if year > 0 {
 		values.Set("y", strconv.Itoa(year))
 	}
-	cacheKey := "title\x00" + strings.ToLower(title) + "\x00" + strconv.Itoa(year)
+	cacheKey := "title\x00" + mediaType + "\x00" + strings.ToLower(title) + "\x00" + strconv.Itoa(year)
 	return o.fetchRatings(ctx, cacheKey, values)
 }
 
@@ -104,7 +128,7 @@ func (o *OMDb) fetchRatings(ctx context.Context, cacheKey string, values url.Val
 		if errors.As(err, &urlError) {
 			err = urlError.Err
 		}
-		return MovieRatings{}, fmt.Errorf("request OMDb: %w", err)
+		return MovieRatings{}, ratingsUnavailableError{message: fmt.Sprintf("request OMDb: %v", err)}
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxOMDbResponseBytes))
@@ -115,6 +139,7 @@ func (o *OMDb) fetchRatings(ctx context.Context, cacheKey string, values url.Val
 		Response   string `json:"Response"`
 		Error      string `json:"Error"`
 		IMDbRating string `json:"imdbRating"`
+		IMDbVotes  string `json:"imdbVotes"`
 		Rated      string `json:"Rated"`
 		Ratings    []struct {
 			Source string `json:"Source"`
@@ -125,10 +150,15 @@ func (o *OMDb) fetchRatings(ctx context.Context, cacheKey string, values url.Val
 		return MovieRatings{}, fmt.Errorf("decode OMDb response: %w", err)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 || payload.Response != "True" {
+		message := "OMDb returned " + response.Status
 		if payload.Error != "" {
-			return MovieRatings{}, fmt.Errorf("OMDb: %s", payload.Error)
+			message = "OMDb: " + payload.Error
 		}
-		return MovieRatings{}, fmt.Errorf("OMDb returned %s", response.Status)
+		lowerMessage := strings.ToLower(message)
+		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError || strings.Contains(lowerMessage, "api key") || strings.Contains(lowerMessage, "request limit") {
+			return MovieRatings{}, ratingsUnavailableError{message: message}
+		}
+		return MovieRatings{}, errors.New(message)
 	}
 
 	ratings := MovieRatings{}
@@ -137,6 +167,9 @@ func (o *OMDb) fetchRatings(ctx context.Context, cacheKey string, values url.Val
 	}
 	if value, err := strconv.ParseFloat(payload.IMDbRating, 64); err == nil && value > 0 {
 		ratings.IMDb = &value
+	}
+	if value, err := strconv.Atoi(strings.ReplaceAll(payload.IMDbVotes, ",", "")); err == nil && value > 0 {
+		ratings.IMDbVotes = &value
 	}
 	for _, rating := range payload.Ratings {
 		if rating.Source != "Rotten Tomatoes" {

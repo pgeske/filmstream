@@ -144,10 +144,10 @@ func TestTMDBDiscoveryReturnsMixedMoviesAndShows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(popular) != 2 || popular[0].Title != "Popular Show" || popular[0].NumberOfSeasons != 3 || popular[1].Title != "Popular Movie" {
+	if len(popular) != 2 || popular[0].Title != "Popular Movie" || popular[1].Title != "Popular Show" || popular[1].NumberOfSeasons != 3 {
 		t.Fatalf("popular = %+v", popular)
 	}
-	if len(topRated) != 2 || topRated[0].Title != "Top Rated Show" || topRated[1].Title != "Top Rated Movie" {
+	if len(topRated) != 2 || topRated[0].Title != "Top Rated Movie" || topRated[1].Title != "Top Rated Show" {
 		t.Fatalf("top rated = %+v", topRated)
 	}
 }

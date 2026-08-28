@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -20,6 +22,13 @@ const (
 	posterBaseURL        = "https://image.tmdb.org/t/p/w500"
 	backdropBaseURL      = "https://image.tmdb.org/t/p/w1280"
 	stillBaseURL         = "https://image.tmdb.org/t/p/w780"
+
+	discoveryPageCount             = 3
+	discoveryCandidateLimitPerType = 30
+	discoveryItemLimit             = 20
+	discoveryExternalWorkers       = 4
+	minimumPopularIMDbRating       = 5.5
+	imdbVotePrior                  = 25000
 )
 
 var tmdbMovieGenres = map[int]string{
@@ -144,14 +153,22 @@ func (t *TMDB) IMDbID(ctx context.Context, mediaID string) (string, error) {
 }
 
 func (t *TMDB) Discover(ctx context.Context, collection Collection) ([]Movie, error) {
+	return t.discover(ctx, collection, nil)
+}
+
+func (t *TMDB) DiscoverWithRatings(ctx context.Context, collection Collection, ratingsProvider MediaRatingsProvider) ([]Movie, error) {
+	return t.discover(ctx, collection, ratingsProvider)
+}
+
+func (t *TMDB) discover(ctx context.Context, collection Collection, ratingsProvider MediaRatingsProvider) ([]Movie, error) {
+	today := time.Now().UTC()
 	movieValues := url.Values{
 		"include_adult": {"false"}, "include_video": {"false"}, "language": {t.language},
-		"page": {"1"}, "release_date.lte": {time.Now().UTC().Format(time.DateOnly)},
-		"with_release_type": {"4|5|6"},
+		"release_date.lte": {today.Format(time.DateOnly)}, "with_release_type": {"4|5|6"},
 	}
 	tvValues := url.Values{
-		"include_adult": {"false"}, "language": {t.language}, "page": {"1"},
-		"first_air_date.lte": {time.Now().UTC().Format(time.DateOnly)},
+		"include_adult": {"false"}, "language": {t.language},
+		"first_air_date.lte": {today.Format(time.DateOnly)},
 	}
 	switch collection {
 	case CollectionPopular:
@@ -172,11 +189,11 @@ func (t *TMDB) Discover(ctx context.Context, collection Collection) ([]Movie, er
 	}
 	results := make(chan result, 2)
 	go func() {
-		items, err := t.fetchMedia(ctx, "discover/movie", movieValues, "movie")
+		items, err := t.fetchDiscoveryPages(ctx, "discover/movie", movieValues, "movie")
 		results <- result{items: items, err: err}
 	}()
 	go func() {
-		items, err := t.fetchMedia(ctx, "discover/tv", tvValues, "tv")
+		items, err := t.fetchDiscoveryPages(ctx, "discover/tv", tvValues, "tv")
 		results <- result{items: items, err: err}
 	}()
 
@@ -192,17 +209,41 @@ func (t *TMDB) Discover(ctx context.Context, collection Collection) ([]Movie, er
 	if len(items) == 0 && len(failures) > 0 {
 		return nil, errors.Join(failures...)
 	}
-	sort.SliceStable(items, func(i, j int) bool {
-		if collection == CollectionPopular {
-			return items[i].Popularity > items[j].Popularity
-		}
-		if items[i].VoteAverage == items[j].VoteAverage {
-			return items[i].VoteCount > items[j].VoteCount
-		}
-		return items[i].VoteAverage > items[j].VoteAverage
-	})
-	items = interleaveMediaTypes(items, 20)
+	// Broaden the TMDB pool before spending the bounded OMDb budget on its strongest candidates.
+	items = shortlistDiscoveryCandidates(filterAiredMedia(items, today), collection)
+	rankedItems := make([]ratedDiscoveryItem, len(items))
+	for index, item := range items {
+		rankedItems[index].item = item
+	}
+	if ratingsProvider != nil {
+		enrichDiscoveryRatings(ctx, rankedItems, ratingsProvider)
+	}
+	items = rankDiscoveryCandidates(rankedItems, collection, today.Year())
 	return t.enrichShowSummaries(ctx, items), nil
+}
+
+func (t *TMDB) fetchDiscoveryPages(ctx context.Context, path string, values url.Values, forcedType string) ([]Movie, error) {
+	items := make([]Movie, 0, discoveryPageCount*20)
+	seen := make(map[string]struct{}, discoveryPageCount*20)
+	for page := 1; page <= discoveryPageCount; page++ {
+		pageValues := make(url.Values, len(values)+1)
+		for name, entries := range values {
+			pageValues[name] = append([]string(nil), entries...)
+		}
+		pageValues.Set("page", strconv.Itoa(page))
+		pageItems, err := t.fetchMedia(ctx, path, pageValues, forcedType)
+		for _, item := range pageItems {
+			if _, ok := seen[item.ID]; ok {
+				continue
+			}
+			seen[item.ID] = struct{}{}
+			items = append(items, item)
+		}
+		if err != nil {
+			return items, err
+		}
+	}
+	return items, nil
 }
 
 func (t *TMDB) Show(ctx context.Context, mediaID string) (Show, error) {
@@ -383,6 +424,245 @@ func (t *TMDB) Season(ctx context.Context, mediaID string, number int) (Season, 
 	return season, nil
 }
 
+type ratedDiscoveryItem struct {
+	item    Movie
+	ratings MovieRatings
+}
+
+type scoredDiscoveryItem struct {
+	ratedDiscoveryItem
+	score  float64
+	rating float64
+	votes  int
+}
+
+func filterAiredMedia(items []Movie, today time.Time) []Movie {
+	filtered := items[:0]
+	for _, item := range items {
+		if item.ReleaseDate != "" {
+			releaseDate, err := time.Parse(time.DateOnly, item.ReleaseDate)
+			if err == nil && releaseDate.After(today) {
+				continue
+			}
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
+func shortlistDiscoveryCandidates(items []Movie, collection Collection) []Movie {
+	movies := make([]Movie, 0, len(items))
+	shows := make([]Movie, 0, len(items))
+	for _, item := range items {
+		if item.MediaType == MediaTypeShow {
+			shows = append(shows, item)
+		} else {
+			movies = append(movies, item)
+		}
+	}
+	less := func(items []Movie) func(int, int) bool {
+		return func(i, j int) bool {
+			if collection == CollectionPopular && items[i].Popularity != items[j].Popularity {
+				return items[i].Popularity > items[j].Popularity
+			}
+			if collection == CollectionTopRated {
+				iScore := weightedRating(items[i].VoteAverage, items[i].VoteCount, tmdbRatingPriorVotes(items[i].MediaType))
+				jScore := weightedRating(items[j].VoteAverage, items[j].VoteCount, tmdbRatingPriorVotes(items[j].MediaType))
+				if iScore != jScore {
+					return iScore > jScore
+				}
+			}
+			if items[i].VoteCount != items[j].VoteCount {
+				return items[i].VoteCount > items[j].VoteCount
+			}
+			if items[i].VoteAverage != items[j].VoteAverage {
+				return items[i].VoteAverage > items[j].VoteAverage
+			}
+			return items[i].ID < items[j].ID
+		}
+	}
+	sort.Slice(movies, less(movies))
+	sort.Slice(shows, less(shows))
+	movies = movies[:min(len(movies), discoveryCandidateLimitPerType)]
+	shows = shows[:min(len(shows), discoveryCandidateLimitPerType)]
+	return append(movies, shows...)
+}
+
+func enrichDiscoveryRatings(ctx context.Context, items []ratedDiscoveryItem, provider MediaRatingsProvider) {
+	if len(items) == 0 {
+		return
+	}
+	jobs := make(chan int)
+	var unavailable atomic.Bool
+	var workers sync.WaitGroup
+	for range min(discoveryExternalWorkers, len(items)) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for index := range jobs {
+				if unavailable.Load() || ctx.Err() != nil {
+					continue
+				}
+				ratings, err := provider.RatingsForMedia(ctx, items[index].item)
+				if err != nil {
+					if errors.Is(err, ErrRatingsUnavailable) {
+						unavailable.Store(true)
+					}
+					continue
+				}
+				items[index].ratings = ratings
+			}
+		}()
+	}
+	for index := range items {
+		jobs <- index
+	}
+	close(jobs)
+	workers.Wait()
+}
+
+func rankDiscoveryCandidates(items []ratedDiscoveryItem, collection Collection, currentYear int) []Movie {
+	if collection == CollectionPopular {
+		items = filterLowRatedPopularItems(items)
+	}
+
+	type popularityRange struct {
+		minimum float64
+		maximum float64
+		set     bool
+	}
+	popularity := make(map[MediaType]popularityRange, 2)
+	for _, item := range items {
+		value := math.Log1p(max(item.item.Popularity, 0))
+		values := popularity[item.item.MediaType]
+		if !values.set || value < values.minimum {
+			values.minimum = value
+		}
+		if !values.set || value > values.maximum {
+			values.maximum = value
+		}
+		values.set = true
+		popularity[item.item.MediaType] = values
+	}
+
+	scored := make([]scoredDiscoveryItem, 0, len(items))
+	for _, item := range items {
+		rating, votes, hasIMDb := discoveryRatingSignals(item)
+		score := 0.0
+		if collection == CollectionTopRated {
+			priorVotes := tmdbRatingPriorVotes(item.item.MediaType)
+			if hasIMDb {
+				priorVotes = imdbVotePrior
+			}
+			score = weightedRating(rating, votes, priorVotes)
+		} else {
+			values := popularity[item.item.MediaType]
+			popularityScore := normalizedValue(math.Log1p(max(item.item.Popularity, 0)), values.minimum, values.maximum)
+			voteScore := min(math.Log10(float64(max(votes, 0))+1)/6, 1)
+			qualityScore := min(max((rating-5)/4, 0), 1)
+			recencyScore := 0.3
+			if item.item.Year > 0 {
+				recencyScore = math.Exp(-float64(max(currentYear-item.item.Year, 0)) / 10)
+			}
+			// TMDB popularity keeps this collection current; IMDb quality and reach suppress transient noise.
+			score = 0.55*popularityScore + 0.2*voteScore + 0.2*qualityScore + 0.05*recencyScore
+		}
+		scored = append(scored, scoredDiscoveryItem{
+			ratedDiscoveryItem: item,
+			score:              score,
+			rating:             rating,
+			votes:              votes,
+		})
+	}
+	sort.Slice(scored, func(i, j int) bool {
+		if scored[i].score != scored[j].score {
+			return scored[i].score > scored[j].score
+		}
+		if scored[i].votes != scored[j].votes {
+			return scored[i].votes > scored[j].votes
+		}
+		if scored[i].rating != scored[j].rating {
+			return scored[i].rating > scored[j].rating
+		}
+		if scored[i].item.Popularity != scored[j].item.Popularity {
+			return scored[i].item.Popularity > scored[j].item.Popularity
+		}
+		return scored[i].item.ID < scored[j].item.ID
+	})
+
+	ranked := make([]Movie, len(scored))
+	for index, item := range scored {
+		ranked[index] = item.item
+	}
+	return interleaveMediaTypes(ranked, discoveryItemLimit)
+}
+
+func filterLowRatedPopularItems(items []ratedDiscoveryItem) []ratedDiscoveryItem {
+	counts := make(map[MediaType]int, 2)
+	acceptable := make(map[MediaType]int, 2)
+	for _, item := range items {
+		counts[item.item.MediaType]++
+		if !hasLowIMDbRating(item.ratings) {
+			acceptable[item.item.MediaType]++
+		}
+	}
+	filtered := make([]ratedDiscoveryItem, 0, len(items))
+	for _, item := range items {
+		required := discoveryItemLimit
+		otherType := MediaTypeMovie
+		if item.item.MediaType == MediaTypeMovie {
+			otherType = MediaTypeShow
+		}
+		if counts[otherType] > 0 {
+			required = discoveryItemLimit / 2
+		}
+		if hasLowIMDbRating(item.ratings) && acceptable[item.item.MediaType] >= required {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
+func hasLowIMDbRating(ratings MovieRatings) bool {
+	return ratings.IMDb != nil && *ratings.IMDb < minimumPopularIMDbRating
+}
+
+func discoveryRatingSignals(item ratedDiscoveryItem) (float64, int, bool) {
+	if item.ratings.IMDb != nil {
+		votes := 0
+		if item.ratings.IMDbVotes != nil {
+			votes = *item.ratings.IMDbVotes
+		}
+		return *item.ratings.IMDb, votes, true
+	}
+	return item.item.VoteAverage, item.item.VoteCount, false
+}
+
+// weightedRating pulls ratings with small audiences toward a neutral prior.
+func weightedRating(rating float64, votes, priorVotes int) float64 {
+	if rating <= 0 || votes <= 0 {
+		return 0
+	}
+	const priorRating = 6.5
+	confidence := float64(votes) / float64(votes+priorVotes)
+	return confidence*rating + (1-confidence)*priorRating
+}
+
+func tmdbRatingPriorVotes(mediaType MediaType) int {
+	if mediaType == MediaTypeShow {
+		return 2000
+	}
+	return 5000
+}
+
+func normalizedValue(value, minimum, maximum float64) float64 {
+	if maximum <= minimum {
+		return 1
+	}
+	return (value - minimum) / (maximum - minimum)
+}
+
 func interleaveMediaTypes(items []Movie, limit int) []Movie {
 	if limit <= 0 {
 		return nil
@@ -423,24 +703,40 @@ func interleaveMediaTypes(items []Movie, limit int) []Movie {
 }
 
 func (t *TMDB) enrichShowSummaries(ctx context.Context, items []Movie) []Movie {
+	type job struct {
+		index int
+		id    string
+	}
 	type result struct {
 		index int
 		show  Show
 	}
+	jobs := make(chan job, len(items))
 	results := make(chan result, len(items))
-	count := 0
 	for index, item := range items {
-		if item.MediaType != MediaTypeShow || item.NumberOfSeasons > 0 {
-			continue
+		if item.MediaType == MediaTypeShow && item.NumberOfSeasons == 0 {
+			jobs <- job{index: index, id: item.ID}
 		}
-		count++
-		go func(index int, id string) {
-			show, _ := t.Show(ctx, id)
-			results <- result{index: index, show: show}
-		}(index, item.ID)
 	}
-	for range count {
-		result := <-results
+	close(jobs)
+	if len(jobs) == 0 {
+		return items
+	}
+
+	var workers sync.WaitGroup
+	for range min(discoveryExternalWorkers, len(jobs)) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for job := range jobs {
+				show, _ := t.Show(ctx, job.id)
+				results <- result{index: job.index, show: show}
+			}
+		}()
+	}
+	workers.Wait()
+	close(results)
+	for result := range results {
 		if result.show.ID == "" {
 			continue
 		}

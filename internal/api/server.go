@@ -426,6 +426,7 @@ func (s *Server) catalogRatings(w http.ResponseWriter, r *http.Request) {
 func (s *Server) discoverCatalog(w http.ResponseWriter, r *http.Request) {
 	s.metadataMu.RLock()
 	provider, ok := s.metadataProvider.(metadata.DiscoveryProvider)
+	ratingsProvider, hasRatings := s.ratingsProvider.(metadata.MediaRatingsProvider)
 	s.metadataMu.RUnlock()
 	if !ok {
 		writeError(w, http.StatusServiceUnavailable, "catalog discovery is not configured")
@@ -443,7 +444,13 @@ func (s *Server) discoverCatalog(w http.ResponseWriter, r *http.Request) {
 	sections := make([]catalogSection, 0, len(collections))
 	var firstError error
 	for _, collection := range collections {
-		movies, err := provider.Discover(r.Context(), collection.id)
+		var movies []metadata.Movie
+		var err error
+		if imdbProvider, supportsIMDb := provider.(metadata.IMDbDiscoveryProvider); supportsIMDb && hasRatings {
+			movies, err = imdbProvider.DiscoverWithRatings(r.Context(), collection.id, ratingsProvider)
+		} else {
+			movies, err = provider.Discover(r.Context(), collection.id)
+		}
 		if err != nil {
 			if firstError == nil {
 				firstError = err
@@ -2262,6 +2269,9 @@ func firstNonEmpty(values ...string) string {
 func mergeMovieRatings(primary, fallback metadata.MovieRatings) metadata.MovieRatings {
 	if primary.IMDb == nil {
 		primary.IMDb = fallback.IMDb
+	}
+	if primary.IMDbVotes == nil {
+		primary.IMDbVotes = fallback.IMDbVotes
 	}
 	if primary.RottenTomatoes == nil {
 		primary.RottenTomatoes = fallback.RottenTomatoes

@@ -1,6 +1,9 @@
 package metadata
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 type MediaType string
 
@@ -67,9 +70,12 @@ type Season struct {
 
 type MovieRatings struct {
 	IMDb           *float64 `json:"imdb,omitempty"`
+	IMDbVotes      *int     `json:"imdb_votes,omitempty"`
 	RottenTomatoes *int     `json:"rotten_tomatoes,omitempty"`
 	ContentRating  *string  `json:"content_rating,omitempty"`
 }
+
+var ErrRatingsUnavailable = errors.New("external ratings are unavailable")
 
 type Provider interface {
 	Search(context.Context, string) ([]Movie, error)
@@ -88,6 +94,10 @@ type IMDbRatingsProvider interface {
 	RatingsByIMDbID(context.Context, string) (MovieRatings, error)
 }
 
+type MediaRatingsProvider interface {
+	RatingsForMedia(context.Context, Movie) (MovieRatings, error)
+}
+
 type IMDbIDProvider interface {
 	IMDbID(context.Context, string) (string, error)
 }
@@ -101,4 +111,8 @@ const (
 
 type DiscoveryProvider interface {
 	Discover(context.Context, Collection) ([]Movie, error)
+}
+
+type IMDbDiscoveryProvider interface {
+	DiscoverWithRatings(context.Context, Collection, MediaRatingsProvider) ([]Movie, error)
 }
