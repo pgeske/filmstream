@@ -73,9 +73,10 @@ func TestServiceFailedRefreshRetainsLastGoodListAndThrottlesRetries(t *testing.T
 	if err := store.save(persistedState{
 		GeneratedAt: generatedAt,
 		Prompt:      "quiet science fiction",
-		Items: []metadata.Movie{{
-			ID: "tmdb:old", MediaType: metadata.MediaTypeMovie, Title: "Last Good",
-		}},
+		Items: []metadata.Movie{
+			{ID: "tmdb-tv:old", MediaType: metadata.MediaTypeShow, Title: "Last Good Show"},
+			{ID: "tmdb:old", MediaType: metadata.MediaTypeMovie, Title: "Last Good Movie"},
+		},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +84,9 @@ func TestServiceFailedRefreshRetainsLastGoodListAndThrottlesRetries(t *testing.T
 	var calls atomic.Int32
 	generator := serviceGeneratorFunc(func(context.Context, string) ([]metadata.Movie, error) {
 		calls.Add(1)
-		return nil, errors.New("private upstream failure")
+		return []metadata.Movie{{
+			ID: "tmdb:new", MediaType: metadata.MediaTypeMovie, Title: "Lopsided Partial Result",
+		}}, errors.New("private show metadata outage")
 	})
 	service := NewService(store, generator, nil, ServiceOptions{Now: func() time.Time { return now }})
 
@@ -91,7 +94,8 @@ func TestServiceFailedRefreshRetainsLastGoodListAndThrottlesRetries(t *testing.T
 	waitForRefresh(t, service)
 	response := service.Snapshot()
 	if response.GeneratedAt == nil || !response.GeneratedAt.Equal(generatedAt) ||
-		len(response.Items) != 1 || response.Items[0].Title != "Last Good" {
+		len(response.Items) != 2 || response.Items[0].Title != "Last Good Show" ||
+		response.Items[1].Title != "Last Good Movie" {
 		t.Fatalf("response after failure = %+v", response)
 	}
 	service.Refresh(RefreshAutomatic)
@@ -104,7 +108,8 @@ func TestServiceFailedRefreshRetainsLastGoodListAndThrottlesRetries(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(reloaded.Items) != 1 || reloaded.Items[0].Title != "Last Good" || reloaded.LastAttemptAt.IsZero() {
+	if len(reloaded.Items) != 2 || reloaded.Items[0].Title != "Last Good Show" ||
+		reloaded.Items[1].Title != "Last Good Movie" || reloaded.LastAttemptAt.IsZero() {
 		t.Fatalf("persisted state = %+v", reloaded)
 	}
 }
