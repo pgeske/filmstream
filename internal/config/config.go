@@ -52,7 +52,8 @@ type Metadata struct {
 }
 
 type Recommendations struct {
-	Model string `json:"model,omitempty"`
+	Model      string `json:"model,omitempty"`
+	PromptFile string `json:"prompt_file,omitempty"`
 }
 
 type Usenet struct {
@@ -162,6 +163,7 @@ func Load(path string) (Config, error) {
 	cfg.Metadata.APIKeyFile = expandHome(cfg.Metadata.APIKeyFile)
 	cfg.Usenet.APIKeyFile = expandHome(cfg.Usenet.APIKeyFile)
 	cfg.Usenet.WebDAVPasswordFile = expandHome(cfg.Usenet.WebDAVPasswordFile)
+	cfg.Recommendations.PromptFile = expandHome(cfg.Recommendations.PromptFile)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}

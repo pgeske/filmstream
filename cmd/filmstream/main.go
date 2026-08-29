@@ -198,7 +198,8 @@ func runServer(args []string) error {
 		}
 	}
 	recommendationService := recommendations.NewService(
-		recommendations.NewStore(cfg.StateDir), recommendationGenerator, logger, recommendations.ServiceOptions{},
+		recommendations.NewStore(cfg.StateDir), recommendationGenerator, logger,
+		recommendations.ServiceOptions{PromptFile: cfg.Recommendations.PromptFile},
 	)
 	apiServer := api.New(registry, engine, defaults, logger)
 	apiServer.SetPlaybackSourceMode(cfg.PlaybackSourceMode)

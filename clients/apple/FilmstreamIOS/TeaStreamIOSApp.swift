@@ -79,27 +79,6 @@ final class IOSAppModel {
         errorMessage = errors.first
     }
 
-    func updateRecommendationPrompt(_ prompt: String) async throws {
-        recommendationOperationID += 1
-        let operationID = recommendationOperationID
-        recommendationPoller.cancel()
-        recommendations = recommendations?.settingRefreshing(false)
-
-        let previousError = recommendationErrorMessage
-        let response = try await api.updateRecommendationPrompt(prompt)
-        guard operationID == recommendationOperationID else { return }
-
-        applyRecommendations(response, source: .promptSave)
-        if errorMessage == previousError {
-            errorMessage = nil
-        }
-        recommendationErrorMessage = nil
-        scheduleRecommendationPolling(
-            ifNeeded: recommendations?.refreshing == true,
-            operationID: operationID
-        )
-    }
-
     private func applyRecommendations(
         _ response: Recommendations,
         source: RecommendationUpdateSource

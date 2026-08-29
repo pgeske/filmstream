@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +51,10 @@ type ServiceOptions struct {
 	RefreshTTL     time.Duration
 	RefreshTimeout time.Duration
 	Now            func() time.Time
+	// PromptFile is an absolute path to a note whose text is the authoritative
+	// taste prompt whenever the file exists and is non-empty. When it is unset,
+	// missing, or empty, the stored prompt remains the taste prompt.
+	PromptFile string
 }
 
 type Service struct {
@@ -66,6 +71,12 @@ type Service struct {
 	refreshTTL     time.Duration
 	refreshTimeout time.Duration
 	now            func() time.Time
+
+	// filePrompt is the trimmed prompt file text; empty means the file is
+	// unset, missing, unreadable, or blank and the stored prompt applies.
+	filePrompt  string
+	fileModTime time.Time
+	promptFile  string
 }
 
 type refreshJob struct {
@@ -101,10 +112,13 @@ func NewService(store *Store, generator ItemGenerator, logger *slog.Logger, opti
 			state = loaded
 		}
 	}
-	return &Service{
+	service := &Service{
 		store: store, storeReady: storeReady, logger: logger, state: state, generator: generator,
 		context: context.Background(), refreshTTL: refreshTTL, refreshTimeout: refreshTimeout, now: now,
+		promptFile: options.PromptFile,
 	}
+	service.refreshPromptFile()
+	return service
 }
 
 func (s *Service) Start(ctx context.Context) {
@@ -145,6 +159,7 @@ func (s *Service) Snapshot() Response {
 }
 
 func (s *Service) Refresh(reason RefreshReason) Response {
+	s.refreshPromptFile()
 	s.mu.Lock()
 	job, started := s.beginRefreshLocked(reason)
 	response := s.snapshotLocked()
@@ -172,7 +187,11 @@ func (s *Service) SetPrompt(prompt string) (Response, error) {
 	}
 	next := s.state
 	next.Prompt = prompt
-	next.PromptRefreshPending = true
+	if s.filePrompt == "" {
+		// Without an authoritative prompt file the stored prompt drives
+		// generation, so a change schedules a refresh as before.
+		next.PromptRefreshPending = true
+	}
 	if err := s.saveLocked(next); err != nil {
 		response := s.snapshotLocked()
 		s.mu.Unlock()
@@ -180,7 +199,11 @@ func (s *Service) SetPrompt(prompt string) (Response, error) {
 	}
 	s.state = next
 	s.promptRevision++
-	job, started := s.beginRefreshLocked(refreshPromptChanged)
+	var job refreshJob
+	started := false
+	if s.filePrompt == "" {
+		job, started = s.beginRefreshLocked(refreshPromptChanged)
+	}
 	response := s.snapshotLocked()
 	s.mu.Unlock()
 	if started {
@@ -209,7 +232,7 @@ func (s *Service) beginRefreshLocked(reason RefreshReason) (refreshJob, bool) {
 	s.state = next
 	s.refreshing = true
 	return refreshJob{
-		context: s.context, generator: s.generator, prompt: s.state.Prompt, revision: s.promptRevision,
+		context: s.context, generator: s.generator, prompt: s.effectivePromptLocked(), revision: s.promptRevision,
 	}, true
 }
 
@@ -217,7 +240,7 @@ func (s *Service) automaticRefreshDueLocked(now time.Time) bool {
 	if s.state.PromptRefreshPending {
 		return true
 	}
-	generatedForCurrentPrompt := s.state.GeneratedPromptHash == promptHash(s.state.Prompt)
+	generatedForCurrentPrompt := s.state.GeneratedPromptHash == promptHash(s.effectivePromptLocked())
 	if generatedForCurrentPrompt && !s.state.GeneratedAt.IsZero() && now.Sub(s.state.GeneratedAt) < s.refreshTTL {
 		return false
 	}
@@ -236,7 +259,7 @@ func (s *Service) run(job refreshJob) {
 func (s *Service) finishRefresh(job refreshJob, items []metadata.Movie, generationErr error) {
 	s.mu.Lock()
 	s.refreshing = false
-	currentPrompt := job.revision == s.promptRevision && job.prompt == s.state.Prompt
+	currentPrompt := job.revision == s.promptRevision && job.prompt == s.effectivePromptLocked()
 	if generationErr == nil && currentPrompt {
 		next := s.state
 		next.GeneratedAt = s.now().UTC()
@@ -263,6 +286,78 @@ func (s *Service) finishRefresh(job refreshJob, items []metadata.Movie, generati
 	s.mu.Unlock()
 	if started {
 		s.run(nextJob)
+	}
+}
+
+// effectivePromptLocked returns the taste prompt generation uses. A configured,
+// non-empty prompt file is authoritative and overrides the stored prompt.
+func (s *Service) effectivePromptLocked() string {
+	if s.filePrompt != "" {
+		return s.filePrompt
+	}
+	return s.state.Prompt
+}
+
+// refreshPromptFile reloads the prompt file after its modification time
+// changes. The hot path pays one stat per refresh; the file itself is only
+// read when the mtime moved, outside the service lock. A missing or empty
+// file falls back to the stored prompt.
+func (s *Service) refreshPromptFile() {
+	if s.promptFile == "" {
+		return
+	}
+	info, err := os.Stat(s.promptFile)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) && s.logger != nil {
+			s.logger.Warn("stat recommendation prompt file failed; using stored prompt", "error", err)
+		}
+		s.mu.Lock()
+		s.filePrompt = ""
+		s.fileModTime = time.Time{}
+		s.markPromptRefreshPendingLocked()
+		s.mu.Unlock()
+		return
+	}
+	modTime := info.ModTime()
+	s.mu.Lock()
+	unchanged := modTime.Equal(s.fileModTime)
+	s.mu.Unlock()
+	if unchanged {
+		return
+	}
+
+	contents, readErr := os.ReadFile(s.promptFile)
+	if readErr != nil && s.logger != nil {
+		s.logger.Warn("read recommendation prompt file failed; using stored prompt", "error", readErr)
+	}
+	s.mu.Lock()
+	s.fileModTime = modTime
+	s.filePrompt = ""
+	if readErr == nil {
+		s.filePrompt = strings.TrimSpace(string(contents))
+	}
+	s.markPromptRefreshPendingLocked()
+	s.mu.Unlock()
+}
+
+// markPromptRefreshPendingLocked reuses the persisted pending flag whenever the
+// effective prompt no longer matches the last generation, so note edits are
+// honored on the next GET and survive restarts.
+func (s *Service) markPromptRefreshPendingLocked() {
+	effective := s.effectivePromptLocked()
+	if effective == "" && s.state.GeneratedPromptHash == "" {
+		// Nothing has been generated yet and there is no prompt; leave
+		// scheduling to the normal TTL path.
+		return
+	}
+	if s.state.GeneratedPromptHash == promptHash(effective) {
+		return
+	}
+	s.state.PromptRefreshPending = true
+	if s.storeReady {
+		if err := s.saveLocked(s.state); err != nil && s.logger != nil {
+			s.logger.Warn("persist recommendation prompt file change", "error", err)
+		}
 	}
 }
 
