@@ -6,7 +6,6 @@ struct HomeView: View {
     @State private var activeShelfID: String?
     @State private var lastFocusedShelfItem: NetflixShelfFocus?
     @State private var searchReturnFocus: NetflixShelfFocus?
-    @State private var isShowingRecommendationPreferences = false
     @FocusState private var focusedShelfItem: NetflixShelfFocus?
     @FocusState private var isSearchFocused: Bool
 
@@ -54,10 +53,6 @@ struct HomeView: View {
             }
             .task {
                 await model.loadHome()
-            }
-            .sheet(isPresented: $isShowingRecommendationPreferences) {
-                RecommendationPreferencesView(prompt: model.recommendations?.prompt ?? "")
-                    .environment(model)
             }
             .onChange(of: focusedShelfItem) { _, newFocus in
                 guard let newFocus else { return }
@@ -155,9 +150,6 @@ struct HomeView: View {
     @ViewBuilder
     private func recommendationSections(scrollProxy: ScrollViewProxy) -> some View {
         VStack(alignment: .leading, spacing: 30) {
-            recommendationHeader
-                .padding(.horizontal, 16)
-
             if (model.isLoading && model.recommendations == nil)
                 || (model.recommendations?.refreshing == true
                     && model.recommendations?.items.isEmpty == true) {
@@ -229,30 +221,6 @@ struct HomeView: View {
         }
     }
 
-    private var recommendationHeader: some View {
-        HStack(spacing: 18) {
-            shelfTitle("For You")
-            if model.recommendations?.refreshing == true,
-               model.recommendations?.items.isEmpty == false {
-                ProgressView()
-                    .tint(Color.teaAccent)
-                Text("Updating recommendations…")
-                    .font(.headline)
-                    .foregroundStyle(Color.teaMuted)
-            }
-            Spacer()
-            Button {
-                isShowingRecommendationPreferences = true
-            } label: {
-                Label("Tune Recommendations", systemImage: "slider.horizontal.3")
-                    .font(.headline.weight(.semibold))
-            }
-            .buttonStyle(TeaActionButtonStyle())
-            .focusEffectDisabled()
-        }
-        .focusSection()
-    }
-
     private var recommendationLoadingState: some View {
         HStack(spacing: 18) {
             ProgressView()
@@ -276,24 +244,13 @@ struct HomeView: View {
                 .foregroundStyle(Color.teaAccentLight)
                 .frame(width: 76)
             VStack(alignment: .leading, spacing: 8) {
-                Text(hasRecommendationPrompt ? "Recommendations are still brewing" : "Tell TeaStream what you like")
+                Text("Recommendations are still brewing")
                     .font(.title2.weight(.semibold))
                     .foregroundStyle(Color.teaCream)
-                Text(hasRecommendationPrompt
-                    ? "TeaStream will check again the next time Home refreshes."
-                    : "Share favorite genres, shows, pacing, and things to avoid to build recommendations.")
+                Text("TeaStream will check again the next time Home refreshes.")
                     .font(.title3)
                     .foregroundStyle(Color.teaMuted)
             }
-            Spacer()
-            Button {
-                isShowingRecommendationPreferences = true
-            } label: {
-                Label("Tune Recommendations", systemImage: "slider.horizontal.3")
-                    .font(.headline.weight(.semibold))
-            }
-            .buttonStyle(TeaActionButtonStyle(prominent: true))
-            .focusEffectDisabled()
         }
         .padding(36)
         .frame(maxWidth: .infinity, minHeight: 210)
@@ -309,10 +266,6 @@ struct HomeView: View {
             RoundedRectangle(cornerRadius: 28, style: .continuous)
                 .stroke(Color.teaAccent.opacity(0.18), lineWidth: 1)
         }
-    }
-
-    private var hasRecommendationPrompt: Bool {
-        !(model.recommendations?.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     }
 
     @ViewBuilder

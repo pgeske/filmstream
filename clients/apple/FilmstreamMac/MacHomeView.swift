@@ -86,7 +86,6 @@ private extension MacHomeView {
 
 private struct MacLibraryView: View {
     @Environment(MacAppModel.self) private var model
-    @State private var isShowingRecommendationPreferences = false
     let showSearch: () -> Void
 
     var body: some View {
@@ -130,10 +129,6 @@ private struct MacLibraryView: View {
         }
         .refreshable {
             await model.loadHome()
-        }
-        .sheet(isPresented: $isShowingRecommendationPreferences) {
-            MacRecommendationPreferencesView(prompt: model.recommendations?.prompt ?? "")
-                .environment(model)
         }
     }
 
@@ -189,8 +184,6 @@ private struct MacLibraryView: View {
     @ViewBuilder
     private var recommendationSections: some View {
         VStack(alignment: .leading, spacing: 32) {
-            recommendationHeader
-
             if (model.isLoading && model.recommendations == nil)
                 || (model.recommendations?.refreshing == true
                     && model.recommendations?.items.isEmpty == true) {
@@ -246,30 +239,6 @@ private struct MacLibraryView: View {
         }
     }
 
-    private var recommendationHeader: some View {
-        HStack(spacing: 12) {
-            sectionHeader("For You")
-            if model.recommendations?.refreshing == true,
-               model.recommendations?.items.isEmpty == false {
-                ProgressView()
-                    .controlSize(.small)
-                    .tint(Color.macTeaAccent)
-                Text("Updating recommendations…")
-                    .font(.caption)
-                    .foregroundStyle(Color.macTeaMuted)
-            }
-            Spacer()
-            Button {
-                isShowingRecommendationPreferences = true
-            } label: {
-                Label("Tune Recommendations", systemImage: "slider.horizontal.3")
-                    .font(.subheadline.weight(.semibold))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(Color.macTeaAccentLight)
-        }
-    }
-
     private var recommendationLoadingState: some View {
         HStack(spacing: 14) {
             ProgressView()
@@ -293,22 +262,12 @@ private struct MacLibraryView: View {
                 .foregroundStyle(Color.macTeaAccentLight)
                 .frame(width: 58)
             VStack(alignment: .leading, spacing: 5) {
-                Text(hasRecommendationPrompt ? "Recommendations are still brewing" : "Tell TeaStream what you like")
+                Text("Recommendations are still brewing")
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(Color.macTeaCream)
-                Text(hasRecommendationPrompt
-                    ? "TeaStream will check again the next time Home refreshes."
-                    : "Share favorite genres, shows, pacing, and things to avoid to build recommendations.")
+                Text("TeaStream will check again the next time Home refreshes.")
                     .foregroundStyle(Color.macTeaMuted)
             }
-            Spacer()
-            Button {
-                isShowingRecommendationPreferences = true
-            } label: {
-                Label("Tune Recommendations", systemImage: "slider.horizontal.3")
-                    .font(.headline.weight(.semibold))
-            }
-            .buttonStyle(MacTeaActionButtonStyle(prominent: true))
         }
         .padding(24)
         .frame(maxWidth: .infinity, minHeight: 130)
@@ -324,10 +283,6 @@ private struct MacLibraryView: View {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(Color.macTeaAccent.opacity(0.18), lineWidth: 1)
         }
-    }
-
-    private var hasRecommendationPrompt: Bool {
-        !(model.recommendations?.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     }
 
     @ViewBuilder

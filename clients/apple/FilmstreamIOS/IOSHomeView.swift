@@ -56,7 +56,6 @@ private enum IOSRootTab: Hashable {
 
 struct IOSHomeView: View {
     @Environment(IOSAppModel.self) private var model
-    @State private var isShowingRecommendationPreferences = false
     let onOpenSearch: () -> Void
 
     var body: some View {
@@ -100,12 +99,6 @@ struct IOSHomeView: View {
             }
         }
         .toolbar(.hidden, for: .navigationBar)
-        .sheet(isPresented: $isShowingRecommendationPreferences) {
-            IOSRecommendationPreferencesView(prompt: model.recommendations?.prompt ?? "")
-                .environment(model)
-                .presentationDetents([.medium, .large])
-                .presentationDragIndicator(.visible)
-        }
     }
 
     private var header: some View {
@@ -161,9 +154,6 @@ struct IOSHomeView: View {
     @ViewBuilder
     private var recommendationSections: some View {
         VStack(alignment: .leading, spacing: 30) {
-            recommendationHeader
-                .padding(.horizontal, 18)
-
             if (model.isLoading && model.recommendations == nil)
                 || (model.recommendations?.refreshing == true
                     && model.recommendations?.items.isEmpty == true) {
@@ -229,36 +219,6 @@ struct IOSHomeView: View {
         }
     }
 
-    private var recommendationHeader: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 10) {
-                MobileSectionHeader(title: "For You")
-                Spacer()
-                Button {
-                    isShowingRecommendationPreferences = true
-                } label: {
-                    Label("Tune Recommendations", systemImage: "slider.horizontal.3")
-                        .labelStyle(.titleAndIcon)
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(Color.mobileTeaAccentLight)
-                }
-                .buttonStyle(MobileCardButtonStyle())
-            }
-
-            if model.recommendations?.refreshing == true,
-               model.recommendations?.items.isEmpty == false {
-                HStack(spacing: 7) {
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(Color.mobileTeaAccent)
-                    Text("Updating recommendations…")
-                        .font(.caption2)
-                        .foregroundStyle(Color.mobileTeaMuted)
-                }
-            }
-        }
-    }
-
     private var recommendationLoadingState: some View {
         HStack(spacing: 14) {
             ProgressView()
@@ -283,28 +243,14 @@ struct IOSHomeView: View {
                     .foregroundStyle(Color.mobileTeaAccentLight)
                     .frame(width: 50)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(hasRecommendationPrompt ? "Recommendations are still brewing" : "Tell TeaStream what you like")
+                    Text("Recommendations are still brewing")
                         .font(.headline)
                         .foregroundStyle(Color.mobileTeaCream)
-                    Text(hasRecommendationPrompt
-                        ? "TeaStream will check again the next time Home refreshes."
-                        : "Share favorite genres, shows, pacing, and things to avoid to build recommendations.")
+                    Text("TeaStream will check again the next time Home refreshes.")
                         .font(.caption)
                         .foregroundStyle(Color.mobileTeaMuted)
                 }
             }
-
-            Button {
-                isShowingRecommendationPreferences = true
-            } label: {
-                Label("Tune Recommendations", systemImage: "slider.horizontal.3")
-                    .font(.subheadline.weight(.bold))
-                    .foregroundStyle(Color.mobileTeaBackground)
-                    .padding(.horizontal, 15)
-                    .padding(.vertical, 10)
-                    .background(Color.mobileTeaAccent, in: Capsule())
-            }
-            .buttonStyle(MobileCardButtonStyle())
         }
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -320,10 +266,6 @@ struct IOSHomeView: View {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .stroke(Color.mobileTeaAccent.opacity(0.18), lineWidth: 1)
         }
-    }
-
-    private var hasRecommendationPrompt: Bool {
-        !(model.recommendations?.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
     }
 
     @ViewBuilder
