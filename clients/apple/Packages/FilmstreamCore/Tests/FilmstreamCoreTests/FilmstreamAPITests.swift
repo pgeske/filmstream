@@ -135,6 +135,82 @@ import Testing
     #expect(afterLastAiredEpisode == nil)
 }
 
+// The retry tests share a static URLProtocol handler, so they must not run concurrently.
+@Suite(.serialized)
+private struct FilmstreamAPIRetryTests {
+    @Test func transientTimeoutOnGetIsRetriedOnce() async throws {
+        let attempts = AttemptCounter()
+        RetryTestURLProtocol.handler = { _ in
+            attempts.increment() == 1
+                ? .failure(URLError(.timedOut))
+                : .success((200, Data(#"{"status":"ok"}"#.utf8)))
+        }
+        defer { RetryTestURLProtocol.handler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RetryTestURLProtocol.self]
+        let api = FilmstreamAPI(
+            baseURL: URL(string: "https://filmstream.test")!,
+            session: URLSession(configuration: configuration)
+        )
+
+        try await api.health()
+
+        #expect(attempts.current == 2)
+    }
+
+    @Test func failedGetRetrySurfacesNetworkErrorAfterSecondAttempt() async throws {
+        let attempts = AttemptCounter()
+        RetryTestURLProtocol.handler = { _ in
+            _ = attempts.increment()
+            return .failure(URLError(.timedOut))
+        }
+        defer { RetryTestURLProtocol.handler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RetryTestURLProtocol.self]
+        let api = FilmstreamAPI(
+            baseURL: URL(string: "https://filmstream.test")!,
+            session: URLSession(configuration: configuration)
+        )
+
+        await #expect(throws: FilmstreamError.self) {
+            try await api.health()
+        }
+
+        #expect(attempts.current == 2)
+    }
+
+    @Test func transientTimeoutIsNotRetriedForPOSTs() async throws {
+        let attempts = AttemptCounter()
+        RetryTestURLProtocol.handler = { _ in
+            _ = attempts.increment()
+            return .failure(URLError(.timedOut))
+        }
+        defer { RetryTestURLProtocol.handler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RetryTestURLProtocol.self]
+        let api = FilmstreamAPI(
+            baseURL: URL(string: "https://filmstream.test")!,
+            session: URLSession(configuration: configuration)
+        )
+        let movie = Movie(
+            id: "tmdb:1",
+            mediaType: .movie,
+            title: "The Movie",
+            originalLanguage: "ja",
+            year: 2020
+        )
+
+        await #expect(throws: FilmstreamError.self) {
+            try await api.createPlayback(for: movie, startSeconds: 0)
+        }
+
+        #expect(attempts.current == 1)
+    }
+}
+
 private final class APIRequestRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var recordedPaths: [String] = []
@@ -263,6 +339,53 @@ private final class EpisodeCatalogURLProtocol: URLProtocol, @unchecked Sendable 
     }
 
     override func stopLoading() {}
+}
+
+private final class RetryTestURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var handler: (@Sendable (URLRequest) -> Result<(Int, Data), URLError>)?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let handler = Self.handler, let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        switch handler(request) {
+        case let .success((status, data)):
+            let response = HTTPURLResponse(
+                url: url,
+                statusCode: status,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        case let .failure(error):
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+private final class AttemptCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var current: Int {
+        lock.withLock { count }
+    }
+
+    func increment() -> Int {
+        lock.withLock {
+            count += 1
+            return count
+        }
+    }
 }
 
 private final class TestURLProtocol: URLProtocol, @unchecked Sendable {
