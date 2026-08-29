@@ -296,8 +296,10 @@ func (m *Manager) Start(
 		return Stream{}, fmt.Errorf("bitmap subtitle track %d is unavailable", bitmapSubtitleIndex)
 	}
 	timelineStart := startSeconds
+	keyframeProbeFailed := false
 	if startSeconds > 0 {
 		if keyframeStart, err := m.probeTimelineStart(ctx, sourceURL, startSeconds); err != nil {
+			keyframeProbeFailed = true
 			m.logger.Warn("probe HLS keyframe start", "playback_id", playbackID, "error", err)
 		} else {
 			timelineStart = keyframeStart
@@ -368,6 +370,22 @@ func (m *Manager) Start(
 	if err := m.waitUntilReady(startupContext, stream); err != nil {
 		m.Stop(playbackID)
 		return Stream{}, err
+	}
+	if keyframeProbeFailed {
+		// The packager's -ss seek landed on the video keyframe preceding the
+		// requested start. Leaving the requested time as the timeline start would
+		// anchor the client position mapping and the WebVTT sidecar to the wrong
+		// point, desyncing subtitles by the keyframe gap. The packager has now
+		// read through that source region, so re-probe the actual landing point
+		// and correct the timeline before handing the stream to the client.
+		if keyframeStart, err := m.probeTimelineStart(startupContext, sourceURL, startSeconds); err != nil {
+			m.logger.Warn("reprobe HLS keyframe start", "playback_id", playbackID, "error", err)
+		} else if keyframeStart != timelineStart {
+			stream.info.StartSeconds = keyframeStart
+			timelineStart = keyframeStart
+			m.logger.Info("corrected HLS keyframe start", "playback_id", playbackID,
+				"timeline_start_seconds", keyframeStart)
+		}
 	}
 	m.logger.Info("HLS stream ready", "playback_id", playbackID, "codec", outputCodec,
 		"audio_stream_index", audioIndex, "audio_language", audioLanguage,
