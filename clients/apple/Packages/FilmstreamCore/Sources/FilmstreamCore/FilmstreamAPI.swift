@@ -447,6 +447,25 @@ public struct FilmstreamAPI: Sendable {
         return try await send(request)
     }
 
+    // One automatic retry for idempotent GETs rides out short reachability
+    // windows (for example a backend redeploy) instead of failing the page load.
+    private static func dataWithTransientGetRetry(
+        _ session: URLSession, _ request: URLRequest
+    ) async throws -> (Data, URLResponse) {
+        do {
+            return try await session.data(for: request)
+        } catch {
+            let isGET = request.httpMethod == nil || request.httpMethod == "GET"
+            guard isGET, isTransientNetworkError(error) else { throw error }
+            return try await session.data(for: request)
+        }
+    }
+
+    private static func isTransientNetworkError(_ error: Error) -> Bool {
+        guard let urlError = error as? URLError else { return false }
+        return urlError.code == .timedOut || urlError.code == .networkConnectionLost
+    }
+
     private func send<Request: Encodable, Response: Decodable>(
         path: String,
         method: String,
@@ -464,7 +483,7 @@ public struct FilmstreamAPI: Sendable {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: request)
+            (data, response) = try await Self.dataWithTransientGetRetry(session, request)
         } catch {
             throw FilmstreamError.network(error.localizedDescription)
         }
