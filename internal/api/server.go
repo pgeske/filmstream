@@ -53,7 +53,6 @@ const (
 	minimumLivePeers        = 3
 	strongLiveSwarmPeers    = 20
 	progressiveSwarmWait    = 750 * time.Millisecond
-	cachedSwarmWait         = 3 * time.Second
 	liveSwarmWait           = 8 * time.Second
 	swarmStatusPollInterval = 250 * time.Millisecond
 
@@ -1386,26 +1385,18 @@ func (s *Server) createCachedPlayback(
 		}
 		return nil, nil, nil
 	}
-	options := []playbackOption{{session: session, candidate: cached.Selected}}
-	strong, err := s.observePlaybackOptions(ctx, options, minimumLivePeers, cachedSwarmWait)
-	if err != nil {
-		_ = s.engine.Drop(session.ID)
-		return nil, nil, err
+	// A cached release has already produced a valid HLS stream, so replays mount it
+	// deterministically instead of re-searching. Peer counts are not re-validated here:
+	// a slow tracker or DHT startup would otherwise evict a known-good release and
+	// force a full search on every replay. Re-probing subtitles is likewise skipped
+	// because it downloads media before playback. HLS startup remains the validator
+	// and invalidateCachedPlayback removes the entry when the release stops working.
+	livePeers := 0
+	if status, ok := s.engine.Status(session.ID); ok {
+		livePeers = max(status.ActivePeers, status.ConnectedSeeders)
 	}
-	if strong < 0 {
-		_ = s.engine.Drop(session.ID)
-		if removeErr := s.playbackCache.Remove(cacheMediaID, request.Query, request.Year); removeErr != nil {
-			s.logger.Warn("remove unavailable playback cache", "title", request.Query, "error", removeErr)
-		}
-		s.logger.Warn("cached playback swarm is unavailable; searching again",
-			"title", request.Query, "live_peers", options[0].peers)
-		return nil, nil, nil
-	}
-	// A cached release has already produced a valid HLS stream. Re-probing it here
-	// downloads media before playback and turns every background lookup into torrent
-	// payload work. The HLS startup probe will expose this episode's actual tracks.
 	s.logger.Info("reused cached playback selection", "id", session.ID,
-		"name", cached.Selected.Candidate.Name, "live_peers", options[strong].peers)
+		"name", cached.Selected.Candidate.Name, "live_peers", livePeers)
 	selected := cached.Selected
 	return wrapTorrentSession(session), &selected, nil
 }
