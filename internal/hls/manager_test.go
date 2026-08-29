@@ -655,6 +655,74 @@ func TestPreferredAudioStreamUsesRequestedLanguageBeforeDefault(t *testing.T) {
 	}
 }
 
+func TestManagerCorrectsTimelineStartWhenKeyframeProbeFails(t *testing.T) {
+	// Model a cold torrent source: the keyframe probe fails until the packager
+	// has read through the seek region, after which the probe sees the keyframe
+	// the -ss seek actually landed on.
+	marker := filepath.Join(t.TempDir(), "warmed")
+	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
+case " $* " in
+  *" -read_intervals "*)
+    if [ ! -f %q ]; then
+      # Cold source: ranging this far into the file fails until the packager warms it.
+      exit 1
+    fi
+    printf '42.000\n'
+    exit 0
+    ;;
+esac
+cat <<'JSON'
+{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]},{"index":3,"codec_name":"subrip","codec_type":"subtitle","tags":{"language":"eng"}}],"format":{"duration":"7200"}}
+JSON
+`, marker))
+	ffmpeg := writeExecutable(t, "ffmpeg", fmt.Sprintf(`#!/bin/sh
+for last do :; done
+dir=$(dirname "$last")
+printf warmed > %q
+printf 'init' > "$dir/init.mp4"
+printf 'segment' > "$dir/segment-000000.m4s"
+cat > "$dir/index.m3u8" <<'PLAYLIST'
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:4.0,
+segment-000000.m4s
+PLAYLIST
+while :; do sleep 1; done
+`, marker))
+	manager, err := New(Config{
+		DataDir:        t.TempDir(),
+		FFmpegPath:     ffmpeg,
+		FFprobePath:    ffprobe,
+		SourceBaseURL:  "http://127.0.0.1:8943",
+		StartupTimeout: 5 * time.Second,
+		BufferSeconds:  4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	stream, err := manager.Start(t.Context(), "playback-1", 43.7, []string{"en"}, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The packager seeked to 43.7 and landed on the 42.0 keyframe; the reported
+	// timeline start must match the landing point or subtitles desync by the gap.
+	if stream.RequestedStartSeconds != 43.7 || stream.StartSeconds != 42.0 {
+		t.Fatalf("stream = %+v, want start 42.0 for requested 43.7", stream)
+	}
+	manager.mu.RLock()
+	packaged := manager.streams["playback-1"]
+	manager.mu.RUnlock()
+	args := strings.Join(manager.subtitleArgs(packaged, 3), " ")
+	for _, expected := range []string{"-noaccurate_seek -ss 43.700", "-output_ts_offset 1.700"} {
+		if !strings.Contains(args, expected) {
+			t.Fatalf("subtitle arguments do not contain %q: %s", expected, args)
+		}
+	}
+}
+
 func TestProbeTimelineStartBacksUpFromFutureTimestamp(t *testing.T) {
 	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
 case " $* " in
