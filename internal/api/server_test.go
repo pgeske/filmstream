@@ -615,6 +615,101 @@ func TestCreatePlaybackReusesCachedUsenetReleaseWithoutSearching(t *testing.T) {
 	}
 }
 
+// A persisted release must be replayed without re-searching even when the freshly
+// mounted swarm has not connected any peers yet; otherwise slow tracker or DHT
+// startup would evict a known-good release and force a full search on every replay.
+func TestCreatePlaybackReusesCachedTorrentReleaseWithoutSearching(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentContents := createAPITestTorrentForFile(t, dataDir, "Original.Show.S01E02.mp4")
+	var searches atomic.Int32
+	var indexerServer *httptest.Server
+	indexerServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/download/season" {
+			w.Header().Set("Content-Type", "application/x-bittorrent")
+			_, _ = w.Write(torrentContents)
+			return
+		}
+		switch r.URL.Query().Get("t") {
+		case "caps":
+			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><tv-search available="yes" supportedParams="q,season,ep"/></searching></caps>`)
+		case "tvsearch":
+			searches.Add(1)
+			fmt.Fprint(w, `<?xml version="1.0"?><rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel><item><title>Original.Show.S01.Complete.1080p.WEB.H264-GROUP</title><guid>season-1</guid><enclosure url="`+indexerServer.URL+`/download/season" length="607836000" type="application/x-bittorrent"/></item></channel></rss>`)
+		default:
+			http.Error(w, "unsupported", http.StatusBadRequest)
+		}
+	}))
+	defer indexerServer.Close()
+	registry, err := indexer.NewRegistry([]config.Indexer{{
+		Name: "torrent", Type: "torznab", Endpoint: indexerServer.URL + "/api", APIKey: "secret",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	torrentEngine, err := torrentstream.New(torrentstream.Config{
+		DataDir: dataDir, MetadataTimeout: time.Second, CleanOnClose: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer torrentEngine.Close()
+	server := New(registry, torrentEngine, catalog.Preferences{Codecs: []string{"h264"}}, slog.Default())
+	server.playbackSourceMode = config.PlaybackSourceTorrentOnly
+	server.hlsManager = &fakeHLSManager{}
+	store := playbackcache.New(t.TempDir())
+	server.SetPlaybackCache(store)
+
+	selected := catalog.RankedCandidate{
+		Candidate: catalog.Candidate{
+			Name: "Original.Show.S01.Complete.1080p.WEB.H264-GROUP", Protocol: catalog.ProtocolTorrent,
+		},
+		Reasons: []string{"season pack", subtitlesVerifiedReason},
+	}
+	if _, err := store.Save("tmdb-tv:3:s1", "Original Show", 2020, selected, torrentContents); err != nil {
+		t.Fatal(err)
+	}
+
+	create := func() CreatePlaybackResponse {
+		request := httptest.NewRequest(http.MethodPost, "/v1/playbacks", strings.NewReader(
+			`{"media_id":"tmdb-tv:3:s1:e2","media_type":"show","query":"Original Show","year":2020,"series_id":"tmdb-tv:3","series_title":"Original Show","season_number":1,"episode_number":2,"episode_title":"Second","preferences":{"codecs":["h264"],"prefer_text_subtitles":true}}`,
+		))
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusCreated {
+			t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+		}
+		var payload CreatePlaybackResponse
+		if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload
+	}
+
+	first := create()
+	if searches.Load() != 0 {
+		t.Fatalf("cached replay searched indexers %d times, want 0", searches.Load())
+	}
+	if first.Source != catalog.ProtocolTorrent || first.FileName != "Original.Show.S01E02.mp4" {
+		t.Fatalf("payload = %+v", first)
+	}
+
+	hlsResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(hlsResponse, httptest.NewRequest(
+		http.MethodPost, "/v1/playbacks/"+first.ID+"/hls", strings.NewReader(`{}`),
+	))
+	if hlsResponse.Code != http.StatusCreated {
+		t.Fatalf("HLS status = %d, body = %s", hlsResponse.Code, hlsResponse.Body.String())
+	}
+	if _, found, err := store.Lookup("tmdb-tv:3:s1", "Original Show", 2020); err != nil || !found {
+		t.Fatalf("cached release kept after replay: found = %v, error = %v", found, err)
+	}
+
+	create()
+	if searches.Load() != 0 {
+		t.Fatalf("second replay searched indexers %d times, want 0", searches.Load())
+	}
+}
+
 func TestParkHLSPlayback(t *testing.T) {
 	manager := &fakeHLSManager{}
 	server := &Server{hlsManager: manager}
