@@ -215,6 +215,175 @@ func TestStoreUsesPrivateAtomicFileAndCorruptionDoesNotBreakService(t *testing.T
 	}
 }
 
+func TestPromptFileOverridesStoredPromptAndRefreshesOnMtimeChange(t *testing.T) {
+	dir := t.TempDir()
+	notePath := filepath.Join(dir, "taste.md")
+	if err := os.WriteFile(notePath, []byte("hopeful science fiction\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(t.TempDir())
+	if err := store.save(persistedState{Prompt: "stored prompt"}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.March, 9, 12, 0, 0, 0, time.UTC)
+	started := make(chan string, 2)
+	release := make(chan struct{}, 2)
+	generator := serviceGeneratorFunc(func(_ context.Context, prompt string) ([]metadata.Movie, error) {
+		started <- prompt
+		<-release
+		return []metadata.Movie{{ID: "tmdb:" + prompt, MediaType: metadata.MediaTypeMovie, Title: prompt}}, nil
+	})
+	service := NewService(store, generator, nil, ServiceOptions{
+		PromptFile: notePath, Now: func() time.Time { return now },
+	})
+
+	service.Start(context.Background())
+	if prompt := <-started; prompt != "hopeful science fiction" {
+		t.Fatalf("generated prompt = %q", prompt)
+	}
+	// The stored prompt stays the reported API prompt; the note only drives
+	// generation.
+	if response := service.Snapshot(); response.Prompt != "stored prompt" {
+		t.Fatalf("stored prompt changed: %+v", response)
+	}
+	release <- struct{}{}
+	waitForRefresh(t, service)
+
+	now = now.Add(time.Hour)
+	service.Refresh(RefreshAutomatic)
+	select {
+	case prompt := <-started:
+		t.Fatalf("unexpected regeneration for unchanged note: %q", prompt)
+	default:
+	}
+
+	if err := os.WriteFile(notePath, []byte("cozy mysteries"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(time.Hour)
+	if err := os.Chtimes(notePath, future, future); err != nil {
+		t.Fatal(err)
+	}
+	response := service.Refresh(RefreshAutomatic)
+	if !response.Refreshing {
+		t.Fatalf("edited note did not schedule a refresh: %+v", response)
+	}
+	if prompt := <-started; prompt != "cozy mysteries" {
+		t.Fatalf("generated prompt after edit = %q", prompt)
+	}
+	release <- struct{}{}
+	waitForRefresh(t, service)
+}
+
+func TestPromptFileMissingOrEmptyFallsBackToStoredPrompt(t *testing.T) {
+	dir := t.TempDir()
+	emptyPath := filepath.Join(dir, "empty.md")
+	if err := os.WriteFile(emptyPath, []byte("   \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, promptFile := range []string{filepath.Join(dir, "missing.md"), emptyPath} {
+		started := make(chan string, 2)
+		generator := serviceGeneratorFunc(func(_ context.Context, prompt string) ([]metadata.Movie, error) {
+			started <- prompt
+			return []metadata.Movie{{ID: "tmdb:" + prompt, MediaType: metadata.MediaTypeMovie, Title: prompt}}, nil
+		})
+		service := NewService(NewStore(t.TempDir()), generator, nil, ServiceOptions{PromptFile: promptFile})
+
+		response, err := service.SetPrompt("stored prompt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !response.Refreshing {
+			t.Fatalf("PUT with %q did not refresh: %+v", promptFile, response)
+		}
+		if prompt := <-started; prompt != "stored prompt" {
+			t.Fatalf("generated prompt = %q", prompt)
+		}
+		waitForRefresh(t, service)
+	}
+}
+
+func TestPromptFileUpdateStoresPromptWithoutRegeneration(t *testing.T) {
+	dir := t.TempDir()
+	notePath := filepath.Join(dir, "taste.md")
+	if err := os.WriteFile(notePath, []byte("note prompt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan string, 2)
+	generator := serviceGeneratorFunc(func(_ context.Context, prompt string) ([]metadata.Movie, error) {
+		started <- prompt
+		return []metadata.Movie{{ID: "tmdb:" + prompt, MediaType: metadata.MediaTypeMovie, Title: prompt}}, nil
+	})
+	service := NewService(NewStore(t.TempDir()), generator, nil, ServiceOptions{PromptFile: notePath})
+
+	service.Start(context.Background())
+	if prompt := <-started; prompt != "note prompt" {
+		t.Fatalf("generated prompt = %q", prompt)
+	}
+	waitForRefresh(t, service)
+
+	// With an authoritative note, PUT keeps the stored prompt without spending
+	// a model refresh on it.
+	response, err := service.SetPrompt("stored fallback prompt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Refreshing || response.Prompt != "stored fallback prompt" {
+		t.Fatalf("PUT response = %+v", response)
+	}
+	select {
+	case prompt := <-started:
+		t.Fatalf("unexpected regeneration: %q", prompt)
+	default:
+	}
+
+	// Removing the note falls back to the stored prompt on the next refresh.
+	if err := os.Remove(notePath); err != nil {
+		t.Fatal(err)
+	}
+	if response := service.Refresh(RefreshAutomatic); !response.Refreshing {
+		t.Fatalf("missing note did not schedule a refresh: %+v", response)
+	}
+	if prompt := <-started; prompt != "stored fallback prompt" {
+		t.Fatalf("fallback generated prompt = %q", prompt)
+	}
+	waitForRefresh(t, service)
+}
+
+func TestPromptFileEditedWhileDownRefreshesOnNextGet(t *testing.T) {
+	notePath := filepath.Join(t.TempDir(), "taste.md")
+	if err := os.WriteFile(notePath, []byte("new note prompt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	generatedAt := time.Date(2026, time.March, 9, 12, 0, 0, 0, time.UTC)
+	store := NewStore(t.TempDir())
+	if err := store.save(persistedState{
+		GeneratedAt:         generatedAt,
+		GeneratedPromptHash: promptHash("old note prompt"),
+		Prompt:              "old note prompt",
+		Items:               []metadata.Movie{{ID: "tmdb:old", MediaType: metadata.MediaTypeMovie, Title: "Old"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan string, 2)
+	generator := serviceGeneratorFunc(func(_ context.Context, prompt string) ([]metadata.Movie, error) {
+		started <- prompt
+		return []metadata.Movie{{ID: "tmdb:new", MediaType: metadata.MediaTypeMovie, Title: "New"}}, nil
+	})
+	service := NewService(store, generator, nil, ServiceOptions{
+		PromptFile: notePath,
+		Now:        func() time.Time { return generatedAt.Add(time.Hour) },
+	})
+
+	if response := service.Refresh(RefreshAutomatic); !response.Refreshing || len(response.Items) != 1 {
+		t.Fatalf("response = %+v", response)
+	}
+	if prompt := <-started; prompt != "new note prompt" {
+		t.Fatalf("generated prompt = %q", prompt)
+	}
+	waitForRefresh(t, service)
+}
+
 func waitForRefresh(t *testing.T, service *Service) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
