@@ -274,6 +274,11 @@ func (m *Manager) Start(
 	); matched {
 		return stream, err
 	}
+	if stream, covered := m.resumeCoveredStream(
+		playbackID, startSeconds, preferredLanguages, bitmapSubtitleIndex,
+	); covered {
+		return stream, nil
+	}
 	m.stopPlaybackStream(playbackID)
 
 	sourceURL := m.sourceBaseURL + "/v1/playbacks/" + playbackID + "/stream"
@@ -425,7 +430,7 @@ func (m *Manager) resumePreparedStream(
 		return Stream{}, false, nil
 	}
 	wasParked := stream.parked
-	bufferedSegments, _ := playlistStatus(stream.dir)
+	bufferedSegments, _, _ := playlistStatus(stream.dir)
 	if wasParked {
 		if err := stream.command.Process.Signal(syscall.SIGCONT); err != nil {
 			stream.processMu.Unlock()
@@ -488,6 +493,69 @@ func (m *Manager) Prepared(
 	return playlistReady(stream.dir, minimumSeconds)
 }
 
+func (m *Manager) resumeCoveredStream(
+	playbackID string,
+	startSeconds float64,
+	preferredLanguages []string,
+	bitmapSubtitleIndex int,
+) (Stream, bool) {
+	m.mu.RLock()
+	stream := m.streams[playbackID]
+	m.mu.RUnlock()
+	if stream == nil || !equalStrings(stream.languages, preferredLanguages) ||
+		stream.bitmapSubtitleIndex != bitmapSubtitleIndex {
+		return Stream{}, false
+	}
+	stream.processMu.Lock()
+	defer stream.processMu.Unlock()
+	select {
+	case <-stream.done:
+		return Stream{}, false
+	default:
+	}
+	m.mu.RLock()
+	isCurrent := m.streams[playbackID] == stream
+	m.mu.RUnlock()
+	if !isCurrent {
+		return Stream{}, false
+	}
+	_, packagedSeconds, _ := playlistStatus(stream.dir)
+	position := startSeconds - stream.info.StartSeconds
+	// The event playlist retains every packaged segment, so a request inside
+	// the packaged range (with one segment of headroom) can seek within the
+	// existing stream instead of discarding it and re-downloading from scratch.
+	// Recovery requests land here after a client stall, where a rebuild would
+	// throw away the buffer and re-probe the source at the worst possible time.
+	headroom := float64(m.segmentSeconds)
+	if position < 0 || position > packagedSeconds-headroom {
+		m.logger.Info("prepared HLS stream does not cover requested position; rebuilding",
+			"playback_id", playbackID, "requested_start_seconds", startSeconds,
+			"timeline_start_seconds", stream.info.StartSeconds,
+			"packaged_seconds", packagedSeconds)
+		return Stream{}, false
+	}
+	if stream.parked {
+		if err := stream.command.Process.Signal(syscall.SIGCONT); err != nil {
+			m.logger.Warn("resume covered HLS stream", "playback_id", playbackID, "error", err)
+			return Stream{}, false
+		}
+		stream.parked = false
+		stream.parkedAt = time.Time{}
+		if stream.parkTimer != nil {
+			stream.parkTimer.Stop()
+			stream.parkTimer = nil
+		}
+	}
+	if !playlistReady(stream.dir, m.bufferSeconds) {
+		return Stream{}, false
+	}
+	m.logger.Info("reused prepared HLS stream for in-range position",
+		"playback_id", playbackID, "requested_start_seconds", startSeconds,
+		"timeline_start_seconds", stream.info.StartSeconds,
+		"packaged_seconds", packagedSeconds)
+	return stream.info, true
+}
+
 func (m *Manager) Park(ctx context.Context, playbackID string, minimumSeconds int) error {
 	unlockStart := m.lockPlaybackStart(playbackID)
 	defer unlockStart()
@@ -503,9 +571,11 @@ func (m *Manager) Park(ctx context.Context, playbackID string, minimumSeconds in
 	if minimumSeconds <= 0 {
 		minimumSeconds = m.bufferSeconds
 	}
+	startTime := time.Now()
 	if err := m.waitUntilBuffered(ctx, stream, minimumSeconds); err != nil {
 		return err
 	}
+	bufferWait := time.Since(startTime)
 
 	stream.processMu.Lock()
 	defer stream.processMu.Unlock()
@@ -538,7 +608,8 @@ func (m *Manager) Park(ctx context.Context, playbackID string, minimumSeconds in
 		m.expireParkedStream(playbackID, stream, parkedAt)
 	})
 	m.logger.Info("parked prepared HLS stream", "playback_id", playbackID,
-		"buffer_seconds", minimumSeconds, "expires_in", m.parkedTTL)
+		"buffer_seconds", minimumSeconds, "buffer_wait_seconds", bufferWait.Seconds(),
+		"expires_in", m.parkedTTL)
 	return nil
 }
 
@@ -1175,7 +1246,7 @@ func (m *Manager) waitForPlaylistGrowth(
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		segments, complete := playlistStatus(stream.dir)
+		segments, _, complete := playlistStatus(stream.dir)
 		if segments > initialSegments || complete {
 			return nil
 		}
@@ -1183,7 +1254,7 @@ func (m *Manager) waitForPlaylistGrowth(
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-stream.done:
-			segments, complete = playlistStatus(stream.dir)
+			segments, _, complete = playlistStatus(stream.dir)
 			if segments > initialSegments || complete {
 				return nil
 			}
@@ -1194,30 +1265,7 @@ func (m *Manager) waitForPlaylistGrowth(
 }
 
 func playlistReady(dir string, minimumSeconds int) bool {
-	playlist, err := os.ReadFile(filepath.Join(dir, "index.m3u8"))
-	if err != nil {
-		return false
-	}
-
-	var duration float64
-	segmentCount := 0
-	complete := false
-	for _, line := range strings.Split(string(playlist), "\n") {
-		if line == "#EXT-X-ENDLIST" {
-			complete = true
-			continue
-		}
-		if !strings.HasPrefix(line, "#EXTINF:") {
-			continue
-		}
-		value := strings.TrimSuffix(strings.TrimPrefix(line, "#EXTINF:"), ",")
-		seconds, err := strconv.ParseFloat(value, 64)
-		if err != nil || seconds <= 0 {
-			continue
-		}
-		duration += seconds
-		segmentCount++
-	}
+	segmentCount, duration, complete := playlistStatus(dir)
 	if segmentCount == 0 || (!complete && duration < float64(minimumSeconds)) {
 		return false
 	}
@@ -1225,20 +1273,24 @@ func playlistReady(dir string, minimumSeconds int) bool {
 	return len(matches) >= segmentCount
 }
 
-func playlistStatus(dir string) (segments int, complete bool) {
+func playlistStatus(dir string) (segments int, duration float64, complete bool) {
 	playlist, err := os.ReadFile(filepath.Join(dir, "index.m3u8"))
 	if err != nil {
-		return 0, false
+		return 0, 0, false
 	}
 	for _, line := range strings.Split(string(playlist), "\n") {
 		switch {
 		case strings.HasPrefix(line, "#EXTINF:"):
 			segments++
+			value := strings.TrimSuffix(strings.TrimPrefix(line, "#EXTINF:"), ",")
+			if seconds, err := strconv.ParseFloat(value, 64); err == nil && seconds > 0 {
+				duration += seconds
+			}
 		case line == "#EXT-X-ENDLIST":
 			complete = true
 		}
 	}
-	return segments, complete
+	return segments, duration, complete
 }
 
 func validPlaybackID(id string) bool {

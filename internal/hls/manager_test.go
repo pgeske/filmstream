@@ -312,6 +312,100 @@ while :; do sleep 1; done
 	}
 }
 
+func TestManagerReusesPreparedStreamForPositionWithinPackagedRange(t *testing.T) {
+	packagerCount := filepath.Join(t.TempDir(), "packager-count")
+	probeCount := filepath.Join(t.TempDir(), "probe-count")
+	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
+case " $* " in
+  *" -read_intervals "*) exit 0 ;;
+esac
+printf 'x\n' >> %q
+cat <<'JSON'
+{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]}],"format":{"duration":"7200"}}
+JSON
+`, probeCount))
+	ffmpeg := writeExecutable(t, "ffmpeg", fmt.Sprintf(`#!/bin/sh
+printf 'x\n' >> %q
+for last do :; done
+dir=$(dirname "$last")
+printf 'init' > "$dir/init.mp4"
+printf 'segment' > "$dir/segment-000000.m4s"
+printf 'segment' > "$dir/segment-000001.m4s"
+printf 'segment' > "$dir/segment-000002.m4s"
+cat > "$dir/index.m3u8" <<'PLAYLIST'
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:4.0,
+segment-000000.m4s
+#EXTINF:4.0,
+segment-000001.m4s
+#EXTINF:4.0,
+segment-000002.m4s
+PLAYLIST
+while :; do sleep 1; done
+`, packagerCount))
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943", StartupTimeout: 5 * time.Second,
+		BufferSeconds: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	first, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A recovery request inside the packaged range must reuse the running
+	// packager instead of discarding the buffered segments.
+	covered, err := manager.Start(t.Context(), "playback-1", 6, []string{"en"}, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if covered.StartSeconds != first.StartSeconds || covered.RequestedStartSeconds != first.RequestedStartSeconds {
+		t.Fatalf("covered stream = %+v, want original %+v", covered, first)
+	}
+
+	// A parked stream resumes for in-range requests instead of rebuilding.
+	if err := manager.Park(t.Context(), "playback-1", 4); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := manager.Start(t.Context(), "playback-1", 3, []string{"en"}, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.StartSeconds != first.StartSeconds || resumed.RequestedStartSeconds != 0 {
+		t.Fatalf("resumed covered stream = %+v, want %+v", resumed, first)
+	}
+
+	// Positions outside the packaged range still rebuild at the new position.
+	restarted, err := manager.Start(t.Context(), "playback-1", 60, []string{"en"}, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.RequestedStartSeconds != 60 {
+		t.Fatalf("restarted stream = %+v, want requested start 60", restarted)
+	}
+
+	packagerCalls, err := os.ReadFile(packagerCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probeCalls, err := os.ReadFile(probeCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(packagerCalls), "x") != 2 {
+		t.Fatalf("packager calls = %q, want one per stream build", packagerCalls)
+	}
+	if strings.Count(string(probeCalls), "x") != 1 {
+		t.Fatalf("probe calls = %q, want the cached source probe only", probeCalls)
+	}
+}
+
 func TestManagerProbesTextAndBitmapSubtitlesWithoutStartingPlayback(t *testing.T) {
 	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
 cat <<'JSON'
