@@ -918,6 +918,99 @@ func TestDuplicateProgressKeepsOneNextEpisodeSourcePrewarm(t *testing.T) {
 	}
 }
 
+func TestClaimedPlaybackBlocksDuplicateSourcePrewarm(t *testing.T) {
+	var createRequests atomic.Int32
+	parked := make(chan struct{}, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/playbacks":
+			createRequests.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{"id":"warm-playback","name":"The Show","file_name":"episode.mkv","file_size":1000,"source":"torrent","stream_url":"http://127.0.0.1/stream"}`)
+		case "/v1/playbacks/warm-playback/hls":
+			w.WriteHeader(http.StatusCreated)
+			fmt.Fprint(w, `{}`)
+		case "/v1/playbacks/warm-playback/hls/park":
+			select {
+			case parked <- struct{}{}:
+			default:
+			}
+			fmt.Fprint(w, `{"status":"parked"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	server := &Server{
+		metadataProvider: fakeMetadata{},
+		logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		prewarmStates:    make(map[string]*playbackPrewarmState),
+		claimedPlaybacks: make(map[string]claimedPlayback),
+		prewarmSlots:     make(chan struct{}, 1),
+		prewarmBaseURL:   upstream.URL,
+		prewarmClient:    upstream.Client(),
+		usenetEngine: &fakeUsenetPlaybackEngine{
+			session: &usenetstream.Session{ID: "warm-playback", Name: "The Show", FileName: "episode.mkv"},
+		},
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	server.prewarmContext = ctx
+	current := history.Entry{
+		MediaID: "tmdb-tv:3:s1:e1", MediaType: "show", Title: "Top Rated Show",
+		SeriesID: "tmdb-tv:3", SeriesTitle: "Top Rated Show", SeasonNumber: 1, EpisodeNumber: 1,
+	}
+	selection := playbackSubtitleSelection{Mode: "off"}
+
+	// The client claims the prewarmed next episode and starts streaming it.
+	ready := make(chan struct{})
+	close(ready)
+	claimRequest := CreatePlaybackRequest{
+		MediaID: "tmdb-tv:3:s1:e2", MediaType: "show", Query: "Top Rated Show",
+		SeriesID: "tmdb-tv:3", SeriesTitle: "Top Rated Show",
+		SeasonNumber: 1, EpisodeNumber: 2, StartSeconds: 0,
+		Preferences: catalog.Preferences{Languages: []string{"ja", "en", "english"}},
+	}
+	server.prewarmStates["tmdb-tv:3:s1:e2"] = &playbackPrewarmState{
+		target:        playbackPrewarmTarget{request: claimRequest},
+		playbackReady: ready,
+		response:      CreatePlaybackResponse{ID: "warm-playback"},
+		cancel:        func() {},
+	}
+	claimed, ok := server.claimPrewarmedPlayback(t.Context(), claimRequest)
+	if !ok || claimed.ID != "warm-playback" {
+		t.Fatalf("claimed = %+v, ok = %v", claimed, ok)
+	}
+
+	// The end-of-episode progress report re-requests the same prewarm. It must
+	// not mount a second source session behind the actively playing episode.
+	server.queueNextEpisodePrewarm(current, selection)
+	if createRequests.Load() != 0 {
+		t.Fatalf("duplicate next-episode creations = %d, want 0", createRequests.Load())
+	}
+
+	// Backing out stops the claimed stream and unblocks prewarming again.
+	closeResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(closeResponse, httptest.NewRequest(
+		http.MethodDelete, "/v1/playbacks/warm-playback/hls", nil,
+	))
+	if closeResponse.Code != http.StatusOK {
+		t.Fatalf("close status = %d, body = %s", closeResponse.Code, closeResponse.Body.String())
+	}
+
+	server.queueNextEpisodePrewarm(current, selection)
+	select {
+	case <-parked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("next-episode prewarm did not restart after the claimed stream closed")
+	}
+	if createRequests.Load() != 1 {
+		t.Fatalf("next-episode creations after close = %d, want 1", createRequests.Load())
+	}
+}
+
 func TestBitmapSubtitlePrewarmMatchesMetadataAcrossTrackIndexes(t *testing.T) {
 	selection := playbackSubtitleSelection{
 		Mode: "bitmap", Index: 6, Language: "en", Title: "English SDH",

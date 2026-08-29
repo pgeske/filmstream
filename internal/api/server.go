@@ -132,6 +132,11 @@ type playbackCacheKey struct {
 	source  string
 }
 
+type claimedPlayback struct {
+	playbackID string
+	claimedAt  time.Time
+}
+
 type playbackSelectionTiming struct {
 	progressiveWait time.Duration
 	liveSwarmWait   time.Duration
@@ -173,6 +178,11 @@ type Server struct {
 	prewarmBaseURL string
 	prewarmClient  *http.Client
 	prewarmContext context.Context
+	// claimedPlaybacks maps a prewarm key to the playback a client claimed from
+	// it and may still be streaming. Claiming removes the prewarm state, so
+	// without this record a later prewarm request for the same media would
+	// start a second source session that competes with active playback.
+	claimedPlaybacks map[string]claimedPlayback
 
 	releaseSearchMu sync.Mutex
 	releaseSearches map[string]*releaseSearchState
@@ -195,6 +205,7 @@ func New(indexers *indexer.Registry, engine *torrentstream.Engine, defaults cata
 		usenetFailures:     make(map[string]time.Time),
 		prewarmStates:      make(map[string]*playbackPrewarmState),
 		prewarmSlots:       make(chan struct{}, 2),
+		claimedPlaybacks:   make(map[string]claimedPlayback),
 		releaseSearches:    make(map[string]*releaseSearchState),
 	}
 	engine.SetCleanupHandler(func(id, _ string) {
@@ -224,12 +235,23 @@ func (s *Server) cleanupPlayback(id string) {
 	delete(s.playbackRequests, id)
 	delete(s.playbackResponses, id)
 	s.mu.Unlock()
+	s.forgetClaimedPlayback(id)
 	s.hlsMu.RLock()
 	manager := s.hlsManager
 	s.hlsMu.RUnlock()
 	if manager != nil {
 		manager.Stop(id)
 	}
+}
+
+func (s *Server) forgetClaimedPlayback(playbackID string) {
+	s.prewarmMu.Lock()
+	for key, claimed := range s.claimedPlaybacks {
+		if claimed.playbackID == playbackID {
+			delete(s.claimedPlaybacks, key)
+		}
+	}
+	s.prewarmMu.Unlock()
 }
 
 func (s *Server) SetIndexerReloader(reload func() error) {
@@ -2184,6 +2206,9 @@ func (s *Server) stopHLSPlayback(w http.ResponseWriter, r *http.Request) {
 	if manager != nil {
 		manager.Stop(playbackID)
 	}
+	// The client explicitly stopped this stream, so the media is no longer
+	// playing and future prewarms (including a movie handoff below) may run.
+	s.forgetClaimedPlayback(playbackID)
 	s.queuePlaybackHandoff(playbackID)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

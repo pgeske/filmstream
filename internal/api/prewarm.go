@@ -149,6 +149,11 @@ func (s *Server) claimPrewarmedPlayback(ctx context.Context, request CreatePlayb
 	if !s.playbackExists(response.ID) {
 		return CreatePlaybackResponse{}, false
 	}
+	s.prewarmMu.Lock()
+	s.claimedPlaybacks[key] = claimedPlayback{
+		playbackID: response.ID, claimedAt: time.Now(),
+	}
+	s.prewarmMu.Unlock()
 	s.logger.Info("claimed prewarmed playback", "id", response.ID,
 		"media_id", request.MediaID, "start_seconds", request.StartSeconds)
 	return response, true
@@ -166,6 +171,17 @@ func (s *Server) queuePlaybackPrewarm(target playbackPrewarmTarget) {
 	s.prewarmMu.Lock()
 	if s.prewarmContext == nil || s.prewarmClient == nil || s.prewarmBaseURL == "" {
 		s.prewarmMu.Unlock()
+		return
+	}
+	// A client may already be streaming this media from a claimed prewarm. The
+	// claim removed the prewarm state, so without this guard a later request
+	// (for example the end-of-episode progress report) would mount a second
+	// source session whose startup burst competes with active playback.
+	if claimed := s.claimedPlaybacks[key]; claimed.playbackID != "" &&
+		time.Since(claimed.claimedAt) < prewarmMaxAge && s.playbackExists(claimed.playbackID) {
+		s.prewarmMu.Unlock()
+		s.logger.Info("skipping prewarm; media is already playing from a claimed playback",
+			"media_id", target.request.MediaID, "playback_id", claimed.playbackID)
 		return
 	}
 	if existing := s.prewarmStates[key]; existing != nil && matchingQueuedPrewarmTarget(existing.target, target) {
