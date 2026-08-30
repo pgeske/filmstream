@@ -430,6 +430,25 @@ func (e *Engine) Get(id string) (*Session, bool) {
 	return session, ok
 }
 
+// LocalFilePath returns the selected media path only when the torrent client
+// has promoted a fully downloaded file into its final location. Callers can
+// then inspect the file directly without bypassing torrent reads for partial
+// data, whose sparse holes must continue to be filled through NewReader.
+func (e *Engine) LocalFilePath(id string) (string, bool) {
+	e.mu.RLock()
+	session, ok := e.sessions[id]
+	e.mu.RUnlock()
+	if !ok || session.file.BytesCompleted() < session.file.Length() {
+		return "", false
+	}
+	path := filepath.Join(e.dataDir, filepath.FromSlash(session.file.Path()))
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != session.file.Length() {
+		return "", false
+	}
+	return path, true
+}
+
 func (e *Engine) TorrentMetainfo(id string) ([]byte, error) {
 	e.mu.RLock()
 	session, ok := e.sessions[id]

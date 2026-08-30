@@ -14,7 +14,10 @@ import (
 func TestManagerCreatesAndServesIncrementalPlaylist(t *testing.T) {
 	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
 case " $* " in
-  *" -read_intervals "*) printf '118.500\n'; exit 0 ;;
+  *" -read_intervals "*)
+    printf '{"packets":[{"pts_time":"118.500","flags":"K__"}]}\n'
+    exit 0
+    ;;
 esac
 cat <<'JSON'
 {"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]},{"index":3,"codec_name":"subrip","codec_type":"subtitle","tags":{"language":"eng"}}],"format":{"duration":"7200.5"}}
@@ -98,6 +101,64 @@ while :; do sleep 1; done
 	manager.Stop(stream.PlaybackID)
 	if _, err := manager.AssetPath(stream.PlaybackID, "index.m3u8"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("asset remained after stop: %v", err)
+	}
+}
+
+func TestManagerUsesCompleteLocalFileForMediaAndKeyframeProbes(t *testing.T) {
+	probeSources := filepath.Join(t.TempDir(), "probe-sources")
+	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
+for last do :; done
+printf '%%s\n' "$last" >> %q
+case " $* " in
+  *" -read_intervals "*)
+    printf '{"packets":[{"pts_time":"118.500","flags":"K__"}]}\n'
+    exit 0
+    ;;
+esac
+cat <<'JSON'
+{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]}],"format":{"duration":"7200"}}
+JSON
+`, probeSources))
+	ffmpeg := writeExecutable(t, "ffmpeg", `#!/bin/sh
+for last do :; done
+dir=$(dirname "$last")
+printf 'init' > "$dir/init.mp4"
+printf 'segment' > "$dir/segment-000000.m4s"
+cat > "$dir/index.m3u8" <<'PLAYLIST'
+#EXTM3U
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:4.0,
+segment-000000.m4s
+PLAYLIST
+while :; do sleep 1; done
+`)
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943", StartupTimeout: 5 * time.Second,
+		BufferSeconds: 4,
+		LocalSourcePath: func(playbackID string) (string, bool) {
+			return "/data/complete-episode.mkv", playbackID == "playback-1"
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	stream, err := manager.Start(t.Context(), "playback-1", 120, nil, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stream.StartSeconds != 118.5 {
+		t.Fatalf("timeline start = %v, want 118.5", stream.StartSeconds)
+	}
+	sources, err := os.ReadFile(probeSources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Fields(string(sources)); len(got) != 2 ||
+		got[0] != "/data/complete-episode.mkv" || got[1] != "/data/complete-episode.mkv" {
+		t.Fatalf("probe sources = %q, want two direct local probes", sources)
 	}
 }
 
@@ -247,6 +308,12 @@ while :; do sleep 1; done
 func TestManagerJoinsInProgressPreparedStream(t *testing.T) {
 	packagerCount := filepath.Join(t.TempDir(), "packager-count")
 	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
+case " $* " in
+  *" -read_intervals "*)
+    printf '{"packets":[{"pts_time":"59.000","flags":"K__"}]}\n'
+    exit 0
+    ;;
+esac
 cat <<'JSON'
 {"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]}],"format":{"duration":"7200"}}
 JSON
@@ -317,7 +384,10 @@ func TestManagerReusesPreparedStreamForPositionWithinPackagedRange(t *testing.T)
 	probeCount := filepath.Join(t.TempDir(), "probe-count")
 	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
 case " $* " in
-  *" -read_intervals "*) exit 0 ;;
+  *" -read_intervals "*)
+    printf '{"packets":[{"pts_time":"59.000","flags":"K__"}]}\n'
+    exit 0
+    ;;
 esac
 printf 'x\n' >> %q
 cat <<'JSON'
@@ -761,7 +831,7 @@ case " $* " in
       # Cold source: ranging this far into the file fails until the packager warms it.
       exit 1
     fi
-    printf '42.000\n'
+    printf '{"packets":[{"pts_time":"42.000","flags":"K__"}]}\n'
     exit 0
     ;;
 esac
@@ -817,13 +887,103 @@ while :; do sleep 1; done
 	}
 }
 
-func TestProbeTimelineStartBacksUpFromFutureTimestamp(t *testing.T) {
+func TestManagerDoesNotReturnUnsynchronizedStreamAfterReprobeFailure(t *testing.T) {
 	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
 case " $* " in
-  *" 569.000%+#1 "*) printf '632.382\n' ;;
-  *) printf '540.540\n' ;;
+  *" -read_intervals "*) exit 1 ;;
 esac
+cat <<'JSON'
+{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]}],"format":{"duration":"7200"}}
+JSON
 `)
+	ffmpeg := writeExecutable(t, "ffmpeg", `#!/bin/sh
+for last do :; done
+dir=$(dirname "$last")
+printf 'init' > "$dir/init.mp4"
+printf 'segment' > "$dir/segment-000000.m4s"
+cat > "$dir/index.m3u8" <<'PLAYLIST'
+#EXTM3U
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:4.0,
+segment-000000.m4s
+PLAYLIST
+while :; do sleep 1; done
+`)
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943", StartupTimeout: 5 * time.Second,
+		BufferSeconds: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	_, err = manager.Start(t.Context(), "playback-1", 43.7, nil, -1)
+	if err == nil || !strings.Contains(err.Error(), "reprobe HLS keyframe start") {
+		t.Fatalf("start error = %v, want reprobe failure", err)
+	}
+	manager.mu.RLock()
+	stream := manager.streams["playback-1"]
+	manager.mu.RUnlock()
+	if stream != nil {
+		t.Fatal("unsynchronized HLS stream remained available after reprobe failure")
+	}
+}
+
+func TestManagerDoesNotRetryDeterministicInvalidKeyframe(t *testing.T) {
+	probeCount := filepath.Join(t.TempDir(), "probe-count")
+	packagerCount := filepath.Join(t.TempDir(), "packager-count")
+	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
+case " $* " in
+  *" -read_intervals "*)
+    printf 'x\n' >> %q
+    printf '{"packets":[{"pts_time":"2830.828","flags":"K__"}]}\n'
+    exit 0
+    ;;
+esac
+cat <<'JSON'
+{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]}],"format":{"duration":"2830.828"}}
+JSON
+`, probeCount))
+	ffmpeg := writeExecutable(t, "ffmpeg", fmt.Sprintf("#!/bin/sh\nprintf 'x\\n' >> %q\nexit 1\n", packagerCount))
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943", StartupTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	_, err = manager.Start(t.Context(), "playback-1", 1875.616, nil, -1)
+	if err == nil || !strings.Contains(err.Error(), `invalid video keyframe timestamp "2830.828"`) {
+		t.Fatalf("start error = %v, want invalid keyframe", err)
+	}
+	probeCalls, readErr := os.ReadFile(probeCount)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if strings.Count(string(probeCalls), "x") != 1 {
+		t.Fatalf("keyframe probe calls = %q, want one", probeCalls)
+	}
+	if _, statErr := os.Stat(packagerCount); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("packager ran after deterministic probe failure: %v", statErr)
+	}
+}
+
+func TestProbeTimelineStartSelectsLatestValidKeyframeInOnePass(t *testing.T) {
+	probeCount := filepath.Join(t.TempDir(), "probe-count")
+	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
+printf 'x\n' >> %q
+case " $* " in
+  *" 509.000%%569.500 "*) ;;
+  *) exit 2 ;;
+esac
+cat <<'JSON'
+{"packets":[{"pts_time":"540.540","flags":"K__"},{"pts_time":"568.568","flags":"K__"},{"pts_time":"632.382","flags":"K__"}]}
+JSON
+`, probeCount))
 	ffmpeg := writeExecutable(t, "ffmpeg", "#!/bin/sh\nexit 0\n")
 	manager, err := New(Config{
 		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
@@ -835,8 +995,15 @@ esac
 	defer manager.Close()
 
 	start, err := manager.probeTimelineStart(t.Context(), "http://source", 569)
-	if err != nil || start != 540.54 {
+	if err != nil || start != 568.568 {
 		t.Fatalf("timeline start = %v, error = %v", start, err)
+	}
+	probeCalls, err := os.ReadFile(probeCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(probeCalls), "x") != 1 {
+		t.Fatalf("keyframe probe calls = %q, want one", probeCalls)
 	}
 }
 

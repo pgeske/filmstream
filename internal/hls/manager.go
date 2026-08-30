@@ -40,6 +40,7 @@ type Config struct {
 	ParkedResumeTimeout   time.Duration
 	Logger                *slog.Logger
 	BitmapSubtitleEncoder string
+	LocalSourcePath       func(string) (string, bool)
 }
 
 type Stream struct {
@@ -75,6 +76,7 @@ type Manager struct {
 	parkedResumeTimeout   time.Duration
 	logger                *slog.Logger
 	bitmapSubtitleEncoder string
+	localSourcePath       func(string) (string, bool)
 
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -131,6 +133,20 @@ type mediaProbe struct {
 		Duration string `json:"duration"`
 	} `json:"format"`
 }
+
+type videoPacketProbe struct {
+	Packets []struct {
+		PTSTime string `json:"pts_time"`
+		Flags   string `json:"flags"`
+	} `json:"packets"`
+}
+
+type transientTimelineProbeError struct {
+	err error
+}
+
+func (e *transientTimelineProbeError) Error() string { return e.err.Error() }
+func (e *transientTimelineProbeError) Unwrap() error { return e.err }
 
 type mediaStream struct {
 	Index        int    `json:"index"`
@@ -214,6 +230,7 @@ func New(cfg Config) (*Manager, error) {
 		parkedResumeTimeout:   cfg.ParkedResumeTimeout,
 		logger:                cfg.Logger,
 		bitmapSubtitleEncoder: cfg.BitmapSubtitleEncoder,
+		localSourcePath:       cfg.LocalSourcePath,
 		ctx:                   ctx,
 		cancel:                cancel,
 		streams:               make(map[string]*runningStream),
@@ -248,11 +265,21 @@ func (m *Manager) ProbeSubtitles(ctx context.Context, playbackID string) ([]Subt
 		return nil, errors.New("invalid playback ID")
 	}
 	sourceURL := m.sourceBaseURL + "/v1/playbacks/" + playbackID + "/stream"
-	probe, err := m.probePlayback(ctx, playbackID, sourceURL)
+	probeSource, _ := m.sourceForProbe(playbackID, sourceURL)
+	probe, err := m.probePlayback(ctx, playbackID, probeSource)
 	if err != nil {
 		return nil, err
 	}
 	return supportedSubtitles(probe), nil
+}
+
+func (m *Manager) sourceForProbe(playbackID, sourceURL string) (string, bool) {
+	if m.localSourcePath != nil {
+		if path, ok := m.localSourcePath(playbackID); ok && path != "" {
+			return path, true
+		}
+	}
+	return sourceURL, false
 }
 
 func (m *Manager) Start(
@@ -283,7 +310,8 @@ func (m *Manager) Start(
 	m.stopPlaybackStream(playbackID)
 
 	sourceURL := m.sourceBaseURL + "/v1/playbacks/" + playbackID + "/stream"
-	probe, err := m.probePlayback(ctx, playbackID, sourceURL)
+	probeSource, probeIsLocal := m.sourceForProbe(playbackID, sourceURL)
+	probe, err := m.probePlayback(ctx, playbackID, probeSource)
 	if err != nil {
 		return Stream{}, err
 	}
@@ -302,10 +330,14 @@ func (m *Manager) Start(
 		return Stream{}, fmt.Errorf("bitmap subtitle track %d is unavailable", bitmapSubtitleIndex)
 	}
 	timelineStart := startSeconds
-	keyframeProbeFailed := false
+	retryKeyframeProbe := false
 	if startSeconds > 0 {
-		if keyframeStart, err := m.probeTimelineStart(ctx, sourceURL, startSeconds); err != nil {
-			keyframeProbeFailed = true
+		if keyframeStart, err := m.probeTimelineStart(ctx, probeSource, startSeconds); err != nil {
+			var transient *transientTimelineProbeError
+			if probeIsLocal || !errors.As(err, &transient) {
+				return Stream{}, fmt.Errorf("probe HLS keyframe start: %w", err)
+			}
+			retryKeyframeProbe = true
 			m.logger.Warn("probe HLS keyframe start", "playback_id", playbackID, "error", err)
 		} else {
 			timelineStart = keyframeStart
@@ -377,16 +409,18 @@ func (m *Manager) Start(
 		m.Stop(playbackID)
 		return Stream{}, err
 	}
-	if keyframeProbeFailed {
-		// The packager's -ss seek landed on the video keyframe preceding the
-		// requested start. Leaving the requested time as the timeline start would
-		// anchor the client position mapping and the WebVTT sidecar to the wrong
-		// point, desyncing subtitles by the keyframe gap. The packager has now
-		// read through that source region, so re-probe the actual landing point
-		// and correct the timeline before handing the stream to the client.
-		if keyframeStart, err := m.probeTimelineStart(startupContext, sourceURL, startSeconds); err != nil {
+	if retryKeyframeProbe {
+		// The packager has now read through the cold source region. Re-probe once
+		// and require the actual landing point before handing the stream to the
+		// client; reporting the requested time after another failure would silently
+		// desync the client timeline and WebVTT sidecar from stream-copied video.
+		keyframeStart, err := m.probeTimelineStart(startupContext, sourceURL, startSeconds)
+		if err != nil {
 			m.logger.Warn("reprobe HLS keyframe start", "playback_id", playbackID, "error", err)
-		} else if keyframeStart != timelineStart {
+			m.Stop(playbackID)
+			return Stream{}, fmt.Errorf("reprobe HLS keyframe start: %w", err)
+		}
+		if keyframeStart != timelineStart {
 			stream.info.StartSeconds = keyframeStart
 			timelineStart = keyframeStart
 			m.logger.Info("corrected HLS keyframe start", "playback_id", playbackID,
@@ -887,52 +921,57 @@ func (m *Manager) probe(parent context.Context, sourceURL string) (mediaProbe, e
 	return probe, nil
 }
 
-func (m *Manager) probeTimelineStart(parent context.Context, sourceURL string, requested float64) (float64, error) {
-	var lastErr error
+func (m *Manager) probeTimelineStart(parent context.Context, source string, requested float64) (float64, error) {
 	minimumStart := math.Max(0, requested-60)
-	for _, lookback := range []float64{0, 5, 15, 30, 60} {
-		probeAt := math.Max(0, requested-lookback)
-		start, err := m.probeVideoTimestamp(parent, sourceURL, probeAt)
-		if err == nil && start >= minimumStart && start <= requested+0.5 {
-			return start, nil
-		}
-		if err != nil {
-			lastErr = err
-		} else {
-			lastErr = fmt.Errorf("invalid video keyframe timestamp %q", strconv.FormatFloat(start, 'f', 3, 64))
-		}
-		if probeAt == 0 {
-			break
-		}
-	}
-	return requested, lastErr
-}
-
-func (m *Manager) probeVideoTimestamp(parent context.Context, sourceURL string, startSeconds float64) (float64, error) {
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
-	interval := strconv.FormatFloat(startSeconds, 'f', 3, 64) + "%+#1"
+	interval := strconv.FormatFloat(minimumStart, 'f', 3, 64) + "%" +
+		strconv.FormatFloat(requested+0.5, 'f', 3, 64)
 	command := exec.CommandContext(ctx, m.ffprobePath,
 		"-v", "error",
 		"-read_intervals", interval,
 		"-select_streams", "v:0",
-		"-show_entries", "packet=pts_time",
-		"-of", "default=noprint_wrappers=1:nokey=1",
-		sourceURL,
+		"-show_entries", "packet=pts_time,flags",
+		"-of", "json",
+		source,
 	)
 	output, err := command.Output()
 	if err != nil {
-		return 0, fmt.Errorf("probe video keyframe: %w", err)
+		return requested, &transientTimelineProbeError{
+			err: fmt.Errorf("probe video keyframes: %w", err),
+		}
 	}
-	fields := strings.Fields(string(output))
-	if len(fields) == 0 {
-		return 0, errors.New("probe video keyframe returned no timestamp")
+	var probe videoPacketProbe
+	if err := json.Unmarshal(output, &probe); err != nil {
+		return requested, fmt.Errorf("decode video keyframe probe: %w", err)
 	}
-	timestamp, err := strconv.ParseFloat(fields[0], 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid video keyframe timestamp %q", fields[0])
+
+	start := -1.0
+	invalidTimestamp := ""
+	for _, packet := range probe.Packets {
+		timestamp, err := strconv.ParseFloat(packet.PTSTime, 64)
+		if err != nil || math.IsNaN(timestamp) || math.IsInf(timestamp, 0) {
+			if packet.PTSTime != "" {
+				invalidTimestamp = packet.PTSTime
+			}
+			continue
+		}
+		if strings.Contains(packet.Flags, "K") && timestamp >= minimumStart &&
+			timestamp <= requested+0.5 && timestamp > start {
+			start = timestamp
+			continue
+		}
+		if strings.Contains(packet.Flags, "K") {
+			invalidTimestamp = packet.PTSTime
+		}
 	}
-	return timestamp, nil
+	if start >= 0 {
+		return start, nil
+	}
+	if invalidTimestamp != "" {
+		return requested, fmt.Errorf("invalid video keyframe timestamp %q", invalidTimestamp)
+	}
+	return requested, errors.New("probe video keyframes returned no timestamp near requested start")
 }
 
 func compatibleVideo(probe mediaProbe) (string, float64, error) {
