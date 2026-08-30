@@ -49,11 +49,12 @@ type fakeRatings struct{}
 type partialRatings struct{}
 
 type fakeTorrentPlaybackEngine struct {
-	mu       sync.Mutex
-	created  []torrentstream.Source
-	dropped  []string
-	sessions map[string]*torrentstream.Session
-	statuses map[string]torrentstream.Status
+	mu                sync.Mutex
+	created           []torrentstream.Source
+	dropped           []string
+	sessions          map[string]*torrentstream.Session
+	statuses          map[string]torrentstream.Status
+	sourceUnavailable map[string]error
 }
 
 func (f *fakeTorrentPlaybackEngine) Create(_ context.Context, source torrentstream.Source) (*torrentstream.Session, error) {
@@ -93,6 +94,12 @@ func (f *fakeTorrentPlaybackEngine) Status(id string) (torrentstream.Status, boo
 	defer f.mu.Unlock()
 	status, ok := f.statuses[id]
 	return status, ok
+}
+
+func (f *fakeTorrentPlaybackEngine) SourceUnavailable(id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sourceUnavailable[id]
 }
 
 func (*fakeTorrentPlaybackEngine) ServeHTTP(http.ResponseWriter, *http.Request, string) error {
@@ -159,6 +166,7 @@ type fakeHLSManager struct {
 	probeErrors      map[string]error
 	languages        []string
 	bitmapSubtitle   int
+	startErrors      map[string]error
 }
 
 func (f *fakeHLSManager) ProbeSubtitles(_ context.Context, id string) ([]hls.SubtitleTrack, error) {
@@ -171,6 +179,9 @@ func (f *fakeHLSManager) ProbeSubtitles(_ context.Context, id string) ([]hls.Sub
 func (f *fakeHLSManager) Start(_ context.Context, id string, start float64, languages []string, bitmapSubtitle int) (hls.Stream, error) {
 	f.languages = append([]string(nil), languages...)
 	f.bitmapSubtitle = bitmapSubtitle
+	if err := f.startErrors[id]; err != nil {
+		return hls.Stream{}, err
+	}
 	return hls.Stream{
 		PlaybackID: id, StartSeconds: start, VideoCodec: "h264",
 		BurnedSubtitleIndex: optionalTestIndex(bitmapSubtitle),
@@ -1910,7 +1921,8 @@ func TestRankedPlaybackStopsAfterHighestRankedHealthySubtitleRelease(t *testing.
 
 	session, selected, err := server.createRankedPlayback(
 		t.Context(), rankedTorrentCandidates(3),
-		catalog.Preferences{StreamingOptimized: true, PreferTextSubtitles: true}, "S01E01",
+		catalog.Preferences{StreamingOptimized: true, PreferTextSubtitles: true},
+		"tmdb-tv:1:s1:e1", "S01E01",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1945,7 +1957,8 @@ func TestRankedPlaybackProgressesPastDeadSwarmWithoutUsingFullWait(t *testing.T)
 	started := time.Now()
 	session, selected, err := server.createRankedPlayback(
 		t.Context(), rankedTorrentCandidates(3),
-		catalog.Preferences{StreamingOptimized: true, PreferTextSubtitles: true}, "S01E01",
+		catalog.Preferences{StreamingOptimized: true, PreferTextSubtitles: true},
+		"tmdb-tv:1:s1:e1", "S01E01",
 	)
 	elapsed := time.Since(started)
 	if err != nil {
@@ -2010,7 +2023,8 @@ func TestRankedPlaybackSubtitleFallbacks(t *testing.T) {
 			server, engine := newRankedPlaybackTestServer(t, test.statuses, test.tracks)
 			session, selected, err := server.createRankedPlayback(
 				t.Context(), rankedTorrentCandidates(test.candidates),
-				catalog.Preferences{StreamingOptimized: true, PreferTextSubtitles: true}, "S01E01",
+				catalog.Preferences{StreamingOptimized: true, PreferTextSubtitles: true},
+				"tmdb-tv:1:s1:e1", "S01E01",
 			)
 			if err != nil {
 				t.Fatal(err)
@@ -2068,6 +2082,135 @@ func rankedTorrentCandidates(count int) []catalog.RankedCandidate {
 		}})
 	}
 	return candidates
+}
+
+func TestUnavailableTorrentRecoveryRefreshesAndStopsAfterTwoCandidates(t *testing.T) {
+	var searches atomic.Int32
+	var indexerServer *httptest.Server
+	indexerServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("t") {
+		case "caps":
+			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><tv-search available="yes" supportedParams="q,season,ep"/></searching></caps>`)
+		case "tvsearch":
+			searches.Add(1)
+			fmt.Fprint(w, `<?xml version="1.0"?><rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel>
+				<item><title>The.Show.S01.Complete.1080p.WEB.H264-BAD</title><guid>release-bad</guid><enclosure url="`+indexerServer.URL+`/bad.torrent" length="1000000" type="application/x-bittorrent"/><torznab:attr name="seeders" value="120"/></item>
+				<item><title>The.Show.S01.Complete.1080p.WEB.H264-HEALTHY</title><guid>release-healthy</guid><enclosure url="`+indexerServer.URL+`/healthy.torrent" length="1000000" type="application/x-bittorrent"/><torznab:attr name="seeders" value="40"/></item>
+			</channel></rss>`)
+		default:
+			http.Error(w, "unsupported", http.StatusBadRequest)
+		}
+	}))
+	defer indexerServer.Close()
+	registry, err := indexer.NewRegistry([]config.Indexer{{
+		Name: "torrent", Type: "torznab", Endpoint: indexerServer.URL + "/api",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mediaID := "tmdb-tv:3:s1:e2"
+	bad := catalog.RankedCandidate{Candidate: catalog.Candidate{
+		ID: "release-bad", Indexer: "torrent",
+		Name: "The.Show.S01.Complete.1080p.WEB.H264-BAD", Protocol: catalog.ProtocolTorrent,
+		Resolution: "1080p", Codec: "h264", SizeBytes: 1_000_000,
+	}, Reasons: []string{"season pack"}}
+	store := playbackcache.New(t.TempDir())
+	if _, err := store.Save("tmdb-tv:3:s1", "The Show", 2020, bad, []byte("metainfo")); err != nil {
+		t.Fatal(err)
+	}
+	unavailable := fmt.Errorf("%w: tracker returned no peers", torrentstream.ErrSourceUnavailable)
+	engine := &fakeTorrentPlaybackEngine{statuses: map[string]torrentstream.Status{
+		"playback-1": {CachedPercent: 14},
+		"playback-2": {},
+	}}
+	manager := &fakeHLSManager{startErrors: map[string]error{
+		"playback-1": unavailable,
+		"playback-2": unavailable,
+	}}
+	server := &Server{
+		indexers: registry, engine: engine, hlsManager: manager,
+		playbackSourceMode: config.PlaybackSourceTorrentOnly,
+		defaults:           catalog.Preferences{Codecs: []string{"h264"}},
+		playbackCache:      store,
+		logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		selected:           make(map[string]catalog.RankedCandidate),
+		playbackCacheKeys:  make(map[string]playbackCacheKey),
+		playbackLanguages:  make(map[string][]string),
+		playbackRequests:   make(map[string]CreatePlaybackRequest),
+		playbackResponses:  make(map[string]CreatePlaybackResponse),
+		torrentFailures:    make(map[string]time.Time),
+		prewarmStates:      make(map[string]*playbackPrewarmState),
+		claimedPlaybacks:   make(map[string]claimedPlayback),
+		releaseSearches:    make(map[string]*releaseSearchState),
+	}
+	requestBody := `{"media_id":"tmdb-tv:3:s1:e2","media_type":"show","query":"The Show","year":2020,"series_id":"tmdb-tv:3","series_title":"The Show","season_number":1,"episode_number":2,"episode_title":"Second","preferences":{"codecs":["h264"]}}`
+	request := CreatePlaybackRequest{
+		MediaID: mediaID, MediaType: "show", Query: "The Show", Year: 2020,
+		SeriesID: "tmdb-tv:3", SeriesTitle: "The Show", SeasonNumber: 1, EpisodeNumber: 2,
+		Preferences: catalog.Preferences{Codecs: []string{"h264"}},
+	}
+	ready := make(chan struct{})
+	close(ready)
+	server.releaseSearches[showReleaseSearchKey(request)] = &releaseSearchState{
+		ready: ready, ranked: []catalog.RankedCandidate{bad}, expiresAt: time.Now().Add(time.Minute),
+	}
+
+	create := func() (*CreatePlaybackResponse, *httptest.ResponseRecorder) {
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, httptest.NewRequest(
+			http.MethodPost, "/v1/playbacks", strings.NewReader(requestBody),
+		))
+		if response.Code != http.StatusCreated {
+			return nil, response
+		}
+		var payload CreatePlaybackResponse
+		if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		return &payload, response
+	}
+	failHLS := func(id string) *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, httptest.NewRequest(
+			http.MethodPost, "/v1/playbacks/"+id+"/hls", strings.NewReader(`{}`),
+		))
+		return response
+	}
+
+	first, response := create()
+	if first == nil || first.ID != "playback-1" || first.Selected == nil || first.Selected.Candidate.ID != "release-bad" {
+		t.Fatalf("first playback = %+v, status = %d, body = %s", first, response.Code, response.Body.String())
+	}
+	if response := failHLS(first.ID); response.Code != http.StatusBadGateway {
+		t.Fatalf("first HLS status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if _, found, err := store.Lookup("tmdb-tv:3:s1", "The Show", 2020); err != nil || found {
+		t.Fatalf("unavailable cached release found = %v, error = %v", found, err)
+	}
+	if _, found := server.releaseSearches[showReleaseSearchKey(request)]; found {
+		t.Fatal("stale prefetched release search survived source failure")
+	}
+
+	second, response := create()
+	if second == nil || second.ID != "playback-2" || second.Selected == nil || second.Selected.Candidate.ID != "release-healthy" {
+		t.Fatalf("replacement playback = %+v, status = %d, body = %s", second, response.Code, response.Body.String())
+	}
+	if searches.Load() != 1 {
+		t.Fatalf("fresh release searches = %d, want 1", searches.Load())
+	}
+	if response := failHLS(second.ID); response.Code != http.StatusBadGateway {
+		t.Fatalf("second HLS status = %d, body = %s", response.Code, response.Body.String())
+	}
+
+	third, response := create()
+	if third != nil || response.Code != http.StatusBadGateway ||
+		!strings.Contains(response.Body.String(), "unavailable after 2 release attempts") {
+		t.Fatalf("terminal playback = %+v, status = %d, body = %s", third, response.Code, response.Body.String())
+	}
+	if searches.Load() != 1 || len(engine.created) != 2 {
+		t.Fatalf("terminal retry searched %d times and mounted %d candidates", searches.Load(), len(engine.created))
+	}
 }
 
 func TestHLSSubtitleProbeFailureInvalidatesTorrentRelease(t *testing.T) {

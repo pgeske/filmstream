@@ -46,15 +46,17 @@ type CreatePlaybackRequest struct {
 }
 
 const (
-	maxUsenetCandidates     = 30
-	maxUsenetPreparation    = 90 * time.Second
-	usenetFailureTTL        = 30 * time.Minute
-	maxLiveSwarmCandidates  = 3
-	minimumLivePeers        = 3
-	strongLiveSwarmPeers    = 20
-	progressiveSwarmWait    = 750 * time.Millisecond
-	liveSwarmWait           = 8 * time.Second
-	swarmStatusPollInterval = 250 * time.Millisecond
+	maxUsenetCandidates            = 30
+	maxUsenetPreparation           = 90 * time.Second
+	usenetFailureTTL               = 30 * time.Minute
+	maxLiveSwarmCandidates         = 3
+	maxUnavailablePlaybackAttempts = 2
+	torrentUnavailableFailureTTL   = 30 * time.Minute
+	minimumLivePeers               = 3
+	strongLiveSwarmPeers           = 20
+	progressiveSwarmWait           = 750 * time.Millisecond
+	liveSwarmWait                  = 8 * time.Second
+	swarmStatusPollInterval        = 250 * time.Millisecond
 
 	subtitlesVerifiedReason = "subtitles verified"
 	subtitleFallbackReason  = "subtitle fallback verified"
@@ -111,6 +113,7 @@ type torrentPlaybackEngine interface {
 	TorrentMetainfo(string) ([]byte, error)
 	Drop(string) error
 	Status(string) (torrentstream.Status, bool)
+	SourceUnavailable(string) error
 	ServeHTTP(http.ResponseWriter, *http.Request, string) error
 }
 
@@ -168,6 +171,7 @@ type Server struct {
 	playbackRequests  map[string]CreatePlaybackRequest
 	playbackResponses map[string]CreatePlaybackResponse
 	usenetFailures    map[string]time.Time
+	torrentFailures   map[string]time.Time
 
 	recommendationService recommendations.Manager
 
@@ -202,6 +206,7 @@ func New(indexers *indexer.Registry, engine *torrentstream.Engine, defaults cata
 		playbackRequests:   make(map[string]CreatePlaybackRequest),
 		playbackResponses:  make(map[string]CreatePlaybackResponse),
 		usenetFailures:     make(map[string]time.Time),
+		torrentFailures:    make(map[string]time.Time),
 		prewarmStates:      make(map[string]*playbackPrewarmState),
 		prewarmSlots:       make(chan struct{}, 2),
 		claimedPlaybacks:   make(map[string]claimedPlayback),
@@ -1093,6 +1098,13 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if session == nil && allowTorrent && s.torrentRecoveryExhausted(request.MediaID) {
+			s.logger.Warn("torrent playback recovery exhausted", "media_id", request.MediaID,
+				"attempts", maxUnavailablePlaybackAttempts)
+			writeError(w, http.StatusBadGateway,
+				fmt.Sprintf("playback unavailable after %d release attempts", maxUnavailablePlaybackAttempts))
+			return
+		}
 		if session == nil {
 			var err error
 			session, selected, err = s.createCachedPlayback(r.Context(), request)
@@ -1130,7 +1142,7 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			torrentSession, torrentSelected, err := s.createRankedPlayback(
-				r.Context(), ranked, preferences, playbackFileHint(request),
+				r.Context(), ranked, preferences, request.MediaID, playbackFileHint(request),
 			)
 			if err != nil {
 				if usenetErr != nil {
@@ -1460,10 +1472,7 @@ func (s *Server) cacheSuccessfulPlayback(id string) {
 	}
 }
 
-func (s *Server) invalidateCachedPlayback(id string) {
-	if s.playbackCache == nil {
-		return
-	}
+func (s *Server) invalidateCachedPlayback(id string, causes ...error) {
 	s.mu.RLock()
 	key, ok := s.playbackCacheKeys[id]
 	selected, hasSelection := s.selected[id]
@@ -1477,9 +1486,30 @@ func (s *Server) invalidateCachedPlayback(id string) {
 		if hasSelection {
 			s.markUsenetCandidateFailed(selected.Candidate, playbackFileHint(request))
 		}
-		err = s.playbackCache.RemoveUsenet(key.mediaID, key.title, key.year)
+		if s.playbackCache != nil {
+			err = s.playbackCache.RemoveUsenet(key.mediaID, key.title, key.year)
+		}
 	} else {
-		err = s.playbackCache.Remove(key.mediaID, key.title, key.year)
+		if s.playbackCache != nil {
+			err = s.playbackCache.Remove(key.mediaID, key.title, key.year)
+		}
+		if hasSelection && sourceUnavailableFailure(causes) {
+			s.markTorrentCandidateFailed(request.MediaID, selected.Candidate)
+			invalidatedSearch := s.invalidateShowReleaseSearch(request)
+			status, _ := s.engine.Status(id)
+			reportedSeeders := -1
+			if selected.Candidate.Seeders != nil {
+				reportedSeeders = *selected.Candidate.Seeders
+			}
+			s.logger.Warn("rejected unavailable torrent playback candidate",
+				"id", id, "media_id", request.MediaID, "name", selected.Candidate.Name,
+				"reported_seeders", reportedSeeders, "connected_peers", status.ActivePeers,
+				"connected_seeders", status.ConnectedSeeders, "total_peers", status.TotalPeers,
+				"pending_peers", status.PendingPeers, "half_open_peers", status.HalfOpenPeers,
+				"cached_percent", status.CachedPercent,
+				"prefetched_release_search_invalidated", invalidatedSearch,
+				"error", errors.Join(causes...))
+		}
 	}
 	if err != nil {
 		s.logger.Warn("invalidate playback cache", "title", key.title, "source", key.source, "error", err)
@@ -1648,15 +1678,105 @@ func usenetCandidateKey(candidate catalog.Candidate, fileHint ...string) string 
 	return key
 }
 
+func sourceUnavailableFailure(causes []error) bool {
+	for _, cause := range causes {
+		if errors.Is(cause, torrentstream.ErrSourceUnavailable) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) markTorrentCandidateFailed(mediaID string, candidate catalog.Candidate) {
+	if strings.TrimSpace(mediaID) == "" {
+		return
+	}
+	s.mu.Lock()
+	if s.torrentFailures == nil {
+		s.torrentFailures = make(map[string]time.Time)
+	}
+	s.torrentFailures[torrentFailureKey(mediaID, candidate)] = time.Now().Add(torrentUnavailableFailureTTL)
+	s.mu.Unlock()
+}
+
+func (s *Server) torrentCandidateRecentlyFailed(mediaID string, candidate catalog.Candidate) bool {
+	if strings.TrimSpace(mediaID) == "" {
+		return false
+	}
+	now := time.Now()
+	key := torrentFailureKey(mediaID, candidate)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	expiresAt, found := s.torrentFailures[key]
+	if found && now.After(expiresAt) {
+		delete(s.torrentFailures, key)
+		return false
+	}
+	return found
+}
+
+func (s *Server) torrentRecoveryExhausted(mediaID string) bool {
+	if strings.TrimSpace(mediaID) == "" {
+		return false
+	}
+	now := time.Now()
+	prefix := strings.ToLower(strings.TrimSpace(mediaID)) + "\x00"
+	failures := 0
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, expiresAt := range s.torrentFailures {
+		if now.After(expiresAt) {
+			delete(s.torrentFailures, key)
+			continue
+		}
+		if strings.HasPrefix(key, prefix) {
+			failures++
+		}
+	}
+	return failures >= maxUnavailablePlaybackAttempts
+}
+
+func (s *Server) clearSuccessfulTorrentRecovery(id string) {
+	s.mu.RLock()
+	key, ok := s.playbackCacheKeys[id]
+	request := s.playbackRequests[id]
+	s.mu.RUnlock()
+	if !ok || key.source != catalog.ProtocolTorrent || request.MediaID == "" {
+		return
+	}
+	prefix := strings.ToLower(strings.TrimSpace(request.MediaID)) + "\x00"
+	s.mu.Lock()
+	for failureKey := range s.torrentFailures {
+		if strings.HasPrefix(failureKey, prefix) {
+			delete(s.torrentFailures, failureKey)
+		}
+	}
+	s.mu.Unlock()
+}
+
+func torrentFailureKey(mediaID string, candidate catalog.Candidate) string {
+	candidateKey := candidate.Indexer + ":" + candidate.Name
+	if candidate.ID != "" {
+		candidateKey = candidate.Indexer + ":" + candidate.ID
+	}
+	return strings.ToLower(strings.TrimSpace(mediaID)) + "\x00" + strings.ToLower(candidateKey)
+}
+
 func (s *Server) createRankedPlayback(
 	ctx context.Context,
 	ranked []catalog.RankedCandidate,
 	preferences catalog.Preferences,
+	mediaID string,
 	fileHint string,
 ) (*torrentstream.Session, *catalog.RankedCandidate, error) {
 	torrents := make([]catalog.RankedCandidate, 0, len(ranked))
 	for _, candidate := range ranked {
 		if candidate.Candidate.Protocol == catalog.ProtocolUsenet || candidate.Candidate.NZBURL != "" {
+			continue
+		}
+		if s.torrentCandidateRecentlyFailed(mediaID, candidate.Candidate) {
+			s.logger.Info("skipping recently unavailable torrent candidate",
+				"media_id", mediaID, "name", candidate.Candidate.Name)
 			continue
 		}
 		torrents = append(torrents, candidate)
@@ -2101,10 +2221,11 @@ func (s *Server) startHLSPlayback(w http.ResponseWriter, r *http.Request) {
 		// HLS errors used to leave nothing in the logs while the client buffered.
 		s.logger.Warn("HLS playback start failed", "id", id,
 			"start_seconds", request.StartSeconds, "error", err)
-		s.invalidateCachedPlayback(id)
+		s.invalidateCachedPlayback(id, err)
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	s.clearSuccessfulTorrentRecovery(id)
 	s.cacheSuccessfulPlayback(id)
 	writeJSON(w, http.StatusCreated, struct {
 		hls.Stream
@@ -2134,7 +2255,7 @@ func (s *Server) listHLSSubtitles(w http.ResponseWriter, r *http.Request) {
 		// The probe reads the same source as HLS startup, so a failure here means
 		// the release cannot serve playback either. The client retries against a
 		// fresh playback, which then searches for a different release.
-		s.invalidateCachedPlayback(id)
+		s.invalidateCachedPlayback(id, err)
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
