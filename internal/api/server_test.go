@@ -183,7 +183,7 @@ func (f *fakeHLSManager) Start(_ context.Context, id string, start float64, lang
 		return hls.Stream{}, err
 	}
 	return hls.Stream{
-		PlaybackID: id, StartSeconds: start, VideoCodec: "h264",
+		PlaybackID: id, TimelineOriginSeconds: start, VideoCodec: "h264",
 		BurnedSubtitleIndex: optionalTestIndex(bitmapSubtitle),
 	}, nil
 }
