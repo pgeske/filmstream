@@ -578,7 +578,7 @@ private final class IOSPlaybackController: ObservableObject {
 
     private let api: FilmstreamAPI
     private let playback: Playback
-    private var streamStartSeconds: Double
+    private var timeline: HLSPlaybackTimeline
     private var burnedSubtitleIndex: Int?
     private var timeObserver: Any?
     private var statusObservation: NSKeyValueObservation?
@@ -599,10 +599,10 @@ private final class IOSPlaybackController: ObservableObject {
     init(prepared: PreparedPlayback, api: FilmstreamAPI) {
         self.api = api
         playback = prepared.playback
-        streamStartSeconds = max(0, prepared.hls.startSeconds)
-        positionSeconds = streamStartSeconds
+        timeline = prepared.hls.timeline
+        positionSeconds = timeline.requestedSeconds
         durationSeconds = max(0, prepared.hls.durationSeconds ?? 0)
-        seekOriginSeconds = streamStartSeconds
+        seekOriginSeconds = timeline.requestedSeconds
         subtitleOptions = prepared.hls.subtitles ?? []
         selectedSubtitle = Self.preferredSubtitle(in: subtitleOptions)
         burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
@@ -613,6 +613,16 @@ private final class IOSPlaybackController: ObservableObject {
         player.automaticallyWaitsToMinimizeStalling = true
         player.actionAtItemEnd = .pause
         installItem(url: prepared.hls.playlistURL)
+        let initialPlayerSeconds = timeline.playerSeconds(
+            forMediaSeconds: timeline.requestedSeconds
+        )
+        if initialPlayerSeconds > 0 {
+            player.seek(
+                to: CMTime(seconds: initialPlayerSeconds, preferredTimescale: 600),
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            )
+        }
 
         timeObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
@@ -623,7 +633,7 @@ private final class IOSPlaybackController: ObservableObject {
                 let current = time.seconds
                 if current.isFinite, current >= 0 {
                     self.positionSeconds = min(
-                        max(0, self.streamStartSeconds + current),
+                        self.timeline.mediaSeconds(forPlayerSeconds: current),
                         self.durationSeconds > 0 ? self.durationSeconds : .greatestFiniteMagnitude
                     )
                     self.updateActiveSubtitle()
@@ -789,9 +799,9 @@ private final class IOSPlaybackController: ObservableObject {
 
     private func performSeek(to target: Double, generation: Int) async {
         guard generation == seekGeneration, !stopped else { return }
-        let localTarget = target - streamStartSeconds
-        if canSeekLocally(to: localTarget) {
-            let time = CMTime(seconds: localTarget, preferredTimescale: 600)
+        let playerTarget = timeline.playerSeconds(forMediaSeconds: target)
+        if canSeekLocally(to: playerTarget) {
+            let time = CMTime(seconds: playerTarget, preferredTimescale: 600)
             player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
                 Task { @MainActor in
                     guard finished else { return }
@@ -804,15 +814,25 @@ private final class IOSPlaybackController: ObservableObject {
         do {
             let prepared = try await api.prepareNativePlayback(playback, startSeconds: target)
             guard !Task.isCancelled, generation == seekGeneration, !stopped else { return }
-            streamStartSeconds = max(0, prepared.hls.startSeconds)
+            timeline = prepared.hls.timeline
             burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
             updateSubtitleOptions(prepared.hls.subtitles ?? [])
             if let duration = prepared.hls.durationSeconds, duration > 0 {
                 durationSeconds = duration
             }
-            positionSeconds = streamStartSeconds
+            positionSeconds = target
             installItem(url: cacheBusted(prepared.hls.playlistURL))
-            finishSeek(generation: generation)
+            let playerPosition = timeline.playerSeconds(forMediaSeconds: target)
+            player.seek(
+                to: CMTime(seconds: playerPosition, preferredTimescale: 600),
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            ) { [weak self] finished in
+                Task { @MainActor in
+                    guard finished else { return }
+                    self?.finishSeek(generation: generation)
+                }
+            }
         } catch {
             guard generation == seekGeneration, !stopped else { return }
             pendingSeekSeconds = nil
@@ -891,13 +911,15 @@ private final class IOSPlaybackController: ObservableObject {
                     useSavedSubtitlePreference: false
                 )
                 guard !Task.isCancelled, !self.stopped else { return }
-                self.streamStartSeconds = max(0, prepared.hls.startSeconds)
+                self.timeline = prepared.hls.timeline
                 self.burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
                 self.updateSubtitleOptions(prepared.hls.subtitles ?? [])
                 self.installItem(url: self.cacheBusted(prepared.hls.playlistURL))
-                let localPosition = max(0, resumePosition - self.streamStartSeconds)
+                let playerPosition = self.timeline.playerSeconds(
+                    forMediaSeconds: resumePosition
+                )
                 self.player.seek(
-                    to: CMTime(seconds: localPosition, preferredTimescale: 600),
+                    to: CMTime(seconds: playerPosition, preferredTimescale: 600),
                     toleranceBefore: .zero,
                     toleranceAfter: .zero
                 ) { [weak self] finished in
@@ -937,7 +959,7 @@ private final class IOSPlaybackController: ObservableObject {
         activeSubtitleText = nil
         guard let track = selectedSubtitle, !track.isBitmap, !stopped else { return }
 
-        let offset = streamStartSeconds
+        let subtitleTimeline = timeline
         subtitleTask = Task { [weak self] in
             guard let self else { return }
             do {
@@ -948,18 +970,17 @@ private final class IOSPlaybackController: ObservableObject {
             while !Task.isCancelled {
                 guard !self.stopped,
                       self.selectedSubtitle?.index == track.index,
-                      self.streamStartSeconds == offset else {
+                      self.timeline == subtitleTimeline else {
                     return
                 }
                 do {
                     if let cues = try await self.api.subtitleCues(
                         playbackID: self.playback.id,
-                        track: track,
-                        offsetSeconds: offset
+                        track: track
                     ) {
                         guard !Task.isCancelled,
                               self.selectedSubtitle?.index == track.index,
-                              self.streamStartSeconds == offset else {
+                              self.timeline == subtitleTimeline else {
                             return
                         }
                         self.subtitleCues = cues

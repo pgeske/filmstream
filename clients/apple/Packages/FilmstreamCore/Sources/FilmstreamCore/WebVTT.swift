@@ -13,7 +13,7 @@ public struct SubtitleCue: Equatable, Sendable {
 }
 
 public enum WebVTTParser {
-    public static func parse(_ data: Data, offsetSeconds: Double = 0) -> [SubtitleCue] {
+    public static func parse(_ data: Data) -> [SubtitleCue] {
         guard let contents = String(data: data, encoding: .utf8) else { return [] }
         let lines = contents.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
         var cues: [SubtitleCue] = []
@@ -53,11 +53,7 @@ public enum WebVTTParser {
             let text = cleanText(textLines.joined(separator: "\n"))
             if !text.isEmpty, end >= start {
                 cues.append(
-                    SubtitleCue(
-                        startSeconds: offsetSeconds + start,
-                        endSeconds: offsetSeconds + end,
-                        text: text
-                    )
+                    SubtitleCue(startSeconds: start, endSeconds: end, text: text)
                 )
             }
         }

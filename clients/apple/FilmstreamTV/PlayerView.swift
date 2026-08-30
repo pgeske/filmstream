@@ -637,8 +637,7 @@ private final class NativePlaybackController: ObservableObject {
     private let api: FilmstreamAPI
     private let movie: Movie
     private var playback: Playback
-    private var requestedStreamStartSeconds: Double
-    private var streamStartSeconds: Double
+    private var timeline: HLSPlaybackTimeline
     private var burnedSubtitleIndex: Int?
     private var timeObserver: Any?
     private var statusObservation: NSKeyValueObservation?
@@ -669,14 +668,10 @@ private final class NativePlaybackController: ObservableObject {
         self.api = api
         self.movie = movie
         playback = prepared.playback
-        requestedStreamStartSeconds = max(
-            0,
-            prepared.hls.requestedStartSeconds ?? prepared.hls.startSeconds
-        )
-        streamStartSeconds = max(0, prepared.hls.startSeconds)
-        positionSeconds = requestedStreamStartSeconds
+        timeline = prepared.hls.timeline
+        positionSeconds = timeline.requestedSeconds
         durationSeconds = max(0, prepared.hls.durationSeconds ?? 0)
-        seekOriginSeconds = requestedStreamStartSeconds
+        seekOriginSeconds = timeline.requestedSeconds
         subtitleOptions = prepared.hls.subtitles ?? []
         selectedSubtitle = Self.preferredSubtitle(in: subtitleOptions)
         burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
@@ -684,10 +679,12 @@ private final class NativePlaybackController: ObservableObject {
         player.automaticallyWaitsToMinimizeStalling = true
         player.actionAtItemEnd = .pause
         installItem(url: prepared.hls.playlistURL)
-        let initialOffset = max(0, requestedStreamStartSeconds - streamStartSeconds)
-        if initialOffset > 0 {
+        let initialPlayerSeconds = timeline.playerSeconds(
+            forMediaSeconds: timeline.requestedSeconds
+        )
+        if initialPlayerSeconds > 0 {
             player.seek(
-                to: CMTime(seconds: initialOffset, preferredTimescale: 600),
+                to: CMTime(seconds: initialPlayerSeconds, preferredTimescale: 600),
                 toleranceBefore: .zero,
                 toleranceAfter: .zero
             )
@@ -702,7 +699,7 @@ private final class NativePlaybackController: ObservableObject {
                 let current = time.seconds
                 if current.isFinite, current >= 0 {
                     self.positionSeconds = min(
-                        max(0, self.streamStartSeconds + current),
+                        self.timeline.mediaSeconds(forPlayerSeconds: current),
                         self.durationSeconds > 0 ? self.durationSeconds : .greatestFiniteMagnitude
                     )
                     self.updateActiveSubtitle()
@@ -952,7 +949,7 @@ private final class NativePlaybackController: ObservableObject {
         player.pause()
 
         let resumePosition = max(0, positionSeconds)
-        var requestedStart = reusePreparedStream ? requestedStreamStartSeconds : resumePosition
+        var requestedStart = reusePreparedStream ? timeline.requestedSeconds : resumePosition
         do {
             let refreshed: PreparedPlayback
             do {
@@ -975,11 +972,7 @@ private final class NativePlaybackController: ObservableObject {
             guard !stopped else { return }
 
             playback = refreshed.playback
-            requestedStreamStartSeconds = max(
-                0,
-                refreshed.hls.requestedStartSeconds ?? requestedStart
-            )
-            streamStartSeconds = max(0, refreshed.hls.startSeconds)
+            timeline = refreshed.hls.timeline
             burnedSubtitleIndex = refreshed.hls.burnedSubtitleIndex
             updateSubtitleOptions(refreshed.hls.subtitles ?? [])
             if let duration = refreshed.hls.durationSeconds, duration > 0 {
@@ -988,8 +981,8 @@ private final class NativePlaybackController: ObservableObject {
             positionSeconds = resumePosition
             installItem(url: cacheBusted(refreshed.hls.playlistURL))
 
-            let localPosition = max(0, resumePosition - streamStartSeconds)
-            let time = CMTime(seconds: localPosition, preferredTimescale: 600)
+            let playerPosition = timeline.playerSeconds(forMediaSeconds: resumePosition)
+            let time = CMTime(seconds: playerPosition, preferredTimescale: 600)
             player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
                 Task { @MainActor in
                     guard let self, !self.stopped else { return }
@@ -1088,9 +1081,9 @@ private final class NativePlaybackController: ObservableObject {
 
     private func performSeek(to target: Double, generation: Int) async {
         guard generation == seekGeneration, !stopped else { return }
-        let localTarget = target - streamStartSeconds
-        if canSeekLocally(to: localTarget) {
-            let time = CMTime(seconds: localTarget, preferredTimescale: 600)
+        let playerTarget = timeline.playerSeconds(forMediaSeconds: target)
+        if canSeekLocally(to: playerTarget) {
+            let time = CMTime(seconds: playerTarget, preferredTimescale: 600)
             player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
                 Task { @MainActor in
                     guard finished else { return }
@@ -1103,11 +1096,7 @@ private final class NativePlaybackController: ObservableObject {
         do {
             let prepared = try await api.prepareNativePlayback(playback, startSeconds: target)
             guard !Task.isCancelled, generation == seekGeneration, !stopped else { return }
-            requestedStreamStartSeconds = max(
-                0,
-                prepared.hls.requestedStartSeconds ?? target
-            )
-            streamStartSeconds = max(0, prepared.hls.startSeconds)
+            timeline = prepared.hls.timeline
             burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
             updateSubtitleOptions(prepared.hls.subtitles ?? [])
             if let duration = prepared.hls.durationSeconds, duration > 0 {
@@ -1115,8 +1104,8 @@ private final class NativePlaybackController: ObservableObject {
             }
             positionSeconds = target
             installItem(url: cacheBusted(prepared.hls.playlistURL))
-            let localPosition = max(0, target - streamStartSeconds)
-            let time = CMTime(seconds: localPosition, preferredTimescale: 600)
+            let playerPosition = timeline.playerSeconds(forMediaSeconds: target)
+            let time = CMTime(seconds: playerPosition, preferredTimescale: 600)
             player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
                 Task { @MainActor in
                     guard finished else { return }
@@ -1201,16 +1190,15 @@ private final class NativePlaybackController: ObservableObject {
                     useSavedSubtitlePreference: false
                 )
                 guard !Task.isCancelled, !self.stopped else { return }
-                self.requestedStreamStartSeconds = max(
-                    0, prepared.hls.requestedStartSeconds ?? resumePosition
-                )
-                self.streamStartSeconds = max(0, prepared.hls.startSeconds)
+                self.timeline = prepared.hls.timeline
                 self.burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
                 self.updateSubtitleOptions(prepared.hls.subtitles ?? [])
                 self.installItem(url: self.cacheBusted(prepared.hls.playlistURL))
-                let localPosition = max(0, resumePosition - self.streamStartSeconds)
+                let playerPosition = self.timeline.playerSeconds(
+                    forMediaSeconds: resumePosition
+                )
                 self.player.seek(
-                    to: CMTime(seconds: localPosition, preferredTimescale: 600),
+                    to: CMTime(seconds: playerPosition, preferredTimescale: 600),
                     toleranceBefore: .zero,
                     toleranceAfter: .zero
                 ) { [weak self] finished in
@@ -1250,7 +1238,7 @@ private final class NativePlaybackController: ObservableObject {
         activeSubtitleText = nil
         guard let track = selectedSubtitle, !track.isBitmap, !stopped else { return }
 
-        let offset = streamStartSeconds
+        let subtitleTimeline = timeline
         subtitleTask = Task { [weak self] in
             guard let self else { return }
             do {
@@ -1261,18 +1249,17 @@ private final class NativePlaybackController: ObservableObject {
             while !Task.isCancelled {
                 guard !self.stopped,
                       self.selectedSubtitle?.index == track.index,
-                      self.streamStartSeconds == offset else {
+                      self.timeline == subtitleTimeline else {
                     return
                 }
                 do {
                     if let cues = try await self.api.subtitleCues(
                         playbackID: self.playback.id,
-                        track: track,
-                        offsetSeconds: offset
+                        track: track
                     ) {
                         guard !Task.isCancelled,
                               self.selectedSubtitle?.index == track.index,
-                              self.streamStartSeconds == offset else {
+                              self.timeline == subtitleTimeline else {
                             return
                         }
                         self.subtitleCues = cues

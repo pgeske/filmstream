@@ -50,6 +50,11 @@ import Testing
     #expect(playback.id == "abc123")
     #expect(playback.requestedStartSeconds == 125)
     #expect(playback.startSeconds == 120)
+    #expect(playback.timeline.requestedSeconds == 125)
+    #expect(playback.timeline.originSeconds == 120)
+    #expect(playback.timeline.playerSeconds(forMediaSeconds: 125) == 5)
+    #expect(playback.timeline.playerSeconds(forMediaSeconds: 119) == -1)
+    #expect(playback.timeline.mediaSeconds(forPlayerSeconds: 5) == 125)
     #expect(playback.durationSeconds == 7200)
     #expect(playback.playlistURL.pathExtension == "m3u8")
     #expect(playback.subtitles?.first?.language == "en")
@@ -57,7 +62,7 @@ import Testing
     #expect(playback.burnedSubtitleIndex == 6)
 }
 
-@Test func parsesGrowingWebVTTWithPlaybackOffset() {
+@Test func parsesGrowingWebVTTOnFullMediaTimeline() {
     let data = Data("""
     WEBVTT
 
@@ -68,10 +73,10 @@ import Testing
     The Matrix has you.
 
     """.utf8)
-    let cues = WebVTTParser.parse(data, offsetSeconds: 120)
+    let cues = WebVTTParser.parse(data)
     #expect(cues == [
-        SubtitleCue(startSeconds: 121.25, endSeconds: 123.5, text: "Wake up, Neo."),
-        SubtitleCue(startSeconds: 124, endSeconds: 126, text: "The Matrix has you.")
+        SubtitleCue(startSeconds: 1.25, endSeconds: 3.5, text: "Wake up, Neo."),
+        SubtitleCue(startSeconds: 4, endSeconds: 6, text: "The Matrix has you.")
     ])
 }
 
