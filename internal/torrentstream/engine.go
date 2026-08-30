@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -31,6 +32,15 @@ const (
 	defaultIdleGrace       = 2 * time.Minute
 	defaultSeedMaxAge      = 168 * time.Hour
 	defaultCleanupInterval = 30 * time.Second
+
+	// A source read only makes progress once the pieces it needs are complete
+	// locally or a connected peer can deliver them. Bound how long a read waits
+	// for that so a playback mounted on a dead swarm fails quickly and
+	// diagnosably instead of stalling until the client times out.
+	defaultServeReadinessWait = 15 * time.Second
+	serviceReadinessPoll      = 250 * time.Millisecond
+	serviceReadinessLogEvery  = 3 * time.Second
+	localVerifyBudget         = 8 * time.Second
 )
 
 var videoExtensions = map[string]bool{
@@ -39,20 +49,21 @@ var videoExtensions = map[string]bool{
 }
 
 type Config struct {
-	DataDir         string
-	ListenPort      int
-	MaxTorrentBytes int64
-	ReadaheadBytes  int64
-	MetadataTimeout time.Duration
-	SeedRatioTarget float64
-	CacheLimitBytes int64
-	MaxSeedSessions int
-	IdleGrace       time.Duration
-	SeedMaxAge      time.Duration
-	CleanupInterval time.Duration
-	CleanOnStart    bool
-	CleanOnClose    bool
-	Logger          *slog.Logger
+	DataDir            string
+	ListenPort         int
+	MaxTorrentBytes    int64
+	ReadaheadBytes     int64
+	MetadataTimeout    time.Duration
+	SeedRatioTarget    float64
+	CacheLimitBytes    int64
+	MaxSeedSessions    int
+	IdleGrace          time.Duration
+	SeedMaxAge         time.Duration
+	CleanupInterval    time.Duration
+	ServeReadinessWait time.Duration
+	CleanOnStart       bool
+	CleanOnClose       bool
+	Logger             *slog.Logger
 }
 
 type Source struct {
@@ -77,6 +88,7 @@ type Engine struct {
 	idleGrace        time.Duration
 	seedMaxAge       time.Duration
 	cleanupInterval  time.Duration
+	serveWait        time.Duration
 	cleanOnClose     bool
 	logger           *slog.Logger
 	lockFile         *os.File
@@ -150,6 +162,9 @@ func New(cfg Config) (*Engine, error) {
 	if cfg.CleanupInterval <= 0 {
 		cfg.CleanupInterval = defaultCleanupInterval
 	}
+	if cfg.ServeReadinessWait <= 0 {
+		cfg.ServeReadinessWait = defaultServeReadinessWait
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -213,6 +228,7 @@ func New(cfg Config) (*Engine, error) {
 		idleGrace:        cfg.IdleGrace,
 		seedMaxAge:       cfg.SeedMaxAge,
 		cleanupInterval:  cfg.CleanupInterval,
+		serveWait:        cfg.ServeReadinessWait,
 		cleanOnClose:     cfg.CleanOnClose,
 		logger:           cfg.Logger,
 		lockFile:         lockFile,
@@ -250,10 +266,17 @@ func acquireDataDirLock(dataDir string) (*os.File, error) {
 }
 
 // Part-file storage treats a final media path as complete after a restart. Demote
-// sparse final files so missing pieces are downloaded instead of served as zeroes.
+// sparse final files so missing pieces are downloaded instead of served as zeroes,
+// and drop part files that shadow complete media: chunk writes for pieces shared
+// with adjacent files can recreate a part file after its media was promoted, and
+// reads prefer the part file, which would serve holes over verified data.
 func repairSparseCompletedMedia(dataDir string, logger *slog.Logger) error {
 	return filepath.Walk(dataDir, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
+			// Entries can vanish mid-walk because this pass removes files itself.
+			if errors.Is(walkErr, os.ErrNotExist) {
+				return nil
+			}
 			return walkErr
 		}
 		if !info.Mode().IsRegular() || strings.HasSuffix(path, ".part") ||
@@ -261,7 +284,18 @@ func repairSparseCompletedMedia(dataDir string, logger *slog.Logger) error {
 			return nil
 		}
 		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok || stat.Blocks*512*2 >= info.Size() {
+		if !ok {
+			return nil
+		}
+		if stat.Blocks*512*2 >= info.Size() {
+			// Not sparse: the final file holds verified complete data. A sibling
+			// part file can only be a stale shadow from later chunk writes.
+			partPath := path + ".part"
+			if err := os.Remove(partPath); err == nil {
+				logger.Warn("removed part file shadowing complete media", "part", partPath)
+			} else if !errors.Is(err, os.ErrNotExist) {
+				logger.Warn("remove part file shadowing complete media", "part", partPath, "error", err)
+			}
 			return nil
 		}
 
@@ -524,6 +558,14 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request, id string) er
 	}
 	defer e.endStream(id)
 
+	// HEAD never reads data, and a parked HLS packager resumes over its existing
+	// source connection, so only body-producing requests need serve readiness.
+	if r.Method != http.MethodHead {
+		if err := e.ensureServeReadiness(r.Context(), session, requestReadStart(r, session.file.Length())); err != nil {
+			return err
+		}
+	}
+
 	reader := session.file.NewReader()
 	defer reader.Close()
 	reader.SetContext(r.Context())
@@ -536,6 +578,194 @@ func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request, id string) er
 	w.Header().Set("Cache-Control", "no-store")
 	http.ServeContent(w, r, filepath.Base(session.FileName), session.CreatedAt, reader)
 	return nil
+}
+
+// requestReadStart returns the position a read request begins at, falling back
+// to the start of the file for absent or unparseable range headers.
+func requestReadStart(r *http.Request, size int64) int64 {
+	rangeHeader := r.Header.Get("Range")
+	if rangeHeader == "" || !strings.HasPrefix(rangeHeader, "bytes=") {
+		return 0
+	}
+	spec := strings.SplitN(strings.TrimPrefix(rangeHeader, "bytes="), ",", 2)[0]
+	dash := strings.IndexByte(spec, '-')
+	if dash < 0 {
+		return 0
+	}
+	first := strings.TrimSpace(spec[:dash])
+	if first == "" {
+		// Suffix range: the last N bytes of the file, for example an MKV cue
+		// seek near the end.
+		if suffix, err := strconv.ParseInt(strings.TrimSpace(spec[dash+1:]), 10, 64); err == nil && suffix > 0 {
+			return max(0, size-suffix)
+		}
+		return 0
+	}
+	start, err := strconv.ParseInt(first, 10, 64)
+	if err != nil || start < 0 || start >= size {
+		return 0
+	}
+	return start
+}
+
+// ensureServeReadiness makes sure a source read can actually make progress.
+// Pieces of a locally present file can still be marked incomplete (for example
+// boundary pieces shared with adjacent part files), so the read first re-hashes
+// local data, then waits a bounded window for the swarm. Without this, a
+// playback mounted on a dead swarm stalls silently inside the first read until
+// the client's request times out with no log or error anywhere.
+func (e *Engine) ensureServeReadiness(ctx context.Context, session *Session, readStart int64) error {
+	if !e.readBlocked(session, readStart) {
+		return nil
+	}
+	e.verifyFileLocalPieces(ctx, session)
+	if !e.readBlocked(session, readStart) {
+		return nil
+	}
+	deadline := time.Now().Add(e.serveWait)
+	nextLog := time.Now().Add(serviceReadinessLogEvery)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !e.readBlocked(session, readStart) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("playback source is not serving: no peers connected within %s and only %d%% of %s is available locally",
+				e.serveWait, localCoveragePercent(session), session.FileName)
+		}
+		if time.Now().After(nextLog) {
+			stats := session.torrent.Stats()
+			e.logger.Info("waiting for playback swarm to serve source",
+				"name", session.Name, "file", session.FileName,
+				"connected_peers", stats.ActivePeers, "connected_seeders", stats.ConnectedSeeders,
+				"pending_peers", stats.PendingPeers, "half_open_peers", stats.HalfOpenPeers,
+				"cached_percent", localCoveragePercent(session))
+			nextLog = time.Now().Add(serviceReadinessLogEvery)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(serviceReadinessPoll):
+		}
+	}
+}
+
+// readBlocked reports whether a read starting at readStart would have to wait
+// for the network: nothing is connected or dialing, and the readahead window is
+// not fully covered by complete local pieces.
+func (e *Engine) readBlocked(session *Session, readStart int64) bool {
+	t := session.torrent
+	stats := t.Stats()
+	if stats.ActivePeers > 0 {
+		return false
+	}
+	file := session.file
+	windowEnd := min(file.Length()-1, readStart+e.readaheadBytes)
+	return !fileRangeComplete(t, file, readStart, windowEnd)
+}
+
+// verifyFileLocalPieces re-hashes the playback file's incomplete pieces so
+// locally present data becomes servable without peers. Data can be on disk
+// while pieces are marked incomplete, and the in-memory completion state does
+// not survive a restart, so this is the only way a disconnected replay can
+// serve. Verification is bounded; pieces beyond the budget stay incomplete.
+func (e *Engine) verifyFileLocalPieces(ctx context.Context, session *Session) {
+	t := session.torrent
+	file := session.file
+	if !fileDataPresent(e.dataDir, file) {
+		return
+	}
+	pieceLength := t.Info().PieceLength
+	begin := int(file.Offset() / pieceLength)
+	end := int((file.Offset() + file.Length() + pieceLength - 1) / pieceLength)
+	if maxPieces := int(t.NumPieces()); end > maxPieces {
+		end = maxPieces
+	}
+	missingPieces := 0
+	for piece := begin; piece < end; piece++ {
+		if t.PieceBytesMissing(piece) > 0 {
+			missingPieces++
+		}
+	}
+	if missingPieces == 0 {
+		return
+	}
+	verifyContext, cancel := context.WithTimeout(ctx, localVerifyBudget)
+	defer cancel()
+	verifiedPieces := 0
+	var verifiedBytes int64
+	for piece := begin; piece < end; piece++ {
+		if verifyContext.Err() != nil {
+			break
+		}
+		if t.PieceBytesMissing(piece) <= 0 {
+			continue
+		}
+		pieceLength := t.Piece(piece).Info().Length()
+		if err := t.Piece(piece).VerifyDataContext(verifyContext); err != nil {
+			e.logger.Warn("verify local torrent data", "name", t.Name(), "piece", piece, "error", err)
+			break
+		}
+		if t.PieceBytesMissing(piece) <= 0 {
+			verifiedPieces++
+			verifiedBytes += pieceLength
+		}
+	}
+	remainingPieces := 0
+	for piece := begin; piece < end; piece++ {
+		if t.PieceBytesMissing(piece) > 0 {
+			remainingPieces++
+		}
+	}
+	if verifiedPieces == 0 && remainingPieces == missingPieces {
+		return
+	}
+	logArgs := []any{"name", t.Name(), "file", file.DisplayPath(),
+		"incomplete_pieces", missingPieces, "verified_pieces", verifiedPieces,
+		"verified_bytes", verifiedBytes, "remaining_incomplete_pieces", remainingPieces}
+	if remainingPieces > 0 {
+		e.logger.Warn("checked local torrent data for playback", logArgs...)
+	} else {
+		e.logger.Info("recovered playback data from local pieces", logArgs...)
+	}
+}
+
+// fileDataPresent reports whether any local bytes exist for the file, so that
+// re-hashing its incomplete pieces has a chance to recover them.
+func fileDataPresent(dataDir string, file *torrent.File) bool {
+	for _, suffix := range []string{"", ".part"} {
+		path := filepath.Join(dataDir, filepath.FromSlash(file.Path())) + suffix
+		if info, err := os.Stat(path); err == nil && info.Size() > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// fileRangeComplete reports whether every piece overlapping the file-relative
+// byte range [start, end] is complete, so reads there are served from local data.
+func fileRangeComplete(t *torrent.Torrent, file *torrent.File, start, end int64) bool {
+	pieceLength := t.Info().PieceLength
+	firstPiece := int((file.Offset() + start) / pieceLength)
+	lastPiece := int((file.Offset() + end) / pieceLength)
+	if maxPiece := int(t.NumPieces()) - 1; lastPiece > maxPiece {
+		lastPiece = maxPiece
+	}
+	for piece := firstPiece; piece <= lastPiece; piece++ {
+		if t.PieceBytesMissing(piece) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func localCoveragePercent(session *Session) int {
+	if session.FileSize <= 0 {
+		return 0
+	}
+	return int(100 * session.file.BytesCompleted() / session.FileSize)
 }
 
 func (e *Engine) beginStream(id string, markStarted bool) (*Session, bool) {

@@ -2097,6 +2097,10 @@ func (s *Server) startHLSPlayback(w http.ResponseWriter, r *http.Request) {
 		r.Context(), id, request.StartSeconds, preferredLanguages, bitmapSubtitleIndex,
 	)
 	if err != nil {
+		// Without this line a failed start is invisible: the probe, packager, and
+		// HLS errors used to leave nothing in the logs while the client buffered.
+		s.logger.Warn("HLS playback start failed", "id", id,
+			"start_seconds", request.StartSeconds, "error", err)
 		s.invalidateCachedPlayback(id)
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -2126,6 +2130,11 @@ func (s *Server) listHLSSubtitles(w http.ResponseWriter, r *http.Request) {
 	}
 	tracks, err := manager.ProbeSubtitles(r.Context(), id)
 	if err != nil {
+		s.logger.Warn("HLS subtitle probe failed", "id", id, "error", err)
+		// The probe reads the same source as HLS startup, so a failure here means
+		// the release cannot serve playback either. The client retries against a
+		// fresh playback, which then searches for a different release.
+		s.invalidateCachedPlayback(id)
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}

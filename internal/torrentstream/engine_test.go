@@ -5,9 +5,11 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -254,6 +256,107 @@ func TestCleanOnStartRemovesUnmanagedTorrentData(t *testing.T) {
 	}
 }
 
+func TestEngineVerifiesLocallyPresentPiecesWithoutPeers(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentPath, videoPath, contents := createTestTorrent(t, dataDir)
+	// A replay can mount data that only exists as a part file: the client then
+	// opens every piece as incomplete and, with no peers, reads would stall
+	// forever unless local data is re-verified.
+	partPath := videoPath + ".part"
+	if err := os.Rename(videoPath, partPath); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := newTestEngine(t, dataDir, Config{})
+	defer engine.Close()
+	session, err := engine.Create(t.Context(), Source{TorrentPath: torrentPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/stream", nil)
+	response := httptest.NewRecorder()
+	if err := engine.ServeHTTP(response, request, session.ID); err != nil {
+		t.Fatalf("read from locally present pieces: %v", err)
+	}
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %q", response.Code, response.Body.String())
+	}
+	if got, want := response.Body.Bytes(), contents; !bytes.Equal(got, want) {
+		t.Fatalf("served %d bytes, want %d", len(got), len(want))
+	}
+	if _, err := os.Stat(partPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("verified part file was not promoted: %v", err)
+	}
+	if _, err := os.Stat(videoPath); err != nil {
+		t.Fatalf("verified media file missing: %v", err)
+	}
+}
+
+func TestEngineRemovesPartFileShadowingCompleteMedia(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentPath, videoPath, contents := createTestTorrent(t, dataDir)
+	// Chunk writes for pieces shared with adjacent files can recreate a part
+	// file after the media file was promoted. Reads prefer the part file, so
+	// the stale shadow must be dropped at startup.
+	partPath := videoPath + ".part"
+	if err := os.WriteFile(partPath, []byte("shadow"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := newTestEngine(t, dataDir, Config{})
+	defer engine.Close()
+	if _, err := os.Stat(partPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale part file still shadows complete media: %v", err)
+	}
+
+	session, err := engine.Create(t.Context(), Source{TorrentPath: torrentPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/stream", nil)
+	response := httptest.NewRecorder()
+	if err := engine.ServeHTTP(response, request, session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := response.Body.Bytes(), contents; !bytes.Equal(got, want) {
+		t.Fatalf("served shadowed media: got %d bytes, want %d", len(got), len(want))
+	}
+}
+
+func TestEngineFailsFastWhenSwarmCannotServeReads(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentPath, videoPath, _ := createTestTorrent(t, dataDir)
+	// A first-play mount with no local data and no peers can never serve the
+	// read; it must fail fast with a clear error instead of stalling until the
+	// client's request times out.
+	if err := os.Remove(videoPath); err != nil {
+		t.Fatal(err)
+	}
+	engine := newTestEngine(t, dataDir, Config{ServeReadinessWait: 200 * time.Millisecond})
+	defer engine.Close()
+	session, err := engine.Create(t.Context(), Source{TorrentPath: torrentPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	request := httptest.NewRequest(http.MethodGet, "/stream", nil).WithContext(ctx)
+	response := httptest.NewRecorder()
+	started := time.Now()
+	err = engine.ServeHTTP(response, request, session.ID)
+	if err == nil {
+		t.Fatal("read without data or peers should fail fast")
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("failure took %s; it should be bounded well below client timeouts", elapsed)
+	}
+	if !strings.Contains(err.Error(), "no peers connected") {
+		t.Fatalf("error = %v, want a clear no-peers failure", err)
+	}
+}
+
 func TestEngineDemotesSparseCompletedMediaBeforeRestore(t *testing.T) {
 	dataDir := t.TempDir()
 	videoPath := filepath.Join(dataDir, "torrents", "season", "episode.mkv")
@@ -426,5 +529,8 @@ func testConfig(dataDir string, overrides Config) Config {
 	}
 	cfg.CleanOnStart = overrides.CleanOnStart
 	cfg.CleanOnClose = overrides.CleanOnClose
+	if overrides.ServeReadinessWait != 0 {
+		cfg.ServeReadinessWait = overrides.ServeReadinessWait
+	}
 	return cfg
 }

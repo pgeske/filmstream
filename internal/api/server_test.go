@@ -2070,6 +2070,50 @@ func rankedTorrentCandidates(count int) []catalog.RankedCandidate {
 	return candidates
 }
 
+func TestHLSSubtitleProbeFailureInvalidatesTorrentRelease(t *testing.T) {
+	store := playbackcache.New(t.TempDir())
+	candidate := catalog.RankedCandidate{Candidate: catalog.Candidate{
+		ID: "stalled-release", Indexer: "torrentleech", Name: "Show.S03.1080p",
+		Protocol: catalog.ProtocolTorrent,
+	}}
+	if _, err := store.Save(
+		"tmdb-tv:1:s3", "Show", 2008, candidate, []byte("metainfo"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	engine := &fakeTorrentPlaybackEngine{sessions: map[string]*torrentstream.Session{
+		"stalled-playback": {ID: "stalled-playback"},
+	}}
+	server := &Server{
+		engine:        engine,
+		playbackCache: store,
+		hlsManager: &fakeHLSManager{
+			probeErrors: map[string]error{"stalled-playback": errors.New("probe playback media: context deadline exceeded")},
+		},
+		playbackCacheKeys: map[string]playbackCacheKey{
+			"stalled-playback": {
+				mediaID: "tmdb-tv:1:s3", title: "Show", year: 2008,
+				source: catalog.ProtocolTorrent,
+			},
+		},
+		selected: map[string]catalog.RankedCandidate{"stalled-playback": candidate},
+		playbackRequests: map[string]CreatePlaybackRequest{
+			"stalled-playback": {SeasonNumber: 3, EpisodeNumber: 7},
+		},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/v1/playbacks/stalled-playback/hls/subtitles", nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("subtitle probe status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if _, found, err := store.Lookup("tmdb-tv:1:s3", "Show", 2008); err != nil || found {
+		t.Fatalf("cached torrent playback found = %v, error = %v", found, err)
+	}
+}
+
 func TestHLSAssetsAndCleanup(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "index.m3u8"), []byte("#EXTM3U\n"), 0o644); err != nil {
