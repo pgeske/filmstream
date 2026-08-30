@@ -65,6 +65,28 @@ func TestEngineReturnsFullyDownloadedLocalFilePath(t *testing.T) {
 	}
 }
 
+func TestEngineDoesNotReturnPartialLocalFilePath(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentPath, videoPath, contents := createTestTorrent(t, dataDir)
+	partPath := videoPath + ".part"
+	if err := os.Rename(videoPath, partPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(partPath, int64(len(contents)/2)); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := newTestEngine(t, dataDir, Config{})
+	defer engine.Close()
+	session, err := engine.Create(t.Context(), Source{TorrentPath: torrentPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path, ok := engine.LocalFilePath(session.ID); ok {
+		t.Fatalf("partial torrent exposed as local file %q", path)
+	}
+}
+
 func TestCleanupProtectsTorrentUntilSeedingRequirementIsMet(t *testing.T) {
 	dataDir := t.TempDir()
 	torrentPath, videoPath, _ := createTestTorrent(t, dataDir)
@@ -290,10 +312,6 @@ func TestEngineVerifiesLocallyPresentPiecesWithoutPeers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if path, ok := engine.LocalFilePath(session.ID); ok {
-		t.Fatalf("partial torrent exposed as local file %q", path)
-	}
-
 	request := httptest.NewRequest(http.MethodGet, "/stream", nil)
 	response := httptest.NewRecorder()
 	if err := engine.ServeHTTP(response, request, session.ID); err != nil {
