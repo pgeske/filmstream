@@ -373,8 +373,7 @@ public struct FilmstreamAPI: Sendable {
 
     public func subtitleCues(
         playbackID: String,
-        track: HLSSubtitleTrack,
-        offsetSeconds: Double
+        track: HLSSubtitleTrack
     ) async throws -> [SubtitleCue]? {
         let url = baseURL.appendingPathComponent(
             "v1/playbacks/\(playbackID)/hls/subtitle-\(track.index).vtt"
@@ -398,7 +397,7 @@ public struct FilmstreamAPI: Sendable {
             let payload = try? decoder.decode(ErrorResponse.self, from: data)
             throw FilmstreamError.server(status: httpResponse.statusCode, message: payload?.error)
         }
-        return WebVTTParser.parse(data, offsetSeconds: offsetSeconds)
+        return WebVTTParser.parse(data)
     }
 
     @discardableResult

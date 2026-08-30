@@ -589,6 +589,13 @@ public struct HLSSubtitleTrack: Codable, Hashable, Identifiable, Sendable {
 
 public struct HLSPlayback: Codable, Hashable, Identifiable, Sendable {
     public var id: String { playbackID }
+    public var timeline: HLSPlaybackTimeline {
+        HLSPlaybackTimeline(
+            requestedSeconds: requestedStartSeconds ?? startSeconds,
+            originSeconds: startSeconds
+        )
+    }
+
     public let playbackID: String
     public let playlistURL: URL
     public let requestedStartSeconds: Double?
@@ -607,6 +614,24 @@ public struct HLSPlayback: Codable, Hashable, Identifiable, Sendable {
         case videoCodec = "video_codec"
         case subtitles
         case burnedSubtitleIndex = "burned_subtitle_index"
+    }
+}
+
+public struct HLSPlaybackTimeline: Hashable, Sendable {
+    public let requestedSeconds: Double
+    public let originSeconds: Double
+
+    public init(requestedSeconds: Double, originSeconds: Double) {
+        self.requestedSeconds = max(0, requestedSeconds)
+        self.originSeconds = max(0, originSeconds)
+    }
+
+    public func mediaSeconds(forPlayerSeconds playerSeconds: Double) -> Double {
+        max(0, originSeconds + max(0, playerSeconds))
+    }
+
+    public func playerSeconds(forMediaSeconds mediaSeconds: Double) -> Double {
+        mediaSeconds - originSeconds
     }
 }
 
