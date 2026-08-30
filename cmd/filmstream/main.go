@@ -162,6 +162,7 @@ func runServer(args []string) error {
 		SegmentSeconds:        cfg.HLSSegmentSeconds,
 		BitmapSubtitleEncoder: *bitmapSubtitleEncoder,
 		LocalSourcePath:       engine.LocalFilePath,
+		SourceUnavailable:     engine.SourceUnavailable,
 		Logger:                logger,
 	})
 	if hlsErr != nil {
