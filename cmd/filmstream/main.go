@@ -161,6 +161,7 @@ func runServer(args []string) error {
 		ReadRate:              cfg.HLSReadRate,
 		SegmentSeconds:        cfg.HLSSegmentSeconds,
 		BitmapSubtitleEncoder: *bitmapSubtitleEncoder,
+		LocalSourcePath:       engine.LocalFilePath,
 		Logger:                logger,
 	})
 	if hlsErr != nil {
