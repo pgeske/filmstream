@@ -674,7 +674,7 @@ func TestCreatePlaybackReusesCachedTorrentReleaseWithoutSearching(t *testing.T) 
 		Candidate: catalog.Candidate{
 			Name: "Original.Show.S01.Complete.1080p.WEB.H264-GROUP", Protocol: catalog.ProtocolTorrent,
 		},
-		Reasons: []string{"season pack", subtitlesVerifiedReason},
+		Reasons: []string{"season pack"},
 	}
 	if _, err := store.Save("tmdb-tv:3:s1", "Original Show", 2020, selected, torrentContents); err != nil {
 		t.Fatal(err)
@@ -856,7 +856,7 @@ func TestShowPrewarmCachesReleaseSearchWithoutCreatingPlayback(t *testing.T) {
 	}
 	lookupContext, lookupCancel := context.WithTimeout(t.Context(), time.Second)
 	defer lookupCancel()
-	ranked, found := server.cachedShowReleases(lookupContext, request)
+	ranked, found := server.cachedReleaseSearch(lookupContext, request)
 	if !found || len(ranked) != 1 || !catalog.IsSeasonPack(ranked[0].Candidate.Name, 1) {
 		t.Fatalf("ranked = %+v, found = %v", ranked, found)
 	}
@@ -1907,21 +1907,13 @@ func TestUsenetCandidateFailuresAreTemporarilySkipped(t *testing.T) {
 	}
 }
 
-func TestRankedPlaybackStopsAfterHighestRankedHealthySubtitleRelease(t *testing.T) {
-	server, engine := newRankedPlaybackTestServer(t,
-		map[string]torrentstream.Status{
-			"playback-1": {ActivePeers: minimumLivePeers},
-			"playback-2": {ActivePeers: strongLiveSwarmPeers},
-		},
-		map[string][]hls.SubtitleTrack{
-			"playback-1": {{Index: 3, Language: "en"}},
-			"playback-2": {{Index: 4, Language: "en"}},
-		},
-	)
+func TestRankedPlaybackSelectsTopMetadataCandidateWithoutLiveWait(t *testing.T) {
+	var logs bytes.Buffer
+	server, engine := newRankedPlaybackTestServer(t, &logs)
 
+	started := time.Now()
 	session, selected, err := server.createRankedPlayback(
 		t.Context(), rankedTorrentCandidates(3),
-		catalog.Preferences{StreamingOptimized: true, PreferTextSubtitles: true},
 		"tmdb-tv:1:s1:e1", "S01E01",
 	)
 	if err != nil {
@@ -1930,123 +1922,42 @@ func TestRankedPlaybackStopsAfterHighestRankedHealthySubtitleRelease(t *testing.
 	if session.ID != "playback-1" || selected.Candidate.ID != "release-1" {
 		t.Fatalf("session = %+v, selected = %+v", session, selected)
 	}
-	if len(engine.created) != 1 {
-		t.Fatalf("mounted torrents = %d, want 1", len(engine.created))
+	if len(engine.created) != 1 || len(engine.dropped) != 0 {
+		t.Fatalf("created = %d, dropped = %v; selection should mount only the winner", len(engine.created), engine.dropped)
 	}
-	if !hasRankingReason(*selected, subtitlesVerifiedReason) {
-		t.Fatalf("selection reasons = %v", selected.Reasons)
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("metadata-ranked selection waited for swarm health: %s", elapsed)
+	}
+	if output := logs.String(); !strings.Contains(output, "release selection stages") ||
+		!strings.Contains(output, "live_swarm_validation_duration=0s") ||
+		!strings.Contains(output, "subtitle_probe_duration=0s") {
+		t.Fatalf("selection timing log = %q", output)
 	}
 }
 
-func TestRankedPlaybackProgressesPastDeadSwarmWithoutUsingFullWait(t *testing.T) {
-	server, engine := newRankedPlaybackTestServer(t,
-		map[string]torrentstream.Status{
-			"playback-1": {},
-			"playback-2": {ActivePeers: minimumLivePeers},
-		},
-		map[string][]hls.SubtitleTrack{
-			"playback-2": {{Index: 3, Language: "en"}},
-		},
-	)
-	server.selectionTiming = playbackSelectionTiming{
-		progressiveWait: 30 * time.Millisecond,
-		liveSwarmWait:   2 * time.Second,
-		statusPoll:      time.Millisecond,
-	}
+func TestRankedPlaybackSkipsQuarantinedCandidateWithoutAnotherHealthWait(t *testing.T) {
+	server, engine := newRankedPlaybackTestServer(t, io.Discard)
+	candidates := rankedTorrentCandidates(3)
+	server.markTorrentCandidateFailed("tmdb-tv:1:s1:e1", candidates[0].Candidate)
 
-	started := time.Now()
 	session, selected, err := server.createRankedPlayback(
-		t.Context(), rankedTorrentCandidates(3),
-		catalog.Preferences{StreamingOptimized: true, PreferTextSubtitles: true},
+		t.Context(), candidates,
 		"tmdb-tv:1:s1:e1", "S01E01",
 	)
-	elapsed := time.Since(started)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if session.ID != "playback-2" || selected.Candidate.ID != "release-2" {
+	if session.ID != "playback-1" || selected.Candidate.ID != "release-2" {
 		t.Fatalf("session = %+v, selected = %+v", session, selected)
 	}
-	if len(engine.created) != 2 {
-		t.Fatalf("mounted torrents = %d, want 2", len(engine.created))
-	}
-	if !slices.Equal(engine.dropped, []string{"playback-1"}) {
-		t.Fatalf("dropped torrents = %v", engine.dropped)
-	}
-	if elapsed >= time.Second {
-		t.Fatalf("selection took %v; it consumed the two-second fallback wait", elapsed)
-	}
-}
-
-func TestRankedPlaybackSubtitleFallbacks(t *testing.T) {
-	tests := []struct {
-		name       string
-		statuses   map[string]torrentstream.Status
-		tracks     map[string][]hls.SubtitleTrack
-		candidates int
-		wantID     string
-		wantMounts int
-	}{
-		{
-			name: "subtitle-less options use strongest live swarm",
-			statuses: map[string]torrentstream.Status{
-				"playback-1": {ActivePeers: 5},
-				"playback-2": {ActivePeers: strongLiveSwarmPeers},
-				"playback-3": {},
-			},
-			candidates: 3, wantID: "release-2", wantMounts: 3,
-		},
-		{
-			name: "scarce weak options use best available swarm",
-			statuses: map[string]torrentstream.Status{
-				"playback-1": {ActivePeers: 1},
-				"playback-2": {ActivePeers: 2},
-			},
-			candidates: 2, wantID: "release-2", wantMounts: 2,
-		},
-		{
-			name: "later subtitle release survives dead and subtitle-less options",
-			statuses: map[string]torrentstream.Status{
-				"playback-1": {},
-				"playback-2": {ActivePeers: 5},
-				"playback-3": {ActivePeers: minimumLivePeers},
-			},
-			tracks: map[string][]hls.SubtitleTrack{
-				"playback-3": {{Index: 3, Language: "en"}},
-			},
-			candidates: 3, wantID: "release-3", wantMounts: 3,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			server, engine := newRankedPlaybackTestServer(t, test.statuses, test.tracks)
-			session, selected, err := server.createRankedPlayback(
-				t.Context(), rankedTorrentCandidates(test.candidates),
-				catalog.Preferences{StreamingOptimized: true, PreferTextSubtitles: true},
-				"tmdb-tv:1:s1:e1", "S01E01",
-			)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if session.ID != strings.Replace(test.wantID, "release", "playback", 1) ||
-				selected.Candidate.ID != test.wantID {
-				t.Fatalf("session = %+v, selected = %+v", session, selected)
-			}
-			if len(engine.created) != test.wantMounts {
-				t.Fatalf("mounted torrents = %d, want %d", len(engine.created), test.wantMounts)
-			}
-			if test.tracks == nil && !hasRankingReason(*selected, subtitleFallbackReason) {
-				t.Fatalf("selection reasons = %v", selected.Reasons)
-			}
-		})
+	if len(engine.created) != 1 {
+		t.Fatalf("mounted torrents = %d, want only the next ranked candidate", len(engine.created))
 	}
 }
 
 func newRankedPlaybackTestServer(
 	t *testing.T,
-	statuses map[string]torrentstream.Status,
-	tracks map[string][]hls.SubtitleTrack,
+	logOutput io.Writer,
 ) (*Server, *fakeTorrentPlaybackEngine) {
 	t.Helper()
 	registry, err := indexer.NewRegistry([]config.Indexer{{
@@ -2055,19 +1966,11 @@ func newRankedPlaybackTestServer(
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine := &fakeTorrentPlaybackEngine{statuses: statuses}
+	engine := &fakeTorrentPlaybackEngine{}
 	server := &Server{
 		indexers: registry,
 		engine:   engine,
-		hlsManager: &fakeHLSManager{
-			subtitleTracks: tracks,
-		},
-		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		selectionTiming: playbackSelectionTiming{
-			progressiveWait: 5 * time.Millisecond,
-			liveSwarmWait:   40 * time.Millisecond,
-			statusPoll:      time.Millisecond,
-		},
+		logger:   slog.New(slog.NewTextHandler(logOutput, nil)),
 	}
 	return server, engine
 }
@@ -2084,7 +1987,7 @@ func rankedTorrentCandidates(count int) []catalog.RankedCandidate {
 	return candidates
 }
 
-func TestUnavailableTorrentRecoveryRefreshesAndStopsAfterTwoCandidates(t *testing.T) {
+func TestUnavailableTorrentRecoveryReusesRankingAndStopsAfterTwoCandidates(t *testing.T) {
 	var searches atomic.Int32
 	var indexerServer *httptest.Server
 	indexerServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2114,6 +2017,12 @@ func TestUnavailableTorrentRecoveryRefreshesAndStopsAfterTwoCandidates(t *testin
 		ID: "release-bad", Indexer: "torrent",
 		Name: "The.Show.S01.Complete.1080p.WEB.H264-BAD", Protocol: catalog.ProtocolTorrent,
 		Resolution: "1080p", Codec: "h264", SizeBytes: 1_000_000,
+	}, Reasons: []string{"season pack"}}
+	healthy := catalog.RankedCandidate{Candidate: catalog.Candidate{
+		ID: "release-healthy", Indexer: "torrent",
+		Name: "The.Show.S01.Complete.1080p.WEB.H264-HEALTHY", Protocol: catalog.ProtocolTorrent,
+		Resolution: "1080p", Codec: "h264", SizeBytes: 1_000_000,
+		MagnetURI: "magnet:?xt=urn:btih:0000000000000000000000000000000000000002",
 	}, Reasons: []string{"season pack"}}
 	store := playbackcache.New(t.TempDir())
 	if _, err := store.Save("tmdb-tv:3:s1", "The Show", 2020, bad, []byte("metainfo")); err != nil {
@@ -2152,8 +2061,8 @@ func TestUnavailableTorrentRecoveryRefreshesAndStopsAfterTwoCandidates(t *testin
 	}
 	ready := make(chan struct{})
 	close(ready)
-	server.releaseSearches[showReleaseSearchKey(request)] = &releaseSearchState{
-		ready: ready, ranked: []catalog.RankedCandidate{bad}, expiresAt: time.Now().Add(time.Minute),
+	server.releaseSearches[releaseSearchKey(request)] = &releaseSearchState{
+		ready: ready, ranked: []catalog.RankedCandidate{bad, healthy}, expiresAt: time.Now().Add(time.Minute),
 	}
 
 	create := func() (*CreatePlaybackResponse, *httptest.ResponseRecorder) {
@@ -2188,16 +2097,16 @@ func TestUnavailableTorrentRecoveryRefreshesAndStopsAfterTwoCandidates(t *testin
 	if _, found, err := store.Lookup("tmdb-tv:3:s1", "The Show", 2020); err != nil || found {
 		t.Fatalf("unavailable cached release found = %v, error = %v", found, err)
 	}
-	if _, found := server.releaseSearches[showReleaseSearchKey(request)]; found {
-		t.Fatal("stale prefetched release search survived source failure")
+	if _, found := server.releaseSearches[releaseSearchKey(request)]; !found {
+		t.Fatal("prefetched ranking was discarded instead of retaining the next candidate")
 	}
 
 	second, response := create()
 	if second == nil || second.ID != "playback-2" || second.Selected == nil || second.Selected.Candidate.ID != "release-healthy" {
 		t.Fatalf("replacement playback = %+v, status = %d, body = %s", second, response.Code, response.Body.String())
 	}
-	if searches.Load() != 1 {
-		t.Fatalf("fresh release searches = %d, want 1", searches.Load())
+	if searches.Load() != 0 {
+		t.Fatalf("retry repeated the external release search %d times", searches.Load())
 	}
 	if response := failHLS(second.ID); response.Code != http.StatusBadGateway {
 		t.Fatalf("second HLS status = %d, body = %s", response.Code, response.Body.String())
@@ -2208,8 +2117,56 @@ func TestUnavailableTorrentRecoveryRefreshesAndStopsAfterTwoCandidates(t *testin
 		!strings.Contains(response.Body.String(), "unavailable after 2 release attempts") {
 		t.Fatalf("terminal playback = %+v, status = %d, body = %s", third, response.Code, response.Body.String())
 	}
-	if searches.Load() != 1 || len(engine.created) != 2 {
+	if searches.Load() != 0 || len(engine.created) != 2 {
 		t.Fatalf("terminal retry searched %d times and mounted %d candidates", searches.Load(), len(engine.created))
+	}
+}
+
+func TestUnavailableTorrentInvalidationIsLoggedOnceAcrossCompetingCallbacks(t *testing.T) {
+	var logs bytes.Buffer
+	candidate := catalog.RankedCandidate{Candidate: catalog.Candidate{
+		ID: "release-1", Indexer: "torrentleech", Name: "Movie.1080p",
+		Protocol: catalog.ProtocolTorrent,
+	}}
+	engine := &fakeTorrentPlaybackEngine{statuses: map[string]torrentstream.Status{
+		"playback-1": {TotalPeers: 71, PendingPeers: 71},
+	}}
+	server := &Server{
+		engine: engine,
+		logger: slog.New(slog.NewTextHandler(&logs, nil)),
+		selected: map[string]catalog.RankedCandidate{
+			"playback-1": candidate,
+		},
+		playbackCacheKeys: map[string]playbackCacheKey{
+			"playback-1": {mediaID: "tmdb:1", title: "Movie", source: catalog.ProtocolTorrent},
+		},
+		playbackRequests: map[string]CreatePlaybackRequest{
+			"playback-1": {MediaID: "tmdb:1"},
+		},
+		torrentFailures: make(map[string]time.Time),
+	}
+	unavailable := fmt.Errorf("%w: no peer could serve", torrentstream.ErrSourceUnavailable)
+	start := make(chan struct{})
+	var callbacks sync.WaitGroup
+	callbacks.Add(2)
+	for range 2 {
+		go func() {
+			defer callbacks.Done()
+			<-start
+			server.invalidateCachedPlayback("playback-1", unavailable)
+		}()
+	}
+	close(start)
+	callbacks.Wait()
+
+	if count := strings.Count(logs.String(), "rejected unavailable torrent playback candidate"); count != 1 {
+		t.Fatalf("rejection log count = %d, logs = %q", count, logs.String())
+	}
+	if !server.torrentCandidateRecentlyFailed("tmdb:1", candidate.Candidate) {
+		t.Fatal("failed release was not quarantined")
+	}
+	if _, ok := server.playbackCacheKeys["playback-1"]; !ok {
+		t.Fatal("deduplication discarded playback metadata needed by a later successful retry")
 	}
 }
 

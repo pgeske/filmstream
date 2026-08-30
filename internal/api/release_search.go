@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -24,7 +23,7 @@ type releaseSearchState struct {
 }
 
 func (s *Server) queueShowReleaseSearch(request CreatePlaybackRequest) {
-	key := showReleaseSearchKey(request)
+	key := releaseSearchKey(request)
 	if key == "" {
 		return
 	}
@@ -50,6 +49,7 @@ func (s *Server) queueShowReleaseSearch(request CreatePlaybackRequest) {
 	s.releaseSearchMu.Unlock()
 
 	go func() {
+		started := time.Now()
 		searchContext, cancel := context.WithTimeout(ctx, releaseSearchTimeout)
 		defer cancel()
 		ranked, err := s.searchShowReleases(searchContext, request)
@@ -62,17 +62,20 @@ func (s *Server) queueShowReleaseSearch(request CreatePlaybackRequest) {
 			close(state.ready)
 		}
 		s.releaseSearchMu.Unlock()
+		s.logger.Info("prefetched release search stages", "media_id", request.MediaID,
+			"candidates", len(ranked), "cache_ttl", releaseSearchTTL,
+			"total_duration", time.Since(started), "error", err)
 		if err != nil && searchContext.Err() == nil {
 			s.logger.Warn("prewarm TV release search", "media_id", request.MediaID, "error", err)
 		}
 	}()
 }
 
-func (s *Server) cachedShowReleases(
+func (s *Server) cachedReleaseSearch(
 	ctx context.Context,
 	request CreatePlaybackRequest,
 ) ([]catalog.RankedCandidate, bool) {
-	key := showReleaseSearchKey(request)
+	key := releaseSearchKey(request)
 	if key == "" {
 		return nil, false
 	}
@@ -98,33 +101,6 @@ func (s *Server) cachedShowReleases(
 		return nil, false
 	}
 	return append([]catalog.RankedCandidate(nil), state.ranked...), true
-}
-
-// invalidateShowReleaseSearch prevents a retry from replaying the same stale
-// prefetched ranking after a selected torrent proves unable to serve. The next
-// playback request must ask the indexer for current candidates.
-func (s *Server) invalidateShowReleaseSearch(request CreatePlaybackRequest) bool {
-	key := showReleaseSearchKey(request)
-	if key == "" {
-		return false
-	}
-	s.releaseSearchMu.Lock()
-	state := s.releaseSearches[key]
-	if state == nil {
-		s.releaseSearchMu.Unlock()
-		return false
-	}
-	delete(s.releaseSearches, key)
-	select {
-	case <-state.ready:
-	default:
-		state.err = errors.New("release search invalidated after unavailable playback")
-		close(state.ready)
-	}
-	s.releaseSearchMu.Unlock()
-	s.logger.Info("invalidated prefetched TV release search after unavailable playback",
-		"media_id", request.MediaID)
-	return true
 }
 
 func (s *Server) searchShowReleases(
@@ -165,10 +141,44 @@ func (s *Server) shouldPreferSeasonPack(ctx context.Context, request CreatePlayb
 	return true
 }
 
-func showReleaseSearchKey(request CreatePlaybackRequest) string {
-	seasonID := seasonPlaybackCacheMediaID(request)
-	if seasonID == "" || strings.TrimSpace(request.Query) == "" {
+func (s *Server) cacheReleaseSearch(request CreatePlaybackRequest, ranked []catalog.RankedCandidate) {
+	key := releaseSearchKey(request)
+	if key == "" {
+		return
+	}
+	ready := make(chan struct{})
+	close(ready)
+	state := &releaseSearchState{
+		ready: ready, ranked: append([]catalog.RankedCandidate(nil), ranked...),
+		expiresAt: time.Now().Add(releaseSearchTTL),
+	}
+	s.releaseSearchMu.Lock()
+	if s.releaseSearches == nil {
+		s.releaseSearches = make(map[string]*releaseSearchState)
+	}
+	if existing := s.releaseSearches[key]; existing == nil || !existing.expiresAt.IsZero() {
+		s.releaseSearches[key] = state
+	}
+	s.releaseSearchMu.Unlock()
+}
+
+// releaseSearchKey includes every request field that affects torrent ranking.
+// Movie prewarms and show browsing can then retain the ranked candidates for a
+// fast retry without sharing an episode-specific result with another request.
+func releaseSearchKey(request CreatePlaybackRequest) string {
+	query := strings.ToLower(strings.TrimSpace(request.Query))
+	if query == "" {
 		return ""
 	}
-	return fmt.Sprintf("%s/%s/%s", seasonID, strings.ToLower(strings.TrimSpace(request.Query)), strings.ToLower(request.Preferences.Resolution))
+	mediaID := strings.ToLower(strings.TrimSpace(request.MediaID))
+	if mediaID == "" {
+		mediaID = fmt.Sprintf("%s:%d", query, request.Year)
+	}
+	preferences := request.Preferences
+	return fmt.Sprintf("%s/%s/%s/%d/%d/%s/%s/%s/%d/%t",
+		strings.ToLower(strings.TrimSpace(request.MediaType)), mediaID, query,
+		request.SeasonNumber, request.EpisodeNumber,
+		strings.ToLower(preferences.Resolution), strings.Join(preferences.Codecs, ","),
+		strings.Join(preferences.Languages, ","), preferences.MaxSizeBytes,
+		preferences.StreamingOptimized)
 }
