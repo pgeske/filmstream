@@ -41,6 +41,7 @@ type Config struct {
 	Logger                *slog.Logger
 	BitmapSubtitleEncoder string
 	LocalSourcePath       func(string) (string, bool)
+	SourceUnavailable     func(string) error
 }
 
 type Stream struct {
@@ -77,6 +78,7 @@ type Manager struct {
 	logger                *slog.Logger
 	bitmapSubtitleEncoder string
 	localSourcePath       func(string) (string, bool)
+	sourceUnavailable     func(string) error
 
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -231,6 +233,7 @@ func New(cfg Config) (*Manager, error) {
 		logger:                cfg.Logger,
 		bitmapSubtitleEncoder: cfg.BitmapSubtitleEncoder,
 		localSourcePath:       cfg.LocalSourcePath,
+		sourceUnavailable:     cfg.SourceUnavailable,
 		ctx:                   ctx,
 		cancel:                cancel,
 		streams:               make(map[string]*runningStream),
@@ -268,7 +271,7 @@ func (m *Manager) ProbeSubtitles(ctx context.Context, playbackID string) ([]Subt
 	probeSource, _ := m.sourceForProbe(playbackID, sourceURL)
 	probe, err := m.probePlayback(ctx, playbackID, probeSource)
 	if err != nil {
-		return nil, err
+		return nil, m.preferSourceUnavailable(playbackID, err)
 	}
 	return supportedSubtitles(probe), nil
 }
@@ -297,8 +300,10 @@ func (m *Manager) Start(
 	}
 	unlockStart := m.lockPlaybackStart(playbackID)
 	defer unlockStart()
+	startupContext, startupCancel := context.WithTimeout(ctx, m.startupTimeout)
+	defer startupCancel()
 	if stream, matched, err := m.resumePreparedStream(
-		ctx, playbackID, startSeconds, preferredLanguages, bitmapSubtitleIndex,
+		startupContext, playbackID, startSeconds, preferredLanguages, bitmapSubtitleIndex,
 	); matched {
 		return stream, err
 	}
@@ -311,9 +316,9 @@ func (m *Manager) Start(
 
 	sourceURL := m.sourceBaseURL + "/v1/playbacks/" + playbackID + "/stream"
 	probeSource, probeIsLocal := m.sourceForProbe(playbackID, sourceURL)
-	probe, err := m.probePlayback(ctx, playbackID, probeSource)
+	probe, err := m.probePlayback(startupContext, playbackID, probeSource)
 	if err != nil {
-		return Stream{}, err
+		return Stream{}, m.preferSourceUnavailable(playbackID, err)
 	}
 	codec, duration, err := compatibleVideo(probe)
 	if err != nil {
@@ -332,7 +337,7 @@ func (m *Manager) Start(
 	timelineStart := startSeconds
 	retryKeyframeProbe := false
 	if startSeconds > 0 {
-		if keyframeStart, err := m.probeTimelineStart(ctx, probeSource, startSeconds); err != nil {
+		if keyframeStart, err := m.probeTimelineStart(startupContext, probeSource, startSeconds); err != nil {
 			var transient *transientTimelineProbeError
 			if probeIsLocal || !errors.As(err, &transient) {
 				return Stream{}, fmt.Errorf("probe HLS keyframe start: %w", err)
@@ -356,7 +361,8 @@ func (m *Manager) Start(
 		return Stream{}, fmt.Errorf("create FFmpeg log: %w", err)
 	}
 
-	streamContext, cancel := context.WithCancel(m.ctx)
+	streamContext, cancelSource := m.monitorSource(m.ctx, playbackID)
+	cancel := func() { cancelSource(context.Canceled) }
 	args := m.ffmpegArgs(sourceURL, dir, codec, timelineStart, audioIndex, bitmapSubtitleIndex)
 	command := exec.CommandContext(streamContext, m.ffmpegPath, args...)
 	command.Stdout = logFile
@@ -403,11 +409,9 @@ func (m *Manager) Start(
 		}
 	}()
 
-	startupContext, startupCancel := context.WithTimeout(ctx, m.startupTimeout)
-	defer startupCancel()
 	if err := m.waitUntilReady(startupContext, stream); err != nil {
 		m.Stop(playbackID)
-		return Stream{}, err
+		return Stream{}, m.preferSourceUnavailable(playbackID, err)
 	}
 	if retryKeyframeProbe {
 		// The packager has now read through the cold source region. Re-probe once
@@ -416,6 +420,7 @@ func (m *Manager) Start(
 		// desync the client timeline and WebVTT sidecar from stream-copied video.
 		keyframeStart, err := m.probeTimelineStart(startupContext, sourceURL, startSeconds)
 		if err != nil {
+			err = m.preferSourceUnavailable(playbackID, err)
 			m.logger.Warn("reprobe HLS keyframe start", "playback_id", playbackID, "error", err)
 			m.Stop(playbackID)
 			return Stream{}, fmt.Errorf("reprobe HLS keyframe start: %w", err)
@@ -835,7 +840,8 @@ func (m *Manager) probePlayback(
 	}
 	cached := m.probes[playbackID]
 	if cached == nil {
-		probeContext, cancel := context.WithCancel(m.ctx)
+		probeContext, cancelSource := m.monitorSource(m.ctx, playbackID)
+		cancel := func() { cancelSource(context.Canceled) }
 		cached = &playbackProbe{done: make(chan struct{}), cancel: cancel}
 		m.probes[playbackID] = cached
 		m.probeWG.Add(1)
@@ -845,9 +851,9 @@ func (m *Manager) probePlayback(
 
 	select {
 	case <-parent.Done():
-		return mediaProbe{}, parent.Err()
+		return mediaProbe{}, context.Cause(parent)
 	case <-cached.done:
-		return cached.probe, cached.err
+		return cached.probe, m.preferSourceUnavailable(playbackID, cached.err)
 	}
 }
 
@@ -859,6 +865,9 @@ func (m *Manager) runPlaybackProbe(
 ) {
 	defer m.probeWG.Done()
 	probe, err := m.probe(ctx, sourceURL)
+	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
+		err = cause
+	}
 
 	m.probeMu.Lock()
 	if m.probes[playbackID] != cached {
@@ -901,6 +910,46 @@ func (m *Manager) closeProbes() {
 	m.probeWG.Wait()
 }
 
+// monitorSource cancels a probe or packager when the torrent engine exhausts
+// the playback's shared serve-readiness deadline. This prevents a child
+// FFprobe or FFmpeg process from continuing to retry source requests until the
+// much longer generic HLS startup timeout.
+func (m *Manager) monitorSource(parent context.Context, playbackID string) (context.Context, context.CancelCauseFunc) {
+	ctx, cancel := context.WithCancelCause(parent)
+	if m.sourceUnavailable == nil {
+		return ctx, cancel
+	}
+	if err := m.sourceUnavailable(playbackID); err != nil {
+		cancel(err)
+		return ctx, cancel
+	}
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := m.sourceUnavailable(playbackID); err != nil {
+					cancel(err)
+					return
+				}
+			}
+		}
+	}()
+	return ctx, cancel
+}
+
+func (m *Manager) preferSourceUnavailable(playbackID string, fallback error) error {
+	if m.sourceUnavailable != nil {
+		if err := m.sourceUnavailable(playbackID); err != nil {
+			return err
+		}
+	}
+	return fallback
+}
+
 func (m *Manager) probe(parent context.Context, sourceURL string) (mediaProbe, error) {
 	ctx, cancel := context.WithTimeout(parent, m.startupTimeout)
 	defer cancel()
@@ -912,6 +961,9 @@ func (m *Manager) probe(parent context.Context, sourceURL string) (mediaProbe, e
 	)
 	output, err := command.Output()
 	if err != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			return mediaProbe{}, fmt.Errorf("probe playback media: %w", cause)
+		}
 		return mediaProbe{}, fmt.Errorf("probe playback media: %w", err)
 	}
 	var probe mediaProbe
@@ -937,6 +989,9 @@ func (m *Manager) probeTimelineStart(parent context.Context, source string, requ
 	)
 	output, err := command.Output()
 	if err != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			return requested, fmt.Errorf("probe video keyframes: %w", cause)
+		}
 		return requested, &transientTimelineProbeError{
 			err: fmt.Errorf("probe video keyframes: %w", err),
 		}
@@ -1244,7 +1299,7 @@ func (m *Manager) waitUntilReady(ctx context.Context, stream *runningStream) err
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("wait for HLS startup buffer: %w", ctx.Err())
+			return fmt.Errorf("wait for HLS startup buffer: %w", context.Cause(ctx))
 		case <-stream.done:
 			if playlistReady(stream.dir, m.bufferSeconds) {
 				return nil
@@ -1278,7 +1333,7 @@ func (m *Manager) waitUntilBuffered(ctx context.Context, stream *runningStream, 
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("wait for HLS prewarm buffer: %w", ctx.Err())
+			return fmt.Errorf("wait for HLS prewarm buffer: %w", context.Cause(ctx))
 		case <-stream.done:
 			if playlistReady(stream.dir, minimumSeconds) {
 				return nil

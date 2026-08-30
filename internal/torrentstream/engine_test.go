@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -355,7 +356,11 @@ func TestEngineFailsFastWhenSwarmCannotServeReads(t *testing.T) {
 	if err := os.Remove(videoPath); err != nil {
 		t.Fatal(err)
 	}
-	engine := newTestEngine(t, dataDir, Config{ServeReadinessWait: 200 * time.Millisecond})
+	var logs bytes.Buffer
+	engine := newTestEngine(t, dataDir, Config{
+		ServeReadinessWait: 200 * time.Millisecond,
+		Logger:             slog.New(slog.NewTextHandler(&logs, nil)),
+	})
 	defer engine.Close()
 	session, err := engine.Create(t.Context(), Source{TorrentPath: torrentPath})
 	if err != nil {
@@ -374,8 +379,30 @@ func TestEngineFailsFastWhenSwarmCannotServeReads(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 5*time.Second {
 		t.Fatalf("failure took %s; it should be bounded well below client timeouts", elapsed)
 	}
-	if !strings.Contains(err.Error(), "no peers connected") {
-		t.Fatalf("error = %v, want a clear no-peers failure", err)
+	if !errors.Is(err, ErrSourceUnavailable) || !strings.Contains(err.Error(), "no peers connected") {
+		t.Fatalf("error = %v, want a typed, clear no-peers failure", err)
+	}
+	status, ok := engine.Status(session.ID)
+	if !ok || !status.SourceUnavailable || status.ServeDeadline == nil || status.CachedPercent != 0 {
+		t.Fatalf("source status = %+v, found = %v", status, ok)
+	}
+
+	// FFprobe and FFmpeg issue multiple range requests. Once the first request
+	// spends the shared budget, later startup reads must fail immediately rather
+	// than receiving another complete readiness window.
+	secondStarted := time.Now()
+	secondErr := engine.ServeHTTP(
+		httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/stream", nil), session.ID,
+	)
+	if !errors.Is(secondErr, ErrSourceUnavailable) {
+		t.Fatalf("second source read error = %v", secondErr)
+	}
+	if elapsed := time.Since(secondStarted); elapsed > 100*time.Millisecond {
+		t.Fatalf("second source read took %s after the shared deadline", elapsed)
+	}
+	if output := logs.String(); !strings.Contains(output, "no_peers_returned_or_retained") ||
+		!strings.Contains(output, "tracker_outcome=inferred_from_peer_counters") {
+		t.Fatalf("unavailable-swarm log lacks announce visibility: %s", output)
 	}
 }
 
@@ -554,5 +581,6 @@ func testConfig(dataDir string, overrides Config) Config {
 	if overrides.ServeReadinessWait != 0 {
 		cfg.ServeReadinessWait = overrides.ServeReadinessWait
 	}
+	cfg.Logger = overrides.Logger
 	return cfg
 }

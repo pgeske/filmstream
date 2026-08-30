@@ -476,6 +476,73 @@ while :; do sleep 1; done
 	}
 }
 
+func TestManagerBoundsProbeAndPackagerWithSourceReadinessFailure(t *testing.T) {
+	errUnavailable := errors.New("torrent source readiness budget exhausted")
+
+	t.Run("subtitle probe", func(t *testing.T) {
+		ffprobe := writeExecutable(t, "ffprobe", "#!/bin/sh\nexec sleep 10\n")
+		ffmpeg := writeExecutable(t, "ffmpeg", "#!/bin/sh\nexit 1\n")
+		deadline := time.Now().Add(150 * time.Millisecond)
+		manager, err := New(Config{
+			DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+			SourceBaseURL: "http://127.0.0.1:8943", StartupTimeout: 5 * time.Second,
+			SourceUnavailable: func(string) error {
+				if time.Now().After(deadline) {
+					return errUnavailable
+				}
+				return nil
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer manager.Close()
+
+		started := time.Now()
+		_, err = manager.ProbeSubtitles(t.Context(), "playback-1")
+		if !errors.Is(err, errUnavailable) {
+			t.Fatalf("subtitle probe error = %v", err)
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("subtitle probe ignored source deadline for %s", elapsed)
+		}
+	})
+
+	t.Run("packager first read", func(t *testing.T) {
+		ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
+cat <<'JSON'
+{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]}],"format":{"duration":"7200"}}
+JSON
+`)
+		ffmpeg := writeExecutable(t, "ffmpeg", "#!/bin/sh\nexec sleep 10\n")
+		deadline := time.Now().Add(150 * time.Millisecond)
+		manager, err := New(Config{
+			DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+			SourceBaseURL: "http://127.0.0.1:8943", StartupTimeout: 5 * time.Second,
+			BufferSeconds: 4,
+			SourceUnavailable: func(string) error {
+				if time.Now().After(deadline) {
+					return errUnavailable
+				}
+				return nil
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer manager.Close()
+
+		started := time.Now()
+		_, err = manager.Start(t.Context(), "playback-1", 0, nil, -1)
+		if !errors.Is(err, errUnavailable) {
+			t.Fatalf("packager start error = %v", err)
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("packager ignored source deadline for %s", elapsed)
+		}
+	})
+}
+
 func TestManagerProbesTextAndBitmapSubtitlesWithoutStartingPlayback(t *testing.T) {
 	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
 cat <<'JSON'

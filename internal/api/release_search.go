@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -97,6 +98,33 @@ func (s *Server) cachedShowReleases(
 		return nil, false
 	}
 	return append([]catalog.RankedCandidate(nil), state.ranked...), true
+}
+
+// invalidateShowReleaseSearch prevents a retry from replaying the same stale
+// prefetched ranking after a selected torrent proves unable to serve. The next
+// playback request must ask the indexer for current candidates.
+func (s *Server) invalidateShowReleaseSearch(request CreatePlaybackRequest) bool {
+	key := showReleaseSearchKey(request)
+	if key == "" {
+		return false
+	}
+	s.releaseSearchMu.Lock()
+	state := s.releaseSearches[key]
+	if state == nil {
+		s.releaseSearchMu.Unlock()
+		return false
+	}
+	delete(s.releaseSearches, key)
+	select {
+	case <-state.ready:
+	default:
+		state.err = errors.New("release search invalidated after unavailable playback")
+		close(state.ready)
+	}
+	s.releaseSearchMu.Unlock()
+	s.logger.Info("invalidated prefetched TV release search after unavailable playback",
+		"media_id", request.MediaID)
+	return true
 }
 
 func (s *Server) searchShowReleases(

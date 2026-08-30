@@ -95,6 +95,7 @@ type Engine struct {
 
 	lifecycleMu sync.Mutex
 	mu          sync.RWMutex
+	serveMu     sync.Mutex
 	sessions    map[string]*Session
 	managed     map[*torrent.Torrent]*managedTorrent
 	onCleanup   func(string, string)
@@ -117,30 +118,41 @@ type Session struct {
 	activeStreams int
 	started       bool
 	lastActivity  time.Time
+
+	serveDeadline    time.Time
+	serveUnavailable error
 }
 
+// ErrSourceUnavailable identifies a torrent that exhausted its one startup
+// readiness budget without local coverage or a peer that could serve it.
+var ErrSourceUnavailable = errors.New("playback source unavailable")
+
 type Status struct {
-	ID               string     `json:"id"`
-	Name             string     `json:"name"`
-	FileName         string     `json:"file_name"`
-	FileSize         int64      `json:"file_size"`
-	State            string     `json:"state"`
-	ActiveStreams    int        `json:"active_streams"`
-	LastActivity     time.Time  `json:"last_activity"`
-	SeedDeadline     *time.Time `json:"seed_deadline,omitempty"`
-	BytesComplete    int64      `json:"bytes_complete"`
-	TorrentBytes     int64      `json:"torrent_bytes"`
-	TorrentComplete  int64      `json:"torrent_complete"`
-	DownloadedBytes  int64      `json:"downloaded_bytes"`
-	UploadedBytes    int64      `json:"uploaded_bytes"`
-	Ratio            float64    `json:"ratio"`
-	RatioTarget      float64    `json:"ratio_target"`
-	RatioTargetMet   bool       `json:"ratio_target_met"`
-	TotalPeers       int        `json:"total_peers"`
-	PendingPeers     int        `json:"pending_peers"`
-	ActivePeers      int        `json:"active_peers"`
-	ConnectedSeeders int        `json:"connected_seeders"`
-	HalfOpenPeers    int        `json:"half_open_peers"`
+	ID                string     `json:"id"`
+	Name              string     `json:"name"`
+	FileName          string     `json:"file_name"`
+	FileSize          int64      `json:"file_size"`
+	State             string     `json:"state"`
+	ActiveStreams     int        `json:"active_streams"`
+	LastActivity      time.Time  `json:"last_activity"`
+	SeedDeadline      *time.Time `json:"seed_deadline,omitempty"`
+	BytesComplete     int64      `json:"bytes_complete"`
+	TorrentBytes      int64      `json:"torrent_bytes"`
+	TorrentComplete   int64      `json:"torrent_complete"`
+	DownloadedBytes   int64      `json:"downloaded_bytes"`
+	UploadedBytes     int64      `json:"uploaded_bytes"`
+	Ratio             float64    `json:"ratio"`
+	RatioTarget       float64    `json:"ratio_target"`
+	RatioTargetMet    bool       `json:"ratio_target_met"`
+	TotalPeers        int        `json:"total_peers"`
+	PendingPeers      int        `json:"pending_peers"`
+	ActivePeers       int        `json:"active_peers"`
+	ConnectedSeeders  int        `json:"connected_seeders"`
+	HalfOpenPeers     int        `json:"half_open_peers"`
+	InfoHash          string     `json:"info_hash,omitempty"`
+	CachedPercent     int        `json:"cached_percent"`
+	SourceUnavailable bool       `json:"source_unavailable,omitempty"`
+	ServeDeadline     *time.Time `json:"serve_deadline,omitempty"`
 }
 
 func New(cfg Config) (*Engine, error) {
@@ -492,7 +504,9 @@ func (e *Engine) Drop(id string) error {
 			e.mu.Unlock()
 			return err
 		}
+		e.serveMu.Lock()
 		retained := *session
+		e.serveMu.Unlock()
 		retained.ID = retainedID
 		retained.activeStreams = 0
 		retained.started = true
@@ -567,7 +581,31 @@ func (e *Engine) Status(id string) (Status, bool) {
 	status.ActivePeers = stats.ActivePeers
 	status.ConnectedSeeders = stats.ConnectedSeeders
 	status.HalfOpenPeers = stats.HalfOpenPeers
+	status.InfoHash = t.InfoHash().HexString()
+	status.CachedPercent = localCoveragePercent(session)
+	e.serveMu.Lock()
+	status.SourceUnavailable = session.serveUnavailable != nil
+	if !session.serveDeadline.IsZero() {
+		deadline := session.serveDeadline
+		status.ServeDeadline = &deadline
+	}
+	e.serveMu.Unlock()
 	return status, true
+}
+
+// SourceUnavailable returns the bounded readiness failure for a playback. HLS
+// uses this to stop probes and packagers as soon as the source HTTP request has
+// established that a peerless partial torrent cannot serve startup.
+func (e *Engine) SourceUnavailable(id string) error {
+	e.mu.RLock()
+	session, ok := e.sessions[id]
+	e.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	e.serveMu.Lock()
+	defer e.serveMu.Unlock()
+	return session.serveUnavailable
 }
 
 func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request, id string) error {
@@ -634,25 +672,29 @@ func requestReadStart(r *http.Request, size int64) int64 {
 // playback mounted on a dead swarm stalls silently inside the first read until
 // the client's request times out with no log or error anywhere.
 func (e *Engine) ensureServeReadiness(ctx context.Context, session *Session, readStart int64) error {
+	deadline, unavailable := e.serveReadinessState(session)
+	if unavailable != nil {
+		return unavailable
+	}
 	if !e.readBlocked(session, readStart) {
 		return nil
 	}
-	e.verifyFileLocalPieces(ctx, session)
+	readinessContext, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	e.verifyFileLocalPieces(readinessContext, session)
 	if !e.readBlocked(session, readStart) {
 		return nil
 	}
-	deadline := time.Now().Add(e.serveWait)
 	nextLog := time.Now().Add(serviceReadinessLogEvery)
 	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
 		if !e.readBlocked(session, readStart) {
 			return nil
 		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("playback source is not serving: no peers connected within %s and only %d%% of %s is available locally",
-				e.serveWait, localCoveragePercent(session), session.FileName)
+		if err := readinessContext.Err(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return e.markSourceUnavailable(session)
 		}
 		if time.Now().After(nextLog) {
 			stats := session.torrent.Stats()
@@ -660,15 +702,56 @@ func (e *Engine) ensureServeReadiness(ctx context.Context, session *Session, rea
 				"name", session.Name, "file", session.FileName,
 				"connected_peers", stats.ActivePeers, "connected_seeders", stats.ConnectedSeeders,
 				"pending_peers", stats.PendingPeers, "half_open_peers", stats.HalfOpenPeers,
-				"cached_percent", localCoveragePercent(session))
+				"cached_percent", localCoveragePercent(session), "serve_deadline", deadline)
 			nextLog = time.Now().Add(serviceReadinessLogEvery)
 		}
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-readinessContext.Done():
 		case <-time.After(serviceReadinessPoll):
 		}
 	}
+}
+
+// serveReadinessState starts one deadline for the session. FFprobe and FFmpeg
+// make several range requests during startup; giving every request a new wait
+// allowed those requests to chain 15-second stalls for minutes.
+func (e *Engine) serveReadinessState(session *Session) (time.Time, error) {
+	e.serveMu.Lock()
+	defer e.serveMu.Unlock()
+	if session.serveDeadline.IsZero() {
+		session.serveDeadline = time.Now().Add(e.serveWait)
+	}
+	return session.serveDeadline, session.serveUnavailable
+}
+
+func (e *Engine) markSourceUnavailable(session *Session) error {
+	e.serveMu.Lock()
+	if session.serveUnavailable != nil {
+		err := session.serveUnavailable
+		e.serveMu.Unlock()
+		return err
+	}
+	stats := session.torrent.Stats()
+	coverage := localCoveragePercent(session)
+	err := fmt.Errorf("%w: no peers connected before the shared %s startup deadline and only %d%% of %s is available locally",
+		ErrSourceUnavailable, e.serveWait, coverage, session.FileName)
+	session.serveUnavailable = err
+	deadline := session.serveDeadline
+	e.serveMu.Unlock()
+
+	discoveryOutcome := "peers_discovered_but_not_connected"
+	if stats.TotalPeers == 0 && stats.PendingPeers == 0 && stats.HalfOpenPeers == 0 {
+		discoveryOutcome = "no_peers_returned_or_retained"
+	}
+	e.logger.Warn("playback swarm cannot serve source",
+		"name", session.Name, "file", session.FileName,
+		"info_hash", session.torrent.InfoHash().HexString(),
+		"connected_peers", stats.ActivePeers, "connected_seeders", stats.ConnectedSeeders,
+		"total_peers", stats.TotalPeers, "pending_peers", stats.PendingPeers,
+		"half_open_peers", stats.HalfOpenPeers, "cached_percent", coverage,
+		"serve_deadline", deadline, "peer_discovery_outcome", discoveryOutcome,
+		"tracker_outcome", "inferred_from_peer_counters")
+	return err
 }
 
 // readBlocked reports whether a read starting at readStart would have to wait
