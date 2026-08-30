@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -46,6 +47,67 @@ func TestEngineServesRangesWithoutRequestingTheWholeFile(t *testing.T) {
 	}
 	if got, want := response.Body.Bytes(), contents[10:100]; !bytes.Equal(got, want) {
 		t.Fatalf("range body mismatch: got %d bytes, want %d", len(got), len(want))
+	}
+}
+
+func TestEngineColdTorrentStartsDialingWhenSourceReadCreatesDemand(t *testing.T) {
+	seedDataDir := t.TempDir()
+	torrentPath, _, contents := createTestTorrent(t, seedDataDir)
+	meta, err := metainfo.LoadFromFile(torrentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedConfig := torrent.NewDefaultClientConfig()
+	seedConfig.DataDir = filepath.Join(seedDataDir, "torrents")
+	seedConfig.ListenHost = torrent.LoopbackListenHost
+	seedConfig.ListenPort = 0
+	seedConfig.NoDHT = true
+	seedConfig.DisableTrackers = true
+	seedConfig.NoDefaultPortForwarding = true
+	seedConfig.Seed = true
+	seedConfig.Slogger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	seedClient, err := torrent.NewClient(seedConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer seedClient.Close()
+	seedTorrent, err := seedClient.AddTorrent(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seedTorrent.VerifyDataContext(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	engine := newTestEngine(t, t.TempDir(), Config{ServeReadinessWait: 3 * time.Second})
+	defer engine.Close()
+	session, err := engine.Create(t.Context(), Source{TorrentPath: torrentPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	added := session.torrent.AddPeers([]torrent.PeerInfo{{
+		Addr:   &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: seedClient.LocalPort()},
+		Source: torrent.PeerSourceDirect,
+	}})
+	if added != 1 {
+		t.Fatalf("added peers = %d, want 1", added)
+	}
+	before := session.torrent.Stats()
+	if before.PendingPeers != 1 || before.ActivePeers != 0 || before.HalfOpenPeers != 0 {
+		t.Fatalf("cold torrent dialed without piece demand: %+v", before)
+	}
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/stream", nil)
+	if err := engine.ServeHTTP(response, request, session.ID); err != nil {
+		t.Fatalf("serve cold torrent from local peer: %v", err)
+	}
+	if response.Code != http.StatusOK || !bytes.Equal(response.Body.Bytes(), contents) {
+		t.Fatalf("response status = %d, bytes = %d, want %d", response.Code, response.Body.Len(), len(contents))
+	}
+	status, ok := engine.Status(session.ID)
+	if !ok || !status.OutboundDialObserved || status.BytesComplete != int64(len(contents)) {
+		t.Fatalf("source status = %+v, found = %v", status, ok)
 	}
 }
 

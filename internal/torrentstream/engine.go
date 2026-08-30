@@ -119,8 +119,10 @@ type Session struct {
 	started       bool
 	lastActivity  time.Time
 
-	serveDeadline    time.Time
-	serveUnavailable error
+	serveDeadline       time.Time
+	serveUnavailable    error
+	serveInitialPending int
+	serveDialObserved   bool
 }
 
 // ErrSourceUnavailable identifies a torrent that exhausted its one startup
@@ -128,31 +130,32 @@ type Session struct {
 var ErrSourceUnavailable = errors.New("playback source unavailable")
 
 type Status struct {
-	ID                string     `json:"id"`
-	Name              string     `json:"name"`
-	FileName          string     `json:"file_name"`
-	FileSize          int64      `json:"file_size"`
-	State             string     `json:"state"`
-	ActiveStreams     int        `json:"active_streams"`
-	LastActivity      time.Time  `json:"last_activity"`
-	SeedDeadline      *time.Time `json:"seed_deadline,omitempty"`
-	BytesComplete     int64      `json:"bytes_complete"`
-	TorrentBytes      int64      `json:"torrent_bytes"`
-	TorrentComplete   int64      `json:"torrent_complete"`
-	DownloadedBytes   int64      `json:"downloaded_bytes"`
-	UploadedBytes     int64      `json:"uploaded_bytes"`
-	Ratio             float64    `json:"ratio"`
-	RatioTarget       float64    `json:"ratio_target"`
-	RatioTargetMet    bool       `json:"ratio_target_met"`
-	TotalPeers        int        `json:"total_peers"`
-	PendingPeers      int        `json:"pending_peers"`
-	ActivePeers       int        `json:"active_peers"`
-	ConnectedSeeders  int        `json:"connected_seeders"`
-	HalfOpenPeers     int        `json:"half_open_peers"`
-	InfoHash          string     `json:"info_hash,omitempty"`
-	CachedPercent     int        `json:"cached_percent"`
-	SourceUnavailable bool       `json:"source_unavailable,omitempty"`
-	ServeDeadline     *time.Time `json:"serve_deadline,omitempty"`
+	ID                   string     `json:"id"`
+	Name                 string     `json:"name"`
+	FileName             string     `json:"file_name"`
+	FileSize             int64      `json:"file_size"`
+	State                string     `json:"state"`
+	ActiveStreams        int        `json:"active_streams"`
+	LastActivity         time.Time  `json:"last_activity"`
+	SeedDeadline         *time.Time `json:"seed_deadline,omitempty"`
+	BytesComplete        int64      `json:"bytes_complete"`
+	TorrentBytes         int64      `json:"torrent_bytes"`
+	TorrentComplete      int64      `json:"torrent_complete"`
+	DownloadedBytes      int64      `json:"downloaded_bytes"`
+	UploadedBytes        int64      `json:"uploaded_bytes"`
+	Ratio                float64    `json:"ratio"`
+	RatioTarget          float64    `json:"ratio_target"`
+	RatioTargetMet       bool       `json:"ratio_target_met"`
+	TotalPeers           int        `json:"total_peers"`
+	PendingPeers         int        `json:"pending_peers"`
+	ActivePeers          int        `json:"active_peers"`
+	ConnectedSeeders     int        `json:"connected_seeders"`
+	HalfOpenPeers        int        `json:"half_open_peers"`
+	InfoHash             string     `json:"info_hash,omitempty"`
+	CachedPercent        int        `json:"cached_percent"`
+	SourceUnavailable    bool       `json:"source_unavailable,omitempty"`
+	OutboundDialObserved bool       `json:"outbound_dial_observed,omitempty"`
+	ServeDeadline        *time.Time `json:"serve_deadline,omitempty"`
 }
 
 func New(cfg Config) (*Engine, error) {
@@ -369,6 +372,7 @@ func (e *Engine) SetCleanupHandler(handler func(string, string)) {
 }
 
 func (e *Engine) Create(ctx context.Context, source Source) (*Session, error) {
+	started := time.Now()
 	configured := 0
 	if source.MagnetURI != "" {
 		configured++
@@ -383,20 +387,30 @@ func (e *Engine) Create(ctx context.Context, source Source) (*Session, error) {
 		return nil, errors.New("exactly one torrent source must be provided")
 	}
 
+	sourceKind := "torrent_url"
+	if source.MagnetURI != "" {
+		sourceKind = "magnet"
+	} else if source.TorrentPath != "" {
+		sourceKind = "torrent_path"
+	}
 	e.lifecycleMu.Lock()
 	defer e.lifecycleMu.Unlock()
+	addStarted := time.Now()
 	t, err := e.addTorrent(ctx, source)
+	addSourceDuration := time.Since(addStarted)
 	if err != nil {
 		return nil, err
 	}
 	metadataContext, cancel := context.WithTimeout(ctx, e.metadataTimeout)
 	defer cancel()
+	metadataStarted := time.Now()
 	select {
 	case <-t.GotInfo():
 	case <-metadataContext.Done():
 		t.Drop()
 		return nil, fmt.Errorf("wait for torrent metadata: %w", metadataContext.Err())
 	}
+	metadataWaitDuration := time.Since(metadataStarted)
 
 	if length := t.Length(); length <= 0 {
 		t.Drop()
@@ -406,11 +420,14 @@ func (e *Engine) Create(ctx context.Context, source Source) (*Session, error) {
 		return nil, fmt.Errorf("torrent is %.1f GiB; configured maximum is %.1f GiB", gib(length), gib(e.maxTorrentBytes))
 	}
 
+	fileSelectionStarted := time.Now()
 	file, err := selectVideoFile(t.Files(), source.FileHint)
 	if err != nil {
 		t.Drop()
 		return nil, err
 	}
+	fileSelectionDuration := time.Since(fileSelectionStarted)
+	registrationStarted := time.Now()
 	id, err := randomID()
 	if err != nil {
 		t.Drop()
@@ -429,9 +446,19 @@ func (e *Engine) Create(ctx context.Context, source Source) (*Session, error) {
 	}
 	e.sessions[id] = session
 	e.mu.Unlock()
+	registrationDuration := time.Since(registrationStarted)
 
-	// Readers request only the selected playback window. Candidate validation deliberately
-	// avoids prefetching payload data so rejected private-tracker releases cannot become HnRs.
+	// Metadata selection does not request payload data. The first source HTTP
+	// read establishes demand for only its requested range, so rejected ranked
+	// candidates never become private-tracker HnR obligations.
+	e.logger.Info("torrent mount stages",
+		"id", session.ID, "name", session.Name, "source_kind", sourceKind,
+		"add_source_duration", addSourceDuration,
+		"metadata_wait_duration", metadataWaitDuration,
+		"file_selection_duration", fileSelectionDuration,
+		"session_registration_duration", registrationDuration,
+		"announce_async", true, "payload_demand", false,
+		"total_duration", time.Since(started))
 	return session, nil
 }
 
@@ -585,6 +612,7 @@ func (e *Engine) Status(id string) (Status, bool) {
 	status.CachedPercent = localCoveragePercent(session)
 	e.serveMu.Lock()
 	status.SourceUnavailable = session.serveUnavailable != nil
+	status.OutboundDialObserved = session.serveDialObserved
 	if !session.serveDeadline.IsZero() {
 		deadline := session.serveDeadline
 		status.ServeDeadline = &deadline
@@ -685,8 +713,45 @@ func (e *Engine) ensureServeReadiness(ctx context.Context, session *Session, rea
 	if !e.readBlocked(session, readStart) {
 		return nil
 	}
+
+	// anacrolix only permits outgoing peer connections when needData is true.
+	// Creating a File reader is not enough: its first Read marks the current and
+	// readahead pieces wanted, which moves tracker peers out of the pending pool
+	// and into outbound dials. Keep this demand reader alive until readiness is
+	// established; the HTTP reader below then takes over the same range.
+	demandContext, cancelDemand := context.WithCancel(readinessContext)
+	demandReader := session.file.NewReader()
+	demandReader.SetContext(demandContext)
+	demandReader.SetResponsive()
+	demandReader.SetReadahead(e.readaheadBytes)
+	if _, err := demandReader.Seek(readStart, io.SeekStart); err != nil {
+		cancelDemand()
+		_ = demandReader.Close()
+		return fmt.Errorf("seek playback source demand: %w", err)
+	}
+	initialStats := session.torrent.Stats()
+	e.serveMu.Lock()
+	session.serveInitialPending = max(session.serveInitialPending, initialStats.PendingPeers)
+	e.serveMu.Unlock()
+	demandDone := make(chan error, 1)
+	go func() {
+		_, err := demandReader.Read(make([]byte, 1))
+		demandDone <- err
+	}()
+	defer func() {
+		cancelDemand()
+		<-demandDone
+		_ = demandReader.Close()
+	}()
+
+	e.logger.Info("started playback source demand",
+		"name", session.Name, "file", session.FileName, "read_start", readStart,
+		"readahead_bytes", e.readaheadBytes, "pending_peers", initialStats.PendingPeers,
+		"half_open_peers", initialStats.HalfOpenPeers, "serve_deadline", deadline)
 	nextLog := time.Now().Add(serviceReadinessLogEvery)
 	for {
+		stats := session.torrent.Stats()
+		e.observeServeDial(session, stats)
 		if !e.readBlocked(session, readStart) {
 			return nil
 		}
@@ -697,7 +762,6 @@ func (e *Engine) ensureServeReadiness(ctx context.Context, session *Session, rea
 			return e.markSourceUnavailable(session)
 		}
 		if time.Now().After(nextLog) {
-			stats := session.torrent.Stats()
 			e.logger.Info("waiting for playback swarm to serve source",
 				"name", session.Name, "file", session.FileName,
 				"connected_peers", stats.ActivePeers, "connected_seeders", stats.ConnectedSeeders,
@@ -710,6 +774,15 @@ func (e *Engine) ensureServeReadiness(ctx context.Context, session *Session, rea
 		case <-time.After(serviceReadinessPoll):
 		}
 	}
+}
+
+func (e *Engine) observeServeDial(session *Session, stats torrent.TorrentStats) {
+	e.serveMu.Lock()
+	if stats.HalfOpenPeers > 0 ||
+		session.serveInitialPending > 0 && stats.PendingPeers < session.serveInitialPending {
+		session.serveDialObserved = true
+	}
+	e.serveMu.Unlock()
 }
 
 // serveReadinessState starts one deadline for the session. FFprobe and FFmpeg
@@ -737,11 +810,16 @@ func (e *Engine) markSourceUnavailable(session *Session) error {
 		ErrSourceUnavailable, e.serveWait, coverage, session.FileName)
 	session.serveUnavailable = err
 	deadline := session.serveDeadline
+	dialObserved := session.serveDialObserved
 	e.serveMu.Unlock()
 
 	discoveryOutcome := "peers_discovered_but_not_connected"
 	if stats.TotalPeers == 0 && stats.PendingPeers == 0 && stats.HalfOpenPeers == 0 {
-		discoveryOutcome = "no_peers_returned_or_retained"
+		if dialObserved {
+			discoveryOutcome = "peers_dialed_but_not_connected"
+		} else {
+			discoveryOutcome = "no_peers_returned_or_retained"
+		}
 	}
 	e.logger.Warn("playback swarm cannot serve source",
 		"name", session.Name, "file", session.FileName,
@@ -749,7 +827,8 @@ func (e *Engine) markSourceUnavailable(session *Session) error {
 		"connected_peers", stats.ActivePeers, "connected_seeders", stats.ConnectedSeeders,
 		"total_peers", stats.TotalPeers, "pending_peers", stats.PendingPeers,
 		"half_open_peers", stats.HalfOpenPeers, "cached_percent", coverage,
-		"serve_deadline", deadline, "peer_discovery_outcome", discoveryOutcome,
+		"serve_deadline", deadline, "outbound_dial_observed", dialObserved,
+		"peer_discovery_outcome", discoveryOutcome,
 		"tracker_outcome", "inferred_from_peer_counters")
 	return err
 }
