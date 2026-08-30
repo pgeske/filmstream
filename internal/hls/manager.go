@@ -24,6 +24,7 @@ const (
 	defaultSegmentSeconds       = 4
 	defaultParkedTTL            = 2 * time.Hour
 	defaultParkedResumeTimeout  = 6 * time.Second
+	startupProgressInterval     = 5 * time.Second
 )
 
 type Config struct {
@@ -1190,9 +1191,17 @@ func (m *Manager) subtitleArgs(stream *runningStream, index int) []string {
 func (m *Manager) waitUntilReady(ctx context.Context, stream *runningStream) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
+	nextProgress := time.Now().Add(startupProgressInterval)
 	for {
 		if playlistReady(stream.dir, m.bufferSeconds) {
 			return nil
+		}
+		if time.Now().After(nextProgress) {
+			nextProgress = time.Now().Add(startupProgressInterval)
+			segments, seconds, complete := playlistStatus(stream.dir)
+			m.logger.Info("HLS startup buffering", "playback_id", stream.info.PlaybackID,
+				"packaged_segments", segments, "packaged_seconds", seconds,
+				"target_seconds", m.bufferSeconds, "complete", complete)
 		}
 		select {
 		case <-ctx.Done():
@@ -1216,9 +1225,17 @@ func (m *Manager) waitUntilReady(ctx context.Context, stream *runningStream) err
 func (m *Manager) waitUntilBuffered(ctx context.Context, stream *runningStream, minimumSeconds int) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
+	nextProgress := time.Now().Add(startupProgressInterval)
 	for {
 		if playlistReady(stream.dir, minimumSeconds) {
 			return nil
+		}
+		if time.Now().After(nextProgress) {
+			nextProgress = time.Now().Add(startupProgressInterval)
+			segments, seconds, complete := playlistStatus(stream.dir)
+			m.logger.Info("HLS prewarm buffering", "playback_id", stream.info.PlaybackID,
+				"packaged_segments", segments, "packaged_seconds", seconds,
+				"target_seconds", minimumSeconds, "complete", complete)
 		}
 		select {
 		case <-ctx.Done():
