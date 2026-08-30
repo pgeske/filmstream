@@ -140,23 +140,24 @@ type Server struct {
 	reloadIndexers     func() error
 	reloadResolver     func() error
 
-	resolverMu        sync.RWMutex
-	movieResolver     resolver.Resolver
-	metadataMu        sync.RWMutex
-	metadataProvider  metadata.Provider
-	ratingsProvider   metadata.RatingsProvider
-	historyStore      *history.Store
-	playbackCache     *playbackcache.Store
-	hlsMu             sync.RWMutex
-	hlsManager        HLSStreamManager
-	mu                sync.RWMutex
-	selected          map[string]catalog.RankedCandidate
-	playbackCacheKeys map[string]playbackCacheKey
-	playbackLanguages map[string][]string
-	playbackRequests  map[string]CreatePlaybackRequest
-	playbackResponses map[string]CreatePlaybackResponse
-	usenetFailures    map[string]time.Time
-	torrentFailures   map[string]time.Time
+	resolverMu          sync.RWMutex
+	movieResolver       resolver.Resolver
+	metadataMu          sync.RWMutex
+	metadataProvider    metadata.Provider
+	ratingsProvider     metadata.RatingsProvider
+	historyStore        *history.Store
+	playbackCache       *playbackcache.Store
+	hlsMu               sync.RWMutex
+	hlsManager          HLSStreamManager
+	mu                  sync.RWMutex
+	selected            map[string]catalog.RankedCandidate
+	playbackCacheKeys   map[string]playbackCacheKey
+	playbackInvalidated map[string]bool
+	playbackLanguages   map[string][]string
+	playbackRequests    map[string]CreatePlaybackRequest
+	playbackResponses   map[string]CreatePlaybackResponse
+	usenetFailures      map[string]time.Time
+	torrentFailures     map[string]time.Time
 
 	recommendationService recommendations.Manager
 
@@ -178,22 +179,23 @@ type Server struct {
 
 func New(indexers *indexer.Registry, engine *torrentstream.Engine, defaults catalog.Preferences, logger *slog.Logger) *Server {
 	server := &Server{
-		indexers:           indexers,
-		engine:             engine,
-		playbackSourceMode: config.PlaybackSourceHybrid,
-		defaults:           defaults,
-		logger:             logger,
-		selected:           make(map[string]catalog.RankedCandidate),
-		playbackCacheKeys:  make(map[string]playbackCacheKey),
-		playbackLanguages:  make(map[string][]string),
-		playbackRequests:   make(map[string]CreatePlaybackRequest),
-		playbackResponses:  make(map[string]CreatePlaybackResponse),
-		usenetFailures:     make(map[string]time.Time),
-		torrentFailures:    make(map[string]time.Time),
-		prewarmStates:      make(map[string]*playbackPrewarmState),
-		prewarmSlots:       make(chan struct{}, 2),
-		claimedPlaybacks:   make(map[string]claimedPlayback),
-		releaseSearches:    make(map[string]*releaseSearchState),
+		indexers:            indexers,
+		engine:              engine,
+		playbackSourceMode:  config.PlaybackSourceHybrid,
+		defaults:            defaults,
+		logger:              logger,
+		selected:            make(map[string]catalog.RankedCandidate),
+		playbackCacheKeys:   make(map[string]playbackCacheKey),
+		playbackInvalidated: make(map[string]bool),
+		playbackLanguages:   make(map[string][]string),
+		playbackRequests:    make(map[string]CreatePlaybackRequest),
+		playbackResponses:   make(map[string]CreatePlaybackResponse),
+		usenetFailures:      make(map[string]time.Time),
+		torrentFailures:     make(map[string]time.Time),
+		prewarmStates:       make(map[string]*playbackPrewarmState),
+		prewarmSlots:        make(chan struct{}, 2),
+		claimedPlaybacks:    make(map[string]claimedPlayback),
+		releaseSearches:     make(map[string]*releaseSearchState),
 	}
 	engine.SetCleanupHandler(func(id, _ string) {
 		server.cleanupPlayback(id)
@@ -218,6 +220,7 @@ func (s *Server) cleanupPlayback(id string) {
 	s.mu.Lock()
 	delete(s.selected, id)
 	delete(s.playbackCacheKeys, id)
+	delete(s.playbackInvalidated, id)
 	delete(s.playbackLanguages, id)
 	delete(s.playbackRequests, id)
 	delete(s.playbackResponses, id)
@@ -1524,7 +1527,14 @@ func (s *Server) invalidateCachedPlayback(id string, causes ...error) {
 	s.mu.Lock()
 	key, ok := s.playbackCacheKeys[id]
 	if ok {
-		delete(s.playbackCacheKeys, id)
+		if s.playbackInvalidated == nil {
+			s.playbackInvalidated = make(map[string]bool)
+		}
+		if s.playbackInvalidated[id] {
+			ok = false
+		} else {
+			s.playbackInvalidated[id] = true
+		}
 	}
 	selected, hasSelection := s.selected[id]
 	request := s.playbackRequests[id]
@@ -2027,6 +2037,9 @@ func (s *Server) startHLSPlayback(w http.ResponseWriter, r *http.Request) {
 		s.logger.Info("HLS playback startup stages", "id", id,
 			"start_seconds", request.StartSeconds, "total_duration", startupDuration)
 	}
+	s.mu.Lock()
+	delete(s.playbackInvalidated, id)
+	s.mu.Unlock()
 	s.clearSuccessfulTorrentRecovery(id)
 	s.cacheSuccessfulPlayback(id)
 	writeJSON(w, http.StatusCreated, struct {

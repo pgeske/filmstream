@@ -2165,6 +2165,9 @@ func TestUnavailableTorrentInvalidationIsLoggedOnceAcrossCompetingCallbacks(t *t
 	if !server.torrentCandidateRecentlyFailed("tmdb:1", candidate.Candidate) {
 		t.Fatal("failed release was not quarantined")
 	}
+	if _, ok := server.playbackCacheKeys["playback-1"]; !ok {
+		t.Fatal("deduplication discarded playback metadata needed by a later successful retry")
+	}
 }
 
 func TestHLSSubtitleProbeFailureInvalidatesTorrentRelease(t *testing.T) {
