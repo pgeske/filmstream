@@ -125,9 +125,6 @@ func (t *Torznab) Search(ctx context.Context, request catalog.SearchRequest) ([]
 	if err != nil {
 		return nil, err
 	}
-	basicParameters := map[string]string{
-		"t": "search", "q": torznabQuery(request.Query), "limit": "100",
-	}
 	if request.MediaType == "show" && request.SeasonNumber > 0 && request.EpisodeNumber > 0 {
 		seasonQuery := fmt.Sprintf("%s S%02d", torznabQuery(request.Query), request.SeasonNumber)
 		episodeQuery := fmt.Sprintf("%s S%02dE%02d", torznabQuery(request.Query), request.SeasonNumber, request.EpisodeNumber)
@@ -185,31 +182,45 @@ func (t *Torznab) Search(ctx context.Context, request catalog.SearchRequest) ([]
 		}
 		return candidates, nil
 	}
-	if !capabilities.MovieSearchAvailable {
-		return t.search(ctx, basicParameters)
+	var candidates []catalog.Candidate
+	var failures []error
+	if capabilities.MovieSearchAvailable {
+		movieParameters := map[string]string{
+			"t": "movie", "q": torznabQuery(request.Query), "limit": "100",
+		}
+		if request.Year > 0 && capabilities.MovieSearchParams["year"] {
+			movieParameters["year"] = strconv.Itoa(request.Year)
+		}
+		movieCandidates, movieErr := t.search(ctx, movieParameters)
+		if movieErr != nil {
+			failures = append(failures, movieErr)
+		} else {
+			candidates = mergeCandidates(candidates, movieCandidates)
+			if len(catalog.Rank(request, candidates)) > 0 {
+				return candidates, nil
+			}
+		}
 	}
 
-	movieParameters := map[string]string{
-		"t": "movie", "q": torznabQuery(request.Query), "limit": "100",
-	}
-	if request.Year > 0 && capabilities.MovieSearchParams["year"] {
-		movieParameters["year"] = strconv.Itoa(request.Year)
-	}
-	movieCandidates, movieErr := t.search(ctx, movieParameters)
-	if movieErr == nil && len(movieCandidates) >= 20 {
-		return movieCandidates, nil
-	}
-	fallbackParameters := map[string]string{
-		"t": "search", "q": broadMovieQuery(request.Query, request.Year), "limit": "100",
-	}
-	basicCandidates, basicErr := t.search(ctx, fallbackParameters)
-	if basicErr != nil {
-		if movieErr != nil {
-			return nil, errors.Join(movieErr, basicErr)
+	if capabilities.SearchAvailable {
+		for _, query := range movieFallbackQueries(request.Query, request.Year) {
+			fallbackCandidates, fallbackErr := t.search(ctx, map[string]string{
+				"t": "search", "q": query, "limit": "100",
+			})
+			if fallbackErr != nil {
+				failures = append(failures, fallbackErr)
+				continue
+			}
+			candidates = mergeCandidates(candidates, fallbackCandidates)
+			if len(catalog.Rank(request, candidates)) > 0 {
+				return candidates, nil
+			}
 		}
-		return movieCandidates, nil
 	}
-	return mergeCandidates(movieCandidates, basicCandidates), nil
+	if len(candidates) == 0 && len(failures) > 0 {
+		return nil, errors.Join(failures...)
+	}
+	return candidates, nil
 }
 
 func (t *Torznab) search(ctx context.Context, parameters map[string]string) ([]catalog.Candidate, error) {
@@ -247,15 +258,16 @@ func (t *Torznab) search(ctx context.Context, parameters map[string]string) ([]c
 	return candidates, nil
 }
 
-func broadMovieQuery(title string, year int) string {
-	words := strings.Fields(torznabQuery(title))
-	if len(words) > 3 {
-		words = words[:3]
-	}
+func movieFallbackQueries(title string, year int) []string {
+	title = torznabQuery(title)
+	queries := make([]string, 0, 2)
 	if year > 0 {
-		words = append(words, strconv.Itoa(year))
+		queries = append(queries, title+" "+strconv.Itoa(year))
 	}
-	return strings.Join(words, " ")
+	if title != "" {
+		queries = append(queries, title)
+	}
+	return queries
 }
 
 func torznabQuery(value string) string {
@@ -312,8 +324,15 @@ func (t *Torznab) Resolve(_ context.Context, candidate catalog.Candidate) (Sourc
 
 func (t *Torznab) candidate(item torznabItem) (catalog.Candidate, bool) {
 	attributes := make(map[string]string, len(item.Attributes))
+	var categories []int
 	for _, attribute := range item.Attributes {
-		attributes[strings.ToLower(attribute.Name)] = attribute.Value
+		name := strings.ToLower(attribute.Name)
+		attributes[name] = attribute.Value
+		if name == "category" {
+			if category, err := strconv.Atoi(attribute.Value); err == nil {
+				categories = append(categories, category)
+			}
+		}
 	}
 
 	download := firstNonempty(attributes["magneturl"], item.Enclosure.URL, item.Link)
@@ -332,6 +351,7 @@ func (t *Torznab) candidate(item torznabItem) (catalog.Candidate, bool) {
 		Protocol:     catalog.ProtocolTorrent,
 		SizeBytes:    parseInt64(firstNonempty(attributes["size"], item.Enclosure.Length)),
 		Year:         int(parseInt64(attributes["year"])),
+		Categories:   categories,
 		ReleaseGroup: firstNonempty(attributes["releasegroup"], attributes["group"]),
 	}
 	if strings.HasPrefix(download, "magnet:") {

@@ -47,6 +47,7 @@ type Candidate struct {
 	Resolution           string   `json:"resolution,omitempty"`
 	Codec                string   `json:"codec,omitempty"`
 	Languages            []string `json:"languages,omitempty"`
+	Categories           []int    `json:"categories,omitempty"`
 	ReleaseGroup         string   `json:"release_group,omitempty"`
 	DownloadVolumeFactor *float64 `json:"download_volume_factor,omitempty"`
 	UploadVolumeFactor   *float64 `json:"upload_volume_factor,omitempty"`
@@ -63,6 +64,32 @@ type RankedCandidate struct {
 	Score     float64   `json:"score"`
 	Reasons   []string  `json:"reasons"`
 }
+
+type CandidateRejection struct {
+	Candidate Candidate
+	Reason    string
+}
+
+type RankingDiagnostics struct {
+	Accepted         int
+	Rejected         int
+	RejectionReasons map[string]int
+	Rejections       []CandidateRejection
+}
+
+const (
+	rejectionMaxSize             = "max_size"
+	rejectionDolbyVision         = "dolby_vision"
+	rejectionAIUpscale           = "ai_upscale"
+	rejection2160pRemux          = "2160p_remux"
+	rejectionUnknownCodec        = "unknown_codec"
+	rejectionUnsupportedCodec    = "unsupported_codec"
+	rejectionEpisodeMismatch     = "episode_mismatch"
+	rejectionSeasonMismatch      = "season_mismatch"
+	rejectionYearMismatch        = "year_mismatch"
+	rejectionTitleMismatch       = "title_mismatch"
+	rejectionSeasonPackPreferred = "season_pack_preferred"
+)
 
 var (
 	resolutionPattern    = regexp.MustCompile(`(?i)(?:^|[^0-9])(2160p|1080p|720p|480p)(?:[^0-9]|$)`)
@@ -102,7 +129,21 @@ func Enrich(candidate Candidate) Candidate {
 }
 
 func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
+	ranked, _ := RankWithDiagnostics(request, candidates)
+	return ranked
+}
+
+func RankWithDiagnostics(request SearchRequest, candidates []Candidate) ([]RankedCandidate, RankingDiagnostics) {
 	ranked := make([]RankedCandidate, 0, len(candidates))
+	diagnostics := RankingDiagnostics{RejectionReasons: make(map[string]int)}
+	reject := func(candidate Candidate, reason string) {
+		diagnostics.Rejected++
+		diagnostics.RejectionReasons[reason]++
+		diagnostics.Rejections = append(diagnostics.Rejections, CandidateRejection{
+			Candidate: candidate,
+			Reason:    reason,
+		})
+	}
 	now := time.Now()
 	for _, raw := range candidates {
 		candidate := Enrich(raw)
@@ -110,24 +151,33 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 			candidate.Year = inferReleaseYear(request.Query, candidate.Name)
 		}
 		if request.Preferences.MaxSizeBytes > 0 && candidate.SizeBytes > request.Preferences.MaxSizeBytes {
+			reject(candidate, rejectionMaxSize)
 			continue
 		}
 		if request.Preferences.StreamingOptimized {
 			name := normalize(candidate.Name)
 			words := wordSet(name)
 			if hasWord(words, "dv") || hasWord(words, "dovi") || strings.Contains(name, "dolby vision") {
+				reject(candidate, rejectionDolbyVision)
 				continue
 			}
 			if isUpscaledRelease(name) {
+				reject(candidate, rejectionAIUpscale)
 				continue
 			}
 			if strings.EqualFold(candidate.Resolution, "2160p") && hasWord(words, "remux") {
+				reject(candidate, rejection2160pRemux)
 				continue
 			}
 			if len(request.Preferences.Codecs) > 0 {
 				unknownUntrustedCodec := candidate.Codec == "" && !candidate.Trusted
 				knownUnsupportedCodec := candidate.Codec != "" && !containsFold(request.Preferences.Codecs, candidate.Codec)
-				if unknownUntrustedCodec || knownUnsupportedCodec {
+				switch {
+				case unknownUntrustedCodec:
+					reject(candidate, rejectionUnknownCodec)
+					continue
+				case knownUnsupportedCodec:
+					reject(candidate, rejectionUnsupportedCodec)
 					continue
 				}
 			}
@@ -140,21 +190,25 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 			case hasEpisode && season == request.SeasonNumber && episode == request.EpisodeNumber:
 				episodeMatch = true
 			case hasEpisode:
+				reject(candidate, rejectionEpisodeMismatch)
 				continue
 			default:
 				candidateSeason, hasSeason := releaseSeason(candidate.Name)
 				if !hasSeason || candidateSeason != request.SeasonNumber {
+					reject(candidate, rejectionSeasonMismatch)
 					continue
 				}
 				seasonPack = true
 			}
 		}
 		if request.MediaType != "show" && request.Year > 0 && candidate.Year > 0 && request.Year != candidate.Year {
+			reject(candidate, rejectionYearMismatch)
 			continue
 		}
 
 		match := titleSimilarity(request.Query, candidate.Name)
 		if match < minimumTitleSimilarity {
+			reject(candidate, rejectionTitleMismatch)
 			continue
 		}
 		score := match * 500
@@ -273,6 +327,11 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 			}
 		}
 		if len(seasonPacks) > 0 {
+			for _, candidate := range ranked {
+				if !IsSeasonPack(candidate.Candidate.Name, request.SeasonNumber) {
+					reject(candidate.Candidate, rejectionSeasonPackPreferred)
+				}
+			}
 			ranked = seasonPacks
 		}
 	}
@@ -280,7 +339,8 @@ func Rank(request SearchRequest, candidates []Candidate) []RankedCandidate {
 	sort.SliceStable(ranked, func(i, j int) bool {
 		return ranked[i].Score > ranked[j].Score
 	})
-	return ranked
+	diagnostics.Accepted = len(ranked)
+	return ranked, diagnostics
 }
 
 func IsSeasonPack(name string, seasonNumber int) bool {

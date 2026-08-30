@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/pgeske/filmstream/internal/catalog"
+	"github.com/pgeske/filmstream/internal/config"
 	"github.com/pgeske/filmstream/internal/history"
 	"github.com/pgeske/filmstream/internal/hls"
 	"github.com/pgeske/filmstream/internal/metadata"
@@ -83,11 +84,11 @@ func (s *Server) prewarmPlayback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	request.Preferences = mergePreferences(s.defaults, request.Preferences)
-	if request.MediaType == string(metadata.MediaTypeShow) {
-		// Browsing a show warms only the indexer search. Torrent media is mounted and
-		// subtitle-probed after an explicit play request; active playback separately
-		// buffers only its next episode.
-		s.queueShowReleaseSearch(request)
+	if request.MediaType == string(metadata.MediaTypeShow) ||
+		s.playbackSourceMode == config.PlaybackSourceTorrentOnly {
+		// Browsing torrent-backed media warms only the indexer search. A torrent is
+		// mounted after explicit Play; active playback separately buffers its next episode.
+		s.queueReleaseSearch(request)
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "finding_releases"})
 		return
 	}

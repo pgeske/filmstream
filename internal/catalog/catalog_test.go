@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"maps"
 	"slices"
 	"testing"
 	"time"
@@ -186,6 +187,118 @@ func TestRankStreamingOptimizedAllowsTrustedUnknownCodec(t *testing.T) {
 	}, []Candidate{{Name: "Sintel", Trusted: true}})
 	if len(ranked) != 1 {
 		t.Fatalf("trusted catalog candidate was rejected: %+v", ranked)
+	}
+}
+
+func TestRankPopularMovieReleaseNames(t *testing.T) {
+	seeders := 100
+	preferences := Preferences{
+		Resolution: "1080p", Codecs: []string{"h264", "h265"},
+		MaxSizeBytes: 60 << 30, StreamingOptimized: true,
+	}
+	tests := []struct {
+		name       string
+		mediaID    string
+		query      string
+		year       int
+		candidates []Candidate
+		want       string
+	}{
+		{
+			name: "Pirates of the Caribbean Dead Men Tell No Tales", mediaID: "tmdb:166426",
+			query: "Pirates of the Caribbean: Dead Men Tell No Tales", year: 2017,
+			candidates: []Candidate{
+				{Name: "Pirates of the Caribbean Dead Men Tell No Tales 2017 UHD BluRay 2160p DV HEVC REMUX-FraMeSToR", SizeBytes: 52 << 30, Seeders: &seeders},
+				{Name: "Pirates of the Caribbean Dead Men Tell No Tales 2017 REPACK 1080p BluRay DD+ 7 1 X265-Ralphy", SizeBytes: 6 << 30, Seeders: &seeders},
+			},
+			want: "Pirates of the Caribbean Dead Men Tell No Tales 2017 REPACK 1080p BluRay DD+ 7 1 X265-Ralphy",
+		},
+		{
+			name: "Dune Part Two", mediaID: "tmdb:693134",
+			query: "Dune: Part Two", year: 2024,
+			candidates: []Candidate{
+				{Name: "Dune Part Two 2024 UHD BluRay 2160p TrueHD Atmos DV HEVC REMUX-FraMeSToR", SizeBytes: 64 << 30, Seeders: &seeders},
+				{Name: "Dune Part Two 2024 1080p WEB-DL H264 AAC-InMemoryOfEVO", SizeBytes: 7 << 30, Seeders: &seeders},
+			},
+			want: "Dune Part Two 2024 1080p WEB-DL H264 AAC-InMemoryOfEVO",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.mediaID, func(t *testing.T) {
+			ranked := Rank(SearchRequest{
+				Query: test.query, Year: test.year, MediaType: "movie", Preferences: preferences,
+			}, test.candidates)
+			if len(ranked) != 1 || ranked[0].Candidate.Name != test.want {
+				t.Fatalf("ranked = %+v", ranked)
+			}
+		})
+	}
+}
+
+func TestRankDiagnosticsExplainFastFixtureMovieRejections(t *testing.T) {
+	candidates := []Candidate{
+		{Name: "Sintel", Year: 2010, Trusted: true},
+		{Name: "Big Buck Bunny", Year: 2008, Trusted: true},
+		{Name: "Tears of Steel", Year: 2012, Trusted: true},
+		{Name: "Cosmos Laundromat", Year: 2015, Trusted: true},
+	}
+	ranked, diagnostics := RankWithDiagnostics(SearchRequest{
+		Query: "Dune: Part Two", Year: 2024, MediaType: "movie",
+		Preferences: Preferences{Codecs: []string{"h264", "h265"}, StreamingOptimized: true},
+	}, candidates)
+	if len(ranked) != 0 || diagnostics.Accepted != 0 || diagnostics.Rejected != len(candidates) {
+		t.Fatalf("ranked = %+v, diagnostics = %+v", ranked, diagnostics)
+	}
+	if got := diagnostics.RejectionReasons[rejectionYearMismatch]; got != 4 {
+		t.Fatalf("year mismatch rejections = %d, diagnostics = %+v", got, diagnostics)
+	}
+	for index, rejection := range diagnostics.Rejections {
+		if rejection.Candidate.Name != candidates[index].Name || rejection.Reason != rejectionYearMismatch {
+			t.Fatalf("rejection %d = %+v", index, rejection)
+		}
+	}
+}
+
+func TestRankDiagnosticsKeepZeroSeederMovieEligible(t *testing.T) {
+	seeders := 0
+	ranked, diagnostics := RankWithDiagnostics(SearchRequest{
+		Query: "Dune: Part Two", Year: 2024, MediaType: "movie",
+		Preferences: Preferences{
+			Resolution: "1080p", Codecs: []string{"h264"}, StreamingOptimized: true,
+		},
+	}, []Candidate{{
+		Name: "Dune Part Two 2024 1080p WEB-DL H264-GROUP", Seeders: &seeders,
+		Categories: []int{2000, 2030},
+	}})
+	if len(ranked) != 1 || diagnostics.Accepted != 1 || diagnostics.Rejected != 0 {
+		t.Fatalf("ranked = %+v, diagnostics = %+v", ranked, diagnostics)
+	}
+}
+
+func TestRankDiagnosticsCountEveryHardPolicyReason(t *testing.T) {
+	request := SearchRequest{
+		Query: "The Movie", Year: 2001, MediaType: "movie",
+		Preferences: Preferences{
+			Codecs: []string{"h264", "h265"}, MaxSizeBytes: 60 << 30, StreamingOptimized: true,
+		},
+	}
+	_, diagnostics := RankWithDiagnostics(request, []Candidate{
+		{Name: "The Movie 2001 1080p x264", SizeBytes: 61 << 30},
+		{Name: "The Movie 2001 2160p DV x265"},
+		{Name: "The Movie 2001 1080p AI Upscaled x265"},
+		{Name: "The Movie 2001 2160p REMUX x265"},
+		{Name: "The Movie 2001 1080p"},
+		{Name: "The Movie 2001 1080p AV1", Codec: "av1"},
+		{Name: "The Movie 1999 1080p x264"},
+		{Name: "Another Movie 2001 1080p x264"},
+	})
+	want := map[string]int{
+		rejectionMaxSize: 1, rejectionDolbyVision: 1, rejectionAIUpscale: 1,
+		rejection2160pRemux: 1, rejectionUnknownCodec: 1,
+		rejectionUnsupportedCodec: 1, rejectionYearMismatch: 1, rejectionTitleMismatch: 1,
+	}
+	if !maps.Equal(diagnostics.RejectionReasons, want) || diagnostics.Rejected != 8 || diagnostics.Accepted != 0 {
+		t.Fatalf("diagnostics = %+v, want reasons = %v", diagnostics, want)
 	}
 }
 
