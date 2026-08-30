@@ -21,13 +21,10 @@ func TestManagerCreatesAndServesIncrementalPlaylist(t *testing.T) {
 	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
 case " $* " in
   *" concat:"*)
-    printf '{"packets":[{"stream_index":0,"pts_time":"0.000","dts_time":"0.000","flags":"K__"}],"streams":[{"index":0,"codec_type":"video","start_time":"0.000"}]}\n'
+    printf '{"packets":[{"stream_index":0,"pts_time":"0.000","dts_time":"0.000","size":"1234","flags":"K__","data_hash":"SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"streams":[{"index":0,"codec_type":"video","start_time":"0.000"}]}\n'
     exit 0
     ;;
-  *" -read_intervals "*)
-    printf '{"packets":[{"pts_time":"118.500","flags":"K__"}]}\n'
-    exit 0
-    ;;
+  *" -read_intervals "*) exit 2 ;;
 esac
 cat <<'JSON'
 {"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]},{"index":3,"codec_name":"subrip","codec_type":"subtitle","tags":{"language":"eng"}}],"format":{"duration":"7200.5"}}
@@ -36,6 +33,10 @@ JSON
 	ffmpeg := writeExecutable(t, "ffmpeg", `#!/bin/sh
 for last do :; done
 dir=$(dirname "$last")
+cat > "$dir/source-video-anchor.framehash" <<'ANCHOR'
+#tb 0: 1/1000
+0, 118417, 118500, 41, 1234, aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ANCHOR
 case "$last" in
   *.vtt)
     cat > "$last" <<'SUBTITLES'
@@ -119,11 +120,7 @@ func TestManagerRebuildStopsPreviousSubtitleProcess(t *testing.T) {
 	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
 case " $* " in
   *" concat:"*)
-    printf '{"packets":[{"stream_index":0,"pts_time":"0.000","dts_time":"0.000","flags":"K__"}],"streams":[{"index":0,"codec_type":"video","start_time":"0.000"}]}\n'
-    exit 0
-    ;;
-  *" -read_intervals "*)
-    printf '{"packets":[{"pts_time":"59.000","flags":"K__"}]}\n'
+    printf '{"packets":[{"stream_index":0,"pts_time":"0.000","dts_time":"0.000","size":"1234","flags":"K__","data_hash":"SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"streams":[{"index":0,"codec_type":"video","start_time":"0.000"}]}\n'
     exit 0
     ;;
 esac
@@ -132,6 +129,10 @@ printf '{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_da
 	ffmpeg := writeExecutable(t, "ffmpeg", fmt.Sprintf(`#!/bin/sh
 for last do :; done
 dir=$(dirname "$last")
+cat > "$dir/source-video-anchor.framehash" <<'ANCHOR'
+#tb 0: 1/1000
+0, 58917, 59000, 41, 1234, aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ANCHOR
 case "$last" in
   *.vtt)
     printf '%%s\n' "$$" >> %q
@@ -201,23 +202,17 @@ while :; do sleep 1; done
 	}
 }
 
-func TestManagerUsesCompleteLocalFileForMediaAndKeyframeProbes(t *testing.T) {
+func TestManagerUsesCompleteLocalFileForMediaProbeOnly(t *testing.T) {
 	probeSources := filepath.Join(t.TempDir(), "probe-sources")
 	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
 case " $* " in
   *" concat:"*)
-    printf '{"packets":[{"stream_index":0,"pts_time":"0.000","dts_time":"0.000","flags":"K__"}],"streams":[{"index":0,"codec_type":"video","start_time":"0.000"}]}\n'
+    printf '{"packets":[{"stream_index":0,"pts_time":"0.000","dts_time":"0.000","size":"1234","flags":"K__","data_hash":"SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"streams":[{"index":0,"codec_type":"video","start_time":"0.000"}]}\n'
     exit 0
     ;;
 esac
 for last do :; done
 printf '%%s\n' "$last" >> %q
-case " $* " in
-  *" -read_intervals "*)
-    printf '{"packets":[{"pts_time":"118.500","flags":"K__"}]}\n'
-    exit 0
-    ;;
-esac
 cat <<'JSON'
 {"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]}],"format":{"duration":"7200"}}
 JSON
@@ -225,6 +220,10 @@ JSON
 	ffmpeg := writeExecutable(t, "ffmpeg", `#!/bin/sh
 for last do :; done
 dir=$(dirname "$last")
+cat > "$dir/source-video-anchor.framehash" <<'ANCHOR'
+#tb 0: 1/1000
+0, 118417, 118500, 41, 1234, aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ANCHOR
 printf 'init' > "$dir/init.mp4"
 printf 'segment' > "$dir/segment-000000.m4s"
 cat > "$dir/index.m3u8" <<'PLAYLIST'
@@ -259,9 +258,9 @@ while :; do sleep 1; done
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Fields(string(sources)); len(got) != 2 ||
-		got[0] != "/data/complete-episode.mkv" || got[1] != "/data/complete-episode.mkv" {
-		t.Fatalf("probe sources = %q, want two direct local probes", sources)
+	if got := strings.Fields(string(sources)); len(got) != 1 ||
+		got[0] != "/data/complete-episode.mkv" {
+		t.Fatalf("probe sources = %q, want one direct local media probe", sources)
 	}
 }
 
@@ -426,11 +425,7 @@ func TestManagerJoinsInProgressPreparedStream(t *testing.T) {
 	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
 case " $* " in
   *" concat:"*)
-    printf '{"packets":[{"stream_index":0,"pts_time":"0.000","dts_time":"0.000","flags":"K__"}],"streams":[{"index":0,"codec_type":"video","start_time":"0.000"}]}\n'
-    exit 0
-    ;;
-  *" -read_intervals "*)
-    printf '{"packets":[{"pts_time":"59.000","flags":"K__"}]}\n'
+    printf '{"packets":[{"stream_index":0,"pts_time":"0.000","dts_time":"0.000","size":"1234","flags":"K__","data_hash":"SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"streams":[{"index":0,"codec_type":"video","start_time":"0.000"}]}\n'
     exit 0
     ;;
 esac
@@ -442,6 +437,10 @@ JSON
 printf 'x\n' >> %q
 for last do :; done
 dir=$(dirname "$last")
+cat > "$dir/source-video-anchor.framehash" <<'ANCHOR'
+#tb 0: 1/1000
+0, 58917, 59000, 41, 1234, aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ANCHOR
 printf 'init' > "$dir/init.mp4"
 printf 'segment' > "$dir/segment-000000.m4s"
 cat > "$dir/index.m3u8" <<'PLAYLIST'
@@ -505,11 +504,7 @@ func TestManagerReusesPreparedStreamForPositionWithinPackagedRange(t *testing.T)
 	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
 case " $* " in
   *" concat:"*)
-    printf '{"packets":[{"stream_index":0,"pts_time":"0.000","dts_time":"0.000","flags":"K__"}],"streams":[{"index":0,"codec_type":"video","start_time":"0.000"}]}\n'
-    exit 0
-    ;;
-  *" -read_intervals "*)
-    printf '{"packets":[{"pts_time":"59.000","flags":"K__"}]}\n'
+    printf '{"packets":[{"stream_index":0,"pts_time":"0.000","dts_time":"0.000","size":"1234","flags":"K__","data_hash":"SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"streams":[{"index":0,"codec_type":"video","start_time":"0.000"}]}\n'
     exit 0
     ;;
 esac
@@ -522,6 +517,10 @@ JSON
 printf 'x\n' >> %q
 for last do :; done
 dir=$(dirname "$last")
+cat > "$dir/source-video-anchor.framehash" <<'ANCHOR'
+#tb 0: 1/1000
+0, 58917, 59000, 41, 1234, aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ANCHOR
 printf 'init' > "$dir/init.mp4"
 printf 'segment' > "$dir/segment-000000.m4s"
 printf 'segment' > "$dir/segment-000001.m4s"
@@ -1103,7 +1102,8 @@ func TestFFmpegArgsBurnBitmapSubtitlesWithNVENC(t *testing.T) {
 	args := strings.Join(manager.ffmpegArgs("http://source", t.TempDir(), "hevc", timeline, 2, 5), " ")
 	for _, expected := range []string{
 		"-copyts -start_at_zero", "-filter_complex [0:v:0][0:5]overlay=eof_action=pass[v]",
-		"-map [v]", "-map 0:2?", "-c:v h264_nvenc", "-preset p5", "-cq 18",
+		"-map 0:v:0 -c:v rawvideo -frames:v 1", "-map [v]", "-map 0:2?",
+		"-c:v h264_nvenc", "-preset p5", "-cq 18",
 		"-force_key_frames expr:if(isnan(prev_forced_t),1,gte(t,prev_forced_t+4))",
 		"-output_ts_offset -30.000",
 	} {
@@ -1112,7 +1112,7 @@ func TestFFmpegArgsBurnBitmapSubtitlesWithNVENC(t *testing.T) {
 		}
 	}
 	if strings.Contains(args, "-c:v copy") || strings.Contains(args, "-tag:v hvc1") {
-		t.Fatalf("bitmap subtitle packager stream-copies video: %s", args)
+		t.Fatalf("bitmap subtitle HLS output stream-copies video: %s", args)
 	}
 }
 
@@ -1166,6 +1166,13 @@ func TestPlaybackTimelineMapsProductionResumeGapsToPlayerTime(t *testing.T) {
 			wantInitialPlayerTime: 0.64162768738253,
 			cueMediaTime:          95.720, wantCuePlayerTime: 3.002,
 		},
+		{
+			name: "Bear 102 second resume", requested: 102.084867958,
+			sourceVideoPTS: 100.142, packagedVideoPTS: 0.083,
+			wantPacketOrigin: 100.059, wantRequestedGap: 2.025867958,
+			wantInitialPlayerTime: 1.942867958,
+			cueMediaTime:          103.478, wantCuePlayerTime: 3.336,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1198,18 +1205,38 @@ func TestPlaybackTimelineMapsProductionResumeGapsToPlayerTime(t *testing.T) {
 	}
 }
 
-func TestPlaybackTimelineRejectsDifferentPackagedKeyframe(t *testing.T) {
-	timeline := newPlaybackTimeline(235.863280322)
-	timeline.setSourceVideoAnchor(sourceVideoAnchor{
-		ptsSeconds: 234.568,
-		packetSize: 44398,
-		packetHash: "SHA256:source",
-	})
-	err := timeline.alignToPackagedVideo(packagedTimelineStart{
-		videoPTS: 0.083, videoPacketSize: 44398, videoPacketHash: "SHA256:previous",
-	}, true)
-	if err == nil || !strings.Contains(err.Error(), "different source video keyframe") {
-		t.Fatalf("packaged keyframe error = %v", err)
+func TestPlaybackTimelineRejectsMissingOrDifferentPackagedSourcePacket(t *testing.T) {
+	tests := []struct {
+		name     string
+		packaged packagedTimelineStart
+	}{
+		{
+			name: "different hash",
+			packaged: packagedTimelineStart{
+				videoPTS: 0.083, videoPacketSize: 44398, videoPacketHash: "SHA256:previous",
+			},
+		},
+		{
+			name: "different size",
+			packaged: packagedTimelineStart{
+				videoPTS: 0.083, videoPacketSize: 44397, videoPacketHash: "SHA256:source",
+			},
+		},
+		{name: "missing identity", packaged: packagedTimelineStart{videoPTS: 0.083}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			timeline := newPlaybackTimeline(235.863280322)
+			timeline.setSourceVideoAnchor(sourceVideoAnchor{
+				ptsSeconds: 234.568,
+				packetSize: 44398,
+				packetHash: "SHA256:source",
+			})
+			err := timeline.alignToPackagedVideo(test.packaged, true)
+			if err == nil || !strings.Contains(err.Error(), "different source video keyframe") {
+				t.Fatalf("packaged keyframe error = %v", err)
+			}
+		})
 	}
 }
 
@@ -1263,34 +1290,153 @@ func TestPreferredAudioStreamUsesRequestedLanguageBeforeDefault(t *testing.T) {
 	}
 }
 
-func TestManagerCorrectsTimelineStartWhenKeyframeProbeFails(t *testing.T) {
-	// Model a cold torrent source: the keyframe probe fails until the packager
-	// has read through the seek region, after which the probe sees the keyframe
-	// the -ss seek actually landed on.
-	marker := filepath.Join(t.TempDir(), "warmed")
+func TestManagerResumesBearMatroskaAtExactProductionTimestamp(t *testing.T) {
+	speculativeProbe := filepath.Join(t.TempDir(), "speculative-probe")
+	packagerArgs := filepath.Join(t.TempDir(), "packager-args")
 	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
 case " $* " in
   *" concat:"*)
-    printf '{"packets":[{"stream_index":0,"pts_time":"0.000","dts_time":"0.000","flags":"K__"}],"streams":[{"index":0,"codec_type":"video","start_time":"0.000"}]}\n'
+    printf '{"packets":[{"stream_index":0,"pts_time":"0.083","dts_time":"0.000","size":"99937","flags":"K__","data_hash":"SHA256:cebf4733fc654bd722400fd325a9a014fabe5527de88fa0c27482e73acda15b2"}],"streams":[{"index":0,"codec_type":"video","start_time":"0.083"},{"index":1,"codec_type":"audio","start_time":"0.081"}]}\n'
     exit 0
     ;;
   *" -read_intervals "*)
-    if [ ! -f %q ]; then
-      # Cold source: ranging this far into the file fails until the packager warms it.
-      exit 1
-    fi
-    printf '{"packets":[{"pts_time":"42.000","flags":"K__"}]}\n'
+    printf 'unexpected\n' >> %q
+    printf '{"packets":[]}\n'
     exit 0
+    ;;
+esac
+cat <<'JSON'
+{"streams":[{"index":0,"codec_name":"hevc","codec_type":"video","side_data_list":[]},{"index":1,"codec_name":"aac","codec_type":"audio","tags":{"language":"eng"}},{"index":2,"codec_name":"subrip","codec_type":"subtitle","tags":{"language":"eng"}}],"format":{"start_time":"0.000000","duration":"1667.082"}}
+JSON
+`, speculativeProbe))
+	ffmpeg := writeExecutable(t, "ffmpeg", fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" > %q
+for last do :; done
+dir=$(dirname "$last")
+cat > "$dir/source-video-anchor.framehash" <<'ANCHOR'
+#tb 0: 1/1000
+0, 100059, 100142, 41, 99937, cebf4733fc654bd722400fd325a9a014fabe5527de88fa0c27482e73acda15b2
+ANCHOR
+printf init > "$dir/init.mp4"
+printf segment > "$dir/segment-000000.m4s"
+printf '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:12.929,\nsegment-000000.m4s\n' > "$dir/index.m3u8"
+while :; do sleep 1; done
+`, packagerArgs))
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943", StartupTimeout: 5 * time.Second,
+		BufferSeconds: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	stream, err := manager.Start(t.Context(), "playback-1", 102.084867958, []string{"en"}, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(stream.TimelineOriginSeconds-100.059) > timelineTimestampEpsilon ||
+		math.Abs(stream.PlayerTimeOffsetSeconds-0.083) > timelineTimestampEpsilon {
+		t.Fatalf("stream timeline = %+v, want authoritative source packet 100.142", stream)
+	}
+	if _, err := os.Stat(speculativeProbe); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deployed one-packet anchor probe still ran: %v", err)
+	}
+	args, err := os.ReadFile(packagerArgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(args), "-noaccurate_seek -ss 102.085") ||
+		strings.Contains(string(args), "-ss 100.142") {
+		t.Fatalf("packager did not seek exactly once at the request: %s", args)
+	}
+}
+
+func TestManagerUsesPackagerSourceAnchorForBitmapBurnIn(t *testing.T) {
+	packagerArgs := filepath.Join(t.TempDir(), "packager-args")
+	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
+case " $* " in
+  *" concat:"*)
+    printf '{"packets":[{"stream_index":0,"pts_time":"0.083","dts_time":"0.000","size":"2000","flags":"K__","data_hash":"SHA256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}],"streams":[{"index":0,"codec_type":"video","start_time":"0.083"}]}\n'
+    exit 0
+    ;;
+esac
+cat <<'JSON'
+{"streams":[{"index":0,"codec_name":"hevc","codec_type":"video","side_data_list":[]},{"index":5,"codec_name":"hdmv_pgs_subtitle","codec_type":"subtitle"}],"format":{"duration":"7200"}}
+JSON
+`)
+	ffmpeg := writeExecutable(t, "ffmpeg", fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" > %q
+for last do :; done
+dir=$(dirname "$last")
+cat > "$dir/source-video-anchor.framehash" <<'ANCHOR'
+#tb 0: 1/1000
+0, 41917, 42000, 41, 1234, aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ANCHOR
+printf init > "$dir/init.mp4"
+printf segment > "$dir/segment-000000.m4s"
+printf '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:4.0,\nsegment-000000.m4s\n' > "$dir/index.m3u8"
+while :; do sleep 1; done
+`, packagerArgs))
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943", StartupTimeout: 5 * time.Second,
+		BufferSeconds: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	stream, err := manager.Start(t.Context(), "playback-1", 43.7, nil, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stream.VideoCodec != "h264" || stream.BurnedSubtitleIndex == nil ||
+		*stream.BurnedSubtitleIndex != 5 ||
+		math.Abs(stream.TimelineOriginSeconds-41.917) > timelineTimestampEpsilon {
+		t.Fatalf("bitmap stream = %+v", stream)
+	}
+	args, err := os.ReadFile(packagerArgs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"-c:v rawvideo -frames:v 1 -flush_packets 1 -hash sha256 -f framehash",
+		"-filter_complex [0:v:0][0:5]overlay=eof_action=pass[v]",
+		"-map [v]", "-c:v libx264",
+	} {
+		if !strings.Contains(string(args), expected) {
+			t.Fatalf("bitmap packager arguments do not contain %q: %s", expected, args)
+		}
+	}
+}
+
+func TestManagerStartsColdTorrentWithoutSpeculativeAnchorProbe(t *testing.T) {
+	probeCount := filepath.Join(t.TempDir(), "speculative-probe-count")
+	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
+case " $* " in
+  *" concat:"*)
+    printf '{"packets":[{"stream_index":0,"pts_time":"0.000","dts_time":"0.000","size":"1234","flags":"K__","data_hash":"SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"streams":[{"index":0,"codec_type":"video","start_time":"0.000"}]}\n'
+    exit 0
+    ;;
+  *" -read_intervals "*)
+    printf 'unexpected\n' >> %q
+    exit 1
     ;;
 esac
 cat <<'JSON'
 {"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]},{"index":3,"codec_name":"subrip","codec_type":"subtitle","tags":{"language":"eng"}}],"format":{"duration":"7200"}}
 JSON
-`, marker))
-	ffmpeg := writeExecutable(t, "ffmpeg", fmt.Sprintf(`#!/bin/sh
+`, probeCount))
+	ffmpeg := writeExecutable(t, "ffmpeg", `#!/bin/sh
 for last do :; done
 dir=$(dirname "$last")
-printf warmed > %q
+cat > "$dir/source-video-anchor.framehash" <<'ANCHOR'
+#tb 0: 1/1000
+0, 41917, 42000, 41, 1234, aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ANCHOR
 printf 'init' > "$dir/init.mp4"
 printf 'segment' > "$dir/segment-000000.m4s"
 cat > "$dir/index.m3u8" <<'PLAYLIST'
@@ -1301,7 +1447,7 @@ cat > "$dir/index.m3u8" <<'PLAYLIST'
 segment-000000.m4s
 PLAYLIST
 while :; do sleep 1; done
-`, marker))
+`)
 	manager, err := New(Config{
 		DataDir:        t.TempDir(),
 		FFmpegPath:     ffmpeg,
@@ -1336,9 +1482,73 @@ while :; do sleep 1; done
 	if strings.Contains(args, "-output_ts_offset") {
 		t.Fatalf("subtitle arguments rebase full-media timestamps: %s", args)
 	}
+	if _, err := os.Stat(probeCount); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("speculative source probe ran before packaging: %v", err)
+	}
 }
 
-func TestManagerDoesNotReturnUnsynchronizedStreamAfterReprobeFailure(t *testing.T) {
+func TestManagerDoesNotExposeAssetsUntilTimelineVerificationCompletes(t *testing.T) {
+	verifying := filepath.Join(t.TempDir(), "verifying")
+	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
+case " $* " in
+  *" concat:"*)
+    printf verifying > %q
+    sleep 0.3
+    printf '{"packets":[{"stream_index":0,"pts_time":"0.000","dts_time":"0.000","size":"1234","flags":"K__","data_hash":"SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"streams":[{"index":0,"codec_type":"video","start_time":"0.000"}]}\n'
+    exit 0
+    ;;
+esac
+printf '{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]}],"format":{"duration":"7200"}}\n'
+`, verifying))
+	ffmpeg := writeExecutable(t, "ffmpeg", `#!/bin/sh
+for last do :; done
+dir=$(dirname "$last")
+cat > "$dir/source-video-anchor.framehash" <<'ANCHOR'
+#tb 0: 1/1000
+0, 41917, 42000, 41, 1234, aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ANCHOR
+printf init > "$dir/init.mp4"
+printf segment > "$dir/segment-000000.m4s"
+printf '#EXTM3U\n#EXTINF:4.0,\nsegment-000000.m4s\n' > "$dir/index.m3u8"
+while :; do sleep 1; done
+`)
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943", StartupTimeout: 5 * time.Second,
+		BufferSeconds: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	result := make(chan error, 1)
+	go func() {
+		_, startErr := manager.Start(t.Context(), "playback-1", 43.7, nil, -1)
+		result <- startErr
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(verifying); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("packaged timeline verification did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := manager.AssetPath("playback-1", "index.m3u8"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unverified playlist was exposed: %v", err)
+	}
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.AssetPath("playback-1", "index.m3u8"); err != nil {
+		t.Fatalf("verified playlist is unavailable: %v", err)
+	}
+}
+
+func TestManagerDoesNotExposeStreamWithoutSourceAnchor(t *testing.T) {
 	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
 case " $* " in
   *" -read_intervals "*) exit 1 ;;
@@ -1371,8 +1581,8 @@ while :; do sleep 1; done
 	defer manager.Close()
 
 	_, err = manager.Start(t.Context(), "playback-1", 43.7, nil, -1)
-	if err == nil || !strings.Contains(err.Error(), "reprobe HLS timeline anchor") {
-		t.Fatalf("start error = %v, want reprobe failure", err)
+	if err == nil || !strings.Contains(err.Error(), "verify packaged HLS source anchor") {
+		t.Fatalf("start error = %v, want source anchor verification failure", err)
 	}
 	manager.mu.RLock()
 	stream := manager.streams["playback-1"]
@@ -1398,6 +1608,10 @@ JSON
 	ffmpeg := writeExecutable(t, "ffmpeg", `#!/bin/sh
 for last do :; done
 dir=$(dirname "$last")
+cat > "$dir/source-video-anchor.framehash" <<'ANCHOR'
+#tb 0: 1/1000
+0, 41917, 42000, 41, 1234, aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ANCHOR
 printf init > "$dir/init.mp4"
 printf segment > "$dir/segment-000000.m4s"
 cat > "$dir/index.m3u8" <<'PLAYLIST'
@@ -1430,25 +1644,30 @@ while :; do sleep 1; done
 	}
 }
 
-func TestManagerDoesNotRetryDeterministicInvalidKeyframe(t *testing.T) {
-	probeCount := filepath.Join(t.TempDir(), "probe-count")
+func TestManagerRejectsSourcePacketAfterPackagerSeek(t *testing.T) {
 	packagerCount := filepath.Join(t.TempDir(), "packager-count")
-	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
-case " $* " in
-  *" -read_intervals "*)
-    printf 'x\n' >> %q
-    printf '{"packets":[{"pts_time":"2830.828","flags":"K__"}]}\n'
-    exit 0
-    ;;
-esac
+	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
 cat <<'JSON'
 {"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]}],"format":{"duration":"2830.828"}}
 JSON
-`, probeCount))
-	ffmpeg := writeExecutable(t, "ffmpeg", fmt.Sprintf("#!/bin/sh\nprintf 'x\\n' >> %q\nexit 1\n", packagerCount))
+`)
+	ffmpeg := writeExecutable(t, "ffmpeg", fmt.Sprintf(`#!/bin/sh
+printf 'x\n' >> %q
+for last do :; done
+dir=$(dirname "$last")
+cat > "$dir/source-video-anchor.framehash" <<'ANCHOR'
+#tb 0: 1/1000
+0, 2830745, 2830828, 41, 1234, aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ANCHOR
+printf init > "$dir/init.mp4"
+printf segment > "$dir/segment-000000.m4s"
+printf '#EXTM3U\n#EXTINF:4.0,\nsegment-000000.m4s\n' > "$dir/index.m3u8"
+while :; do sleep 1; done
+`, packagerCount))
 	manager, err := New(Config{
 		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
 		SourceBaseURL: "http://127.0.0.1:8943", StartupTimeout: 5 * time.Second,
+		BufferSeconds: 4,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1456,107 +1675,84 @@ JSON
 	defer manager.Close()
 
 	_, err = manager.Start(t.Context(), "playback-1", 1875.616, nil, -1)
-	if err == nil || !strings.Contains(err.Error(), `video keyframe timestamp "2830.828" follows requested start`) {
-		t.Fatalf("start error = %v, want future keyframe rejection", err)
+	if err == nil || !strings.Contains(err.Error(), "source video packet timestamp 2830.828000 follows packager seek 1875.616000") {
+		t.Fatalf("start error = %v, want future source packet rejection", err)
 	}
-	probeCalls, readErr := os.ReadFile(probeCount)
-	if readErr != nil {
-		t.Fatal(readErr)
+	packagerCalls, readErr := os.ReadFile(packagerCount)
+	if readErr != nil || strings.Count(string(packagerCalls), "x") != 1 {
+		t.Fatalf("packager calls = %q, error = %v", packagerCalls, readErr)
 	}
-	if strings.Count(string(probeCalls), "x") != 1 {
-		t.Fatalf("keyframe probe calls = %q, want one", probeCalls)
-	}
-	if _, statErr := os.Stat(packagerCount); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("packager ran after deterministic probe failure: %v", statErr)
-	}
-}
-
-func TestProbeTimelineAnchorUsesRequestedSeekLandingInOnePass(t *testing.T) {
-	probeCount := filepath.Join(t.TempDir(), "probe-count")
-	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
-printf 'x\n' >> %q
-case " $* " in
-  *" 569.000%%+#1 "*) ;;
-  *) exit 2 ;;
-esac
-cat <<'JSON'
-{"packets":[{"pts_time":"568.568","size":"1234","flags":"K__","data_hash":"SHA256:anchor"}]}
-JSON
-`, probeCount))
-	ffmpeg := writeExecutable(t, "ffmpeg", "#!/bin/sh\nexit 0\n")
-	manager, err := New(Config{
-		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
-		SourceBaseURL: "http://127.0.0.1:8943",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer manager.Close()
-
-	anchor, err := manager.probeTimelineAnchor(t.Context(), "http://source", 0, 569)
-	if err != nil || anchor.ptsSeconds != 568.568 || anchor.packetSize != 1234 ||
-		anchor.packetHash != "SHA256:anchor" {
-		t.Fatalf("timeline anchor = %+v, error = %v", anchor, err)
-	}
-	probeCalls, err := os.ReadFile(probeCount)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Count(string(probeCalls), "x") != 1 {
-		t.Fatalf("keyframe probe calls = %q, want one", probeCalls)
+	manager.mu.RLock()
+	stream := manager.streams["playback-1"]
+	manager.mu.RUnlock()
+	if stream != nil {
+		t.Fatal("timeline-rejected HLS stream was exposed")
 	}
 }
 
-func TestProbeTimelineAnchorRejectsFutureIncidentKeyframe(t *testing.T) {
-	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
-cat <<'JSON'
-{"packets":[{"pts_time":"163.038","flags":"K__"},{"pts_time":"164.247","flags":"K__"}]}
-JSON
-`)
-	ffmpeg := writeExecutable(t, "ffmpeg", "#!/bin/sh\nexit 0\n")
-	manager, err := New(Config{
-		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
-		SourceBaseURL: "http://127.0.0.1:8943",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer manager.Close()
+func TestReadPackagerSourceAnchorUsesActualSeekPacketAndCommandRounding(t *testing.T) {
+	path := filepath.Join(t.TempDir(), sourceVideoAnchorFileName)
+	writeSourceAnchor(t, path, 1, 1000, 102085, 19417,
+		"8ef055e330d43f11d701fd5036450d7e504a5458bb8c54734ae0f8151047dd75")
 
-	anchor, err := manager.probeTimelineAnchor(
-		t.Context(), "http://source", 0, 163.98749558,
-	)
+	anchor, err := readPackagerSourceAnchor(path, 102.084867958)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if anchor.ptsSeconds != 163.038 {
-		t.Fatalf("timeline anchor = %.9f, want preceding keyframe 163.038", anchor.ptsSeconds)
+	if math.Abs(anchor.ptsSeconds-102.085) > timelineTimestampEpsilon || anchor.packetSize != 19417 ||
+		anchor.packetHash != "SHA256:8ef055e330d43f11d701fd5036450d7e504a5458bb8c54734ae0f8151047dd75" {
+		t.Fatalf("source anchor = %+v", anchor)
 	}
 }
 
-func TestProbeTimelineAnchorUsesMediaTimeForNonZeroContainerStart(t *testing.T) {
-	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
-case " $* " in
-  *" 103.750%+#1 "*) ;;
-  *) exit 2 ;;
-esac
-cat <<'JSON'
-{"packets":[{"pts_time":"103.000","flags":"K__"},{"pts_time":"104.000","flags":"K__"}]}
-JSON
-`)
-	ffmpeg := writeExecutable(t, "ffmpeg", "#!/bin/sh\nexit 0\n")
-	manager, err := New(Config{
-		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
-		SourceBaseURL: "http://127.0.0.1:8943",
-	})
-	if err != nil {
-		t.Fatal(err)
+func TestReadPackagerSourceAnchorUsesMediaTimeForNonZeroContainerStart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), sourceVideoAnchorFileName)
+	writeSourceAnchor(t, path, 1, 1000, 3000, 1234,
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	anchor, err := readPackagerSourceAnchor(path, 3.75)
+	if err != nil || math.Abs(anchor.ptsSeconds-3) > timelineTimestampEpsilon {
+		t.Fatalf("source anchor = %+v, error = %v, want media time 3", anchor, err)
 	}
-	defer manager.Close()
+}
 
-	anchor, err := manager.probeTimelineAnchor(t.Context(), "http://source", 100, 3.75)
-	if err != nil || anchor.ptsSeconds != 3 {
-		t.Fatalf("timeline anchor = %+v, error = %v, want media time 3", anchor, err)
+func TestReadPackagerSourceAnchorRejectsMissingAmbiguousAndInvalidPackets(t *testing.T) {
+	tests := []struct {
+		name      string
+		contents  string
+		requested float64
+		want      string
+	}{
+		{name: "missing", contents: "#tb 0: 1/1000\n", requested: 10, want: "no source video packet"},
+		{
+			name: "ambiguous",
+			contents: "#tb 0: 1/1000\n" +
+				"0, 9000, 9000, 41, 1234, aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n" +
+				"0, 9500, 9500, 41, 1234, bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+			requested: 10, want: "ambiguous source video packets",
+		},
+		{
+			name: "future packet",
+			contents: "#tb 0: 1/1000\n" +
+				"0, 102086, 102086, 41, 1234, aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+			requested: 102.084867958, want: "follows packager seek 102.085000",
+		},
+		{
+			name:      "invalid hash",
+			contents:  "#tb 0: 1/1000\n0, 9000, 9000, 41, 1234, not-a-hash\n",
+			requested: 10, want: "invalid source video packet hash",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), sourceVideoAnchorFileName)
+			if err := os.WriteFile(path, []byte(test.contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := readPackagerSourceAnchor(path, test.requested)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 
@@ -1625,6 +1821,26 @@ func TestManagerRejectsUnsafeAssetNames(t *testing.T) {
 	}
 	if !validAssetName("subtitle-6.vtt") {
 		t.Fatal("valid subtitle asset was rejected")
+	}
+}
+
+func writeSourceAnchor(
+	t *testing.T,
+	path string,
+	timeBaseNumerator int,
+	timeBaseDenominator int,
+	pts int64,
+	packetSize int,
+	packetHash string,
+) {
+	t.Helper()
+	contents := fmt.Sprintf(
+		"#format: frame checksums\n#version: 2\n#hash: SHA256\n#tb 0: %d/%d\n"+
+			"#stream#, dts, pts, duration, size, hash\n0, %d, %d, 41, %d, %s\n",
+		timeBaseNumerator, timeBaseDenominator, pts, pts, packetSize, packetHash,
+	)
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
