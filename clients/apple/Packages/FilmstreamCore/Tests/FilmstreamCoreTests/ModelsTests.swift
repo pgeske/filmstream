@@ -45,13 +45,15 @@ import Testing
 }
 
 @Test func decodesNativeHLSPlayback() throws {
-    let data = Data(#"{"playback_id":"abc123","playlist_url":"https://filmstream.example/v1/playbacks/abc123/hls/index.m3u8","requested_start_seconds":125,"start_seconds":120,"duration_seconds":7200,"video_codec":"h264","burned_subtitle_index":6,"subtitles":[{"index":6,"language":"en","title":"PGS SDH","codec":"hdmv_pgs_subtitle","kind":"bitmap"}]}"#.utf8)
+    let data = Data(#"{"playback_id":"abc123","playlist_url":"https://filmstream.example/v1/playbacks/abc123/hls/index.m3u8","requested_start_seconds":125,"start_seconds":119.917,"player_time_offset_seconds":0.083,"duration_seconds":7200,"video_codec":"h264","burned_subtitle_index":6,"subtitles":[{"index":6,"language":"en","title":"PGS SDH","codec":"hdmv_pgs_subtitle","kind":"bitmap"}]}"#.utf8)
     let playback = try JSONDecoder().decode(HLSPlayback.self, from: data)
     #expect(playback.id == "abc123")
     #expect(playback.requestedStartSeconds == 125)
-    #expect(playback.startSeconds == 120)
+    #expect(playback.startSeconds == 119.917)
+    #expect(playback.playerTimeOffsetSeconds == 0.083)
     #expect(playback.timeline.requestedSeconds == 125)
-    #expect(playback.timeline.originSeconds == 120)
+    #expect(playback.timeline.originSeconds == 119.917)
+    #expect(abs(playback.timeline.mediaOriginSeconds - 120) < 0.000_000_001)
     #expect(playback.timeline.playerSeconds(forMediaSeconds: 125) == 5)
     #expect(playback.timeline.playerSeconds(forMediaSeconds: 119) == -1)
     #expect(playback.timeline.mediaSeconds(forPlayerSeconds: 5) == 125)
@@ -60,6 +62,40 @@ import Testing
     #expect(playback.subtitles?.first?.language == "en")
     #expect(playback.subtitles?.first?.isBitmap == true)
     #expect(playback.burnedSubtitleIndex == 6)
+}
+
+@Test func mapsProductionResumeSubtitlesToAVPlayerTime() {
+    let cases = [
+        (
+            requested: 235.863280322,
+            packetOrigin: 234.485,
+            playerOffset: 0.083,
+            cueMediaTime: 237.070,
+            expectedInitialPlayerTime: 1.295280322,
+            expectedCuePlayerTime: 2.502
+        ),
+        (
+            requested: 93.35962768738253,
+            packetOrigin: 92.635,
+            playerOffset: 0.083,
+            cueMediaTime: 95.720,
+            expectedInitialPlayerTime: 0.64162768738253,
+            expectedCuePlayerTime: 3.002
+        ),
+    ]
+
+    for testCase in cases {
+        let timeline = HLSPlaybackTimeline(
+            requestedSeconds: testCase.requested,
+            originSeconds: testCase.packetOrigin,
+            playerTimeOffsetSeconds: testCase.playerOffset
+        )
+        let initialPlayerTime = timeline.playerSeconds(forMediaSeconds: testCase.requested)
+        let cuePlayerTime = timeline.playerSeconds(forMediaSeconds: testCase.cueMediaTime)
+        #expect(abs(initialPlayerTime - testCase.expectedInitialPlayerTime) < 0.000_000_001)
+        #expect(abs(cuePlayerTime - testCase.expectedCuePlayerTime) < 0.000_000_001)
+        #expect(abs(timeline.mediaSeconds(forPlayerSeconds: cuePlayerTime) - testCase.cueMediaTime) < 0.000_000_001)
+    }
 }
 
 @Test func parsesGrowingWebVTTOnFullMediaTimeline() {

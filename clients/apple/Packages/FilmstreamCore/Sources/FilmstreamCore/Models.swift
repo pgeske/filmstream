@@ -592,7 +592,8 @@ public struct HLSPlayback: Codable, Hashable, Identifiable, Sendable {
     public var timeline: HLSPlaybackTimeline {
         HLSPlaybackTimeline(
             requestedSeconds: requestedStartSeconds ?? startSeconds,
-            originSeconds: startSeconds
+            originSeconds: startSeconds,
+            playerTimeOffsetSeconds: playerTimeOffsetSeconds ?? 0
         )
     }
 
@@ -600,6 +601,7 @@ public struct HLSPlayback: Codable, Hashable, Identifiable, Sendable {
     public let playlistURL: URL
     public let requestedStartSeconds: Double?
     public let startSeconds: Double
+    public let playerTimeOffsetSeconds: Double?
     public let durationSeconds: Double?
     public let videoCodec: String
     public let subtitles: [HLSSubtitleTrack]?
@@ -610,6 +612,7 @@ public struct HLSPlayback: Codable, Hashable, Identifiable, Sendable {
         case playlistURL = "playlist_url"
         case requestedStartSeconds = "requested_start_seconds"
         case startSeconds = "start_seconds"
+        case playerTimeOffsetSeconds = "player_time_offset_seconds"
         case durationSeconds = "duration_seconds"
         case videoCodec = "video_codec"
         case subtitles
@@ -620,18 +623,29 @@ public struct HLSPlayback: Codable, Hashable, Identifiable, Sendable {
 public struct HLSPlaybackTimeline: Hashable, Sendable {
     public let requestedSeconds: Double
     public let originSeconds: Double
+    public let playerTimeOffsetSeconds: Double
 
-    public init(requestedSeconds: Double, originSeconds: Double) {
+    // AVPlayer reports the first playlist presentation timestamp as time zero.
+    public var mediaOriginSeconds: Double {
+        originSeconds + playerTimeOffsetSeconds
+    }
+
+    public init(
+        requestedSeconds: Double,
+        originSeconds: Double,
+        playerTimeOffsetSeconds: Double = 0
+    ) {
         self.requestedSeconds = max(0, requestedSeconds)
         self.originSeconds = max(0, originSeconds)
+        self.playerTimeOffsetSeconds = max(0, playerTimeOffsetSeconds)
     }
 
     public func mediaSeconds(forPlayerSeconds playerSeconds: Double) -> Double {
-        max(0, originSeconds + max(0, playerSeconds))
+        max(0, mediaOriginSeconds + max(0, playerSeconds))
     }
 
     public func playerSeconds(forMediaSeconds mediaSeconds: Double) -> Double {
-        mediaSeconds - originSeconds
+        mediaSeconds - mediaOriginSeconds
     }
 }
 
