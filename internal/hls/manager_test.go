@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -110,6 +111,93 @@ while :; do sleep 1; done
 	manager.Stop(stream.PlaybackID)
 	if _, err := manager.AssetPath(stream.PlaybackID, "index.m3u8"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("asset remained after stop: %v", err)
+	}
+}
+
+func TestManagerRebuildStopsPreviousSubtitleProcess(t *testing.T) {
+	subtitlePIDs := filepath.Join(t.TempDir(), "subtitle-pids")
+	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
+case " $* " in
+  *" concat:"*)
+    printf '{"packets":[{"stream_index":0,"pts_time":"0.000","dts_time":"0.000","flags":"K__"}],"streams":[{"index":0,"codec_type":"video","start_time":"0.000"}]}\n'
+    exit 0
+    ;;
+  *" -read_intervals "*)
+    printf '{"packets":[{"pts_time":"59.000","flags":"K__"}]}\n'
+    exit 0
+    ;;
+esac
+printf '{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]},{"index":3,"codec_name":"subrip","codec_type":"subtitle","tags":{"language":"eng"}}],"format":{"duration":"7200"}}\n'
+`)
+	ffmpeg := writeExecutable(t, "ffmpeg", fmt.Sprintf(`#!/bin/sh
+for last do :; done
+dir=$(dirname "$last")
+case "$last" in
+  *.vtt)
+    printf '%%s\n' "$$" >> %q
+    printf 'WEBVTT\n\n00:01.000 --> 00:02.000\nCurrent cue\n' > "$last"
+    ;;
+  *)
+    printf init > "$dir/init.mp4"
+    printf segment > "$dir/segment-000000.m4s"
+    printf '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:4.0,\nsegment-000000.m4s\n' > "$dir/index.m3u8"
+    ;;
+esac
+while :; do sleep 1; done
+`, subtitlePIDs))
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943", StartupTimeout: 5 * time.Second,
+		BufferSeconds: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	if _, err := manager.Start(t.Context(), "playback-1", 0, nil, -1); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.StartSubtitle(t.Context(), "playback-1", 3); err != nil {
+		t.Fatal(err)
+	}
+	var firstPID int
+	deadline := time.Now().Add(time.Second)
+	for firstPID == 0 && time.Now().Before(deadline) {
+		contents, readErr := os.ReadFile(subtitlePIDs)
+		if readErr == nil {
+			firstPID, _ = strconv.Atoi(strings.TrimSpace(string(contents)))
+		}
+		if firstPID == 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if firstPID == 0 {
+		t.Fatal("first subtitle process did not start")
+	}
+
+	if _, err := manager.Start(t.Context(), "playback-1", 60, nil, -1); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(firstPID, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("old subtitle process %d survived rebuild: %v", firstPID, err)
+	}
+	if err := manager.StartSubtitle(t.Context(), "playback-1", 3); err != nil {
+		t.Fatal(err)
+	}
+	var pids []string
+	deadline = time.Now().Add(time.Second)
+	for len(pids) < 2 && time.Now().Before(deadline) {
+		contents, readErr := os.ReadFile(subtitlePIDs)
+		if readErr == nil {
+			pids = strings.Fields(string(contents))
+		}
+		if len(pids) < 2 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if len(pids) != 2 || pids[0] == pids[1] {
+		t.Fatalf("subtitle process IDs after rebuild = %v, want two owners", pids)
 	}
 }
 
@@ -944,11 +1032,13 @@ Dialogue: 0,0:00:04.80,0:00:06.20,Default,,0,0,0,,Following cue
 			t.Fatalf("WebVTT cue %d starts at %.6f, want full-media time %.3f", index, cueStarts[index], want)
 		}
 	}
-	// At the following authored cue, the HLS media clock and the full-media
-	// WebVTT clock now meet exactly through the one measured origin transform.
-	hlsCueTime := 4.8 - stream.TimelineOriginSeconds
-	if difference := math.Abs(stream.TimelineOriginSeconds + hlsCueTime - cueStarts[1]); difference > 0.001 {
-		t.Fatalf("HLS/WebVTT alignment differs by %.6fs", difference)
+	// AVPlayer exposes playlist-relative time zero rather than the first fMP4
+	// packet PTS. Restoring that offset keeps its clock on the source timeline.
+	playerCueTime := 4.8 - stream.TimelineOriginSeconds - stream.PlayerTimeOffsetSeconds
+	if difference := math.Abs(
+		stream.TimelineOriginSeconds + stream.PlayerTimeOffsetSeconds + playerCueTime - cueStarts[1],
+	); difference > 0.001 {
+		t.Fatalf("player/WebVTT alignment differs by %.6fs", difference)
 	}
 }
 
@@ -987,7 +1077,7 @@ func parseWebVTTCueStarts(t *testing.T, contents string) []float64 {
 func TestFFmpegArgsPaceInputAndTagHEVC(t *testing.T) {
 	manager := &Manager{bufferSeconds: 16, readRate: 1.25, segmentSeconds: 4}
 	timeline := newPlaybackTimeline(30)
-	timeline.setSourceVideoPTS(30)
+	timeline.setSourceVideoAnchor(sourceVideoAnchor{ptsSeconds: 30})
 	args := strings.Join(manager.ffmpegArgs("http://source", t.TempDir(), "hevc", timeline, 2, -1), " ")
 	for _, expected := range []string{
 		"-copyts -start_at_zero", "-readrate 1.25", "-readrate_initial_burst 20",
@@ -1009,7 +1099,7 @@ func TestFFmpegArgsBurnBitmapSubtitlesWithNVENC(t *testing.T) {
 		bitmapSubtitleEncoder: "h264_nvenc",
 	}
 	timeline := newPlaybackTimeline(30)
-	timeline.setSourceVideoPTS(30)
+	timeline.setSourceVideoAnchor(sourceVideoAnchor{ptsSeconds: 30})
 	args := strings.Join(manager.ffmpegArgs("http://source", t.TempDir(), "hevc", timeline, 2, 5), " ")
 	for _, expected := range []string{
 		"-copyts -start_at_zero", "-filter_complex [0:v:0][0:5]overlay=eof_action=pass[v]",
@@ -1029,7 +1119,7 @@ func TestFFmpegArgsBurnBitmapSubtitlesWithNVENC(t *testing.T) {
 func TestSubtitleArgsKeepCuesOnFullMediaTimeline(t *testing.T) {
 	manager := &Manager{bufferSeconds: 16, readRate: 1.25, segmentSeconds: 4}
 	timeline := newPlaybackTimeline(120)
-	timeline.setSourceVideoPTS(118.5)
+	timeline.setSourceVideoAnchor(sourceVideoAnchor{ptsSeconds: 118.5})
 	stream := &runningStream{
 		info:      Stream{TimelineOriginSeconds: 118.458},
 		dir:       t.TempDir(),
@@ -1047,6 +1137,97 @@ func TestSubtitleArgsKeepCuesOnFullMediaTimeline(t *testing.T) {
 	}
 	if strings.Contains(args, "-output_ts_offset") {
 		t.Fatalf("subtitle conversion rebases full-media cue timestamps: %s", args)
+	}
+}
+
+func TestPlaybackTimelineMapsProductionResumeGapsToPlayerTime(t *testing.T) {
+	tests := []struct {
+		name                  string
+		requested             float64
+		sourceVideoPTS        float64
+		packagedVideoPTS      float64
+		wantPacketOrigin      float64
+		wantRequestedGap      float64
+		wantInitialPlayerTime float64
+		cueMediaTime          float64
+		wantCuePlayerTime     float64
+	}{
+		{
+			name: "235 second resume", requested: 235.863280322,
+			sourceVideoPTS: 234.568, packagedVideoPTS: 0.083,
+			wantPacketOrigin: 234.485, wantRequestedGap: 1.378280322,
+			wantInitialPlayerTime: 1.295280322,
+			cueMediaTime:          237.070, wantCuePlayerTime: 2.502,
+		},
+		{
+			name: "93 second rebuild", requested: 93.35962768738253,
+			sourceVideoPTS: 92.718, packagedVideoPTS: 0.083,
+			wantPacketOrigin: 92.635, wantRequestedGap: 0.72462768738253,
+			wantInitialPlayerTime: 0.64162768738253,
+			cueMediaTime:          95.720, wantCuePlayerTime: 3.002,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			timeline := newPlaybackTimeline(test.requested)
+			timeline.setSourceVideoAnchor(sourceVideoAnchor{ptsSeconds: test.sourceVideoPTS})
+			if err := timeline.alignToPackagedVideo(
+				packagedTimelineStart{videoPTS: test.packagedVideoPTS}, false,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if difference := math.Abs(timeline.originSeconds - test.wantPacketOrigin); difference > 1e-9 {
+				t.Fatalf("packet origin = %.12f, want %.12f", timeline.originSeconds, test.wantPacketOrigin)
+			}
+			if difference := math.Abs(
+				test.requested - timeline.originSeconds - test.wantRequestedGap,
+			); difference > 1e-9 {
+				t.Fatalf("requested/origin gap differs by %.12fs", difference)
+			}
+			if difference := math.Abs(
+				timeline.playerSecondsForMedia(test.requested) - test.wantInitialPlayerTime,
+			); difference > 1e-9 {
+				t.Fatalf("initial player time differs by %.12fs", difference)
+			}
+			if difference := math.Abs(
+				timeline.playerSecondsForMedia(test.cueMediaTime) - test.wantCuePlayerTime,
+			); difference > 1e-9 {
+				t.Fatalf("cue player time differs by %.12fs", difference)
+			}
+		})
+	}
+}
+
+func TestPlaybackTimelineRejectsDifferentPackagedKeyframe(t *testing.T) {
+	timeline := newPlaybackTimeline(235.863280322)
+	timeline.setSourceVideoAnchor(sourceVideoAnchor{
+		ptsSeconds: 234.568,
+		packetSize: 44398,
+		packetHash: "SHA256:source",
+	})
+	err := timeline.alignToPackagedVideo(packagedTimelineStart{
+		videoPTS: 0.083, videoPacketSize: 44398, videoPacketHash: "SHA256:previous",
+	}, true)
+	if err == nil || !strings.Contains(err.Error(), "different source video keyframe") {
+		t.Fatalf("packaged keyframe error = %v", err)
+	}
+}
+
+func TestVideoAndSubtitleSeekDifferentCoordinates(t *testing.T) {
+	manager := &Manager{bufferSeconds: 12, readRate: 1.25, segmentSeconds: 4}
+	timeline := newPlaybackTimeline(235.863280322)
+	timeline.setSourceVideoAnchor(sourceVideoAnchor{ptsSeconds: 234.568})
+	videoArgs := strings.Join(
+		manager.ffmpegArgs("http://source", t.TempDir(), "hevc", timeline, 1, -1), " ",
+	)
+	if !strings.Contains(videoArgs, "-noaccurate_seek -ss 235.863") ||
+		strings.Contains(videoArgs, "-ss 234.568") {
+		t.Fatalf("video packager does not seek to the request: %s", videoArgs)
+	}
+	stream := &runningStream{dir: t.TempDir(), sourceURL: "http://source", timeline: timeline}
+	subtitleArgs := strings.Join(manager.subtitleArgs(stream, 2), " ")
+	if !strings.Contains(subtitleArgs, "-noaccurate_seek -ss 234.568") {
+		t.Fatalf("subtitle conversion does not include the video anchor: %s", subtitleArgs)
 	}
 }
 
@@ -1138,8 +1319,8 @@ while :; do sleep 1; done
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The packager sought to 43.7 and landed on the 42.0 keyframe. The packaged
-	// probe reports that keyframe at HLS time zero, so the canonical origin is 42.
+	// The packager seeks to 43.7 and lands on the 42.0 keyframe. It must not seek
+	// to 42.0 again, because that can land one additional keyframe back.
 	if stream.RequestedStartSeconds != 43.7 || stream.TimelineOriginSeconds != 42.0 {
 		t.Fatalf("stream = %+v, want origin 42.0 for requested 43.7", stream)
 	}
@@ -1290,16 +1471,16 @@ JSON
 	}
 }
 
-func TestProbeTimelineAnchorSelectsLatestPrecedingKeyframeInOnePass(t *testing.T) {
+func TestProbeTimelineAnchorUsesRequestedSeekLandingInOnePass(t *testing.T) {
 	probeCount := filepath.Join(t.TempDir(), "probe-count")
 	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
 printf 'x\n' >> %q
 case " $* " in
-  *" 509.000%%569.000 "*) ;;
+  *" 569.000%%+#1 "*) ;;
   *) exit 2 ;;
 esac
 cat <<'JSON'
-{"packets":[{"pts_time":"540.540","flags":"K__"},{"pts_time":"568.568","flags":"K__"},{"pts_time":"632.382","flags":"K__"}]}
+{"packets":[{"pts_time":"568.568","size":"1234","flags":"K__","data_hash":"SHA256:anchor"}]}
 JSON
 `, probeCount))
 	ffmpeg := writeExecutable(t, "ffmpeg", "#!/bin/sh\nexit 0\n")
@@ -1313,8 +1494,9 @@ JSON
 	defer manager.Close()
 
 	anchor, err := manager.probeTimelineAnchor(t.Context(), "http://source", 0, 569)
-	if err != nil || anchor != 568.568 {
-		t.Fatalf("timeline anchor = %v, error = %v", anchor, err)
+	if err != nil || anchor.ptsSeconds != 568.568 || anchor.packetSize != 1234 ||
+		anchor.packetHash != "SHA256:anchor" {
+		t.Fatalf("timeline anchor = %+v, error = %v", anchor, err)
 	}
 	probeCalls, err := os.ReadFile(probeCount)
 	if err != nil {
@@ -1347,15 +1529,15 @@ JSON
 	if err != nil {
 		t.Fatal(err)
 	}
-	if anchor != 163.038 {
-		t.Fatalf("timeline anchor = %.9f, want preceding keyframe 163.038", anchor)
+	if anchor.ptsSeconds != 163.038 {
+		t.Fatalf("timeline anchor = %.9f, want preceding keyframe 163.038", anchor.ptsSeconds)
 	}
 }
 
 func TestProbeTimelineAnchorUsesMediaTimeForNonZeroContainerStart(t *testing.T) {
 	ffprobe := writeExecutable(t, "ffprobe", `#!/bin/sh
 case " $* " in
-  *" 100.000%103.750 "*) ;;
+  *" 103.750%+#1 "*) ;;
   *) exit 2 ;;
 esac
 cat <<'JSON'
@@ -1373,8 +1555,8 @@ JSON
 	defer manager.Close()
 
 	anchor, err := manager.probeTimelineAnchor(t.Context(), "http://source", 100, 3.75)
-	if err != nil || anchor != 3 {
-		t.Fatalf("timeline anchor = %v, error = %v, want media time 3", anchor, err)
+	if err != nil || anchor.ptsSeconds != 3 {
+		t.Fatalf("timeline anchor = %+v, error = %v, want media time 3", anchor, err)
 	}
 }
 
