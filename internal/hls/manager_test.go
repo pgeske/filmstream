@@ -1,9 +1,11 @@
 package hls
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -536,12 +538,18 @@ segment-000001.m4s
 #EXTINF:4.0,
 segment-000002.m4s
 PLAYLIST
+sleep 0.2
+printf 'segment' > "$dir/segment-000003.m4s"
+cat >> "$dir/index.m3u8" <<'PLAYLIST'
+#EXTINF:4.0,
+segment-000003.m4s
+PLAYLIST
 while :; do sleep 1; done
 `, packagerCount))
 	manager, err := New(Config{
 		DataDir: t.TempDir(), FFmpegPath: ffmpeg, FFprobePath: ffprobe,
 		SourceBaseURL: "http://127.0.0.1:8943", StartupTimeout: 5 * time.Second,
-		BufferSeconds: 4,
+		BufferSeconds: 4, ParkedResumeTimeout: time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -597,6 +605,120 @@ while :; do sleep 1; done
 	}
 	if strings.Count(string(probeCalls), "x") != 1 {
 		t.Fatalf("probe calls = %q, want the cached source probe only", probeCalls)
+	}
+}
+
+func TestManagerRejectsStalePreparedStreams(t *testing.T) {
+	packagerCount := filepath.Join(t.TempDir(), "packager-count")
+	probeCount := filepath.Join(t.TempDir(), "probe-count")
+	ffprobe := writeExecutable(t, "ffprobe", fmt.Sprintf(`#!/bin/sh
+case " $* " in
+  *" concat:"*)
+    printf '{"packets":[{"stream_index":0,"pts_time":"0.000","dts_time":"0.000","size":"1234","flags":"K__","data_hash":"SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"streams":[{"index":0,"codec_type":"video","start_time":"0.000"}]}\n'
+    exit 0
+    ;;
+esac
+printf 'x\n' >> %q
+cat <<'JSON'
+{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","side_data_list":[]}],"format":{"duration":"7200"}}
+JSON
+`, probeCount))
+	ffmpeg := writeExecutable(t, "ffmpeg", fmt.Sprintf(`#!/bin/sh
+printf 'x\n' >> %q
+for last do :; done
+dir=$(dirname "$last")
+cat > "$dir/source-video-anchor.framehash" <<'ANCHOR'
+#tb 0: 1/1000
+0, 0, 0, 41, 1234, aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ANCHOR
+printf 'init' > "$dir/init.mp4"
+printf 'segment' > "$dir/segment-000000.m4s"
+printf 'segment' > "$dir/segment-000001.m4s"
+printf 'segment' > "$dir/segment-000002.m4s"
+cat > "$dir/index.m3u8" <<'PLAYLIST'
+#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:4.0,
+segment-000000.m4s
+#EXTINF:4.0,
+segment-000001.m4s
+#EXTINF:4.0,
+segment-000002.m4s
+PLAYLIST
+while :; do sleep 1; done
+`, packagerCount))
+	dataDir := t.TempDir()
+	var logs bytes.Buffer
+	errSourceStalled := errors.New("torrent source stalled")
+	var markedCauses []error
+	manager, err := New(Config{
+		DataDir: dataDir, FFmpegPath: ffmpeg, FFprobePath: ffprobe,
+		SourceBaseURL: "http://127.0.0.1:8943", StartupTimeout: 5 * time.Second,
+		BufferSeconds: 4, ParkedResumeTimeout: 100 * time.Millisecond,
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+		SourceStalled: func(playbackID string, cause error) error {
+			if playbackID != "playback-1" {
+				t.Errorf("stalled playback ID = %q", playbackID)
+			}
+			markedCauses = append(markedCauses, cause)
+			if len(markedCauses) == 1 {
+				return nil
+			}
+			return errSourceStalled
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	if _, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1); err != nil {
+		t.Fatal(err)
+	}
+	playlistPath := filepath.Join(dataDir, "playback-1", "index.m3u8")
+	staleTime := time.Now().Add(-time.Second)
+	if err := os.Chtimes(playlistPath, staleTime, staleTime); err != nil {
+		t.Fatal(err)
+	}
+
+	rebuilt, err := manager.Start(t.Context(), "playback-1", 6, []string{"en"}, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rebuilt.RequestedStartSeconds != 6 || len(markedCauses) != 1 ||
+		!strings.Contains(markedCauses[0].Error(), "covered HLS stream did not advance") {
+		t.Fatalf("covered recovery = %+v, marked causes = %v", rebuilt, markedCauses)
+	}
+	staleTime = time.Now().Add(-time.Second)
+	if err := os.Chtimes(playlistPath, staleTime, staleTime); err != nil {
+		t.Fatal(err)
+	}
+	_, err = manager.Start(t.Context(), "playback-1", 6, []string{"en"}, -1)
+	if !errors.Is(err, errSourceStalled) {
+		t.Fatalf("stalled recovery error = %v, want %v", err, errSourceStalled)
+	}
+	if len(markedCauses) != 2 ||
+		!strings.Contains(markedCauses[1].Error(), "prepared HLS stream did not advance") {
+		t.Fatalf("marked source causes = %v", markedCauses)
+	}
+	packagerCalls, err := os.ReadFile(packagerCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probeCalls, err := os.ReadFile(probeCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(packagerCalls), "x") != 2 {
+		t.Fatalf("packager calls = %q, want one covered-range rebuild", packagerCalls)
+	}
+	if strings.Count(string(probeCalls), "x") != 1 {
+		t.Fatalf("probe calls = %q, want the cached source probe only", probeCalls)
+	}
+	if output := logs.String(); !strings.Contains(output, "covered HLS stream did not advance") ||
+		!strings.Contains(output, "prepared HLS stream did not advance") {
+		t.Fatalf("stale stream rejection was not logged: %s", output)
 	}
 }
 

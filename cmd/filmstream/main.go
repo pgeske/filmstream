@@ -163,6 +163,7 @@ func runServer(args []string) error {
 		BitmapSubtitleEncoder: *bitmapSubtitleEncoder,
 		LocalSourcePath:       engine.LocalFilePath,
 		SourceUnavailable:     engine.SourceUnavailable,
+		SourceStalled:         engine.MarkSourceUnavailable,
 		Logger:                logger,
 	})
 	if hlsErr != nil {

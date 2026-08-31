@@ -427,6 +427,35 @@ func TestEngineRemovesPartFileShadowingCompleteMedia(t *testing.T) {
 	}
 }
 
+func TestEngineMarksAStalledHLSPlaybackUnavailable(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentPath, _, _ := createTestTorrent(t, dataDir)
+	engine := newTestEngine(t, dataDir, Config{})
+	defer engine.Close()
+	session, err := engine.Create(t.Context(), Source{TorrentPath: torrentPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cause := errors.New("covered HLS stream did not advance")
+	unavailable := engine.MarkSourceUnavailable(session.ID, cause)
+	if !errors.Is(unavailable, ErrSourceUnavailable) || !errors.Is(unavailable, cause) {
+		t.Fatalf("marked source error = %v", unavailable)
+	}
+	if got := engine.SourceUnavailable(session.ID); got != unavailable {
+		t.Fatalf("stored source error = %v, want %v", got, unavailable)
+	}
+	status, ok := engine.Status(session.ID)
+	if !ok || !status.SourceUnavailable {
+		t.Fatalf("source status = %+v, found = %v", status, ok)
+	}
+
+	second := engine.MarkSourceUnavailable(session.ID, errors.New("second stall"))
+	if second != unavailable {
+		t.Fatalf("second source error = %v, want original %v", second, unavailable)
+	}
+}
+
 func TestEngineFailsFastWhenSwarmCannotServeReads(t *testing.T) {
 	dataDir := t.TempDir()
 	torrentPath, videoPath, _ := createTestTorrent(t, dataDir)

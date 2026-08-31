@@ -636,6 +636,42 @@ func (e *Engine) SourceUnavailable(id string) error {
 	return session.serveUnavailable
 }
 
+// MarkSourceUnavailable records a source that connected for startup but later
+// stopped advancing its HLS playlist. The failure remains session-wide so
+// recovery cannot keep replaying cached ranges from the same stalled release.
+func (e *Engine) MarkSourceUnavailable(id string, cause error) error {
+	e.mu.RLock()
+	session, ok := e.sessions[id]
+	e.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	if cause == nil {
+		cause = errors.New("source stopped advancing")
+	}
+
+	e.serveMu.Lock()
+	if session.serveUnavailable != nil {
+		err := session.serveUnavailable
+		e.serveMu.Unlock()
+		return err
+	}
+	err := fmt.Errorf("%w: %w", ErrSourceUnavailable, cause)
+	session.serveUnavailable = err
+	deadline := session.serveDeadline
+	e.serveMu.Unlock()
+
+	stats := session.torrent.Stats()
+	e.logger.Warn("playback source stopped advancing",
+		"name", session.Name, "file", session.FileName,
+		"info_hash", session.torrent.InfoHash().HexString(),
+		"connected_peers", stats.ActivePeers, "connected_seeders", stats.ConnectedSeeders,
+		"total_peers", stats.TotalPeers, "pending_peers", stats.PendingPeers,
+		"half_open_peers", stats.HalfOpenPeers, "cached_percent", localCoveragePercent(session),
+		"serve_deadline", deadline, "error", cause)
+	return err
+}
+
 func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request, id string) error {
 	session, ok := e.beginStream(id, r.Method != http.MethodHead)
 	if !ok {
