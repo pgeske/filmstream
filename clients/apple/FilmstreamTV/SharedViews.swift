@@ -527,25 +527,12 @@ private struct NetflixShelfCard: View {
     }
 
     private var artwork: some View {
-        ZStack {
-            if isExpanded {
-                NetflixShelfArtwork(
-                    movie: item.movie,
-                    landscape: true,
-                    width: cardWidth,
-                    height: NetflixShelfLayout.artworkHeight
-                )
-                .transition(.opacity)
-            } else {
-                NetflixShelfArtwork(
-                    movie: item.movie,
-                    landscape: false,
-                    width: cardWidth,
-                    height: NetflixShelfLayout.artworkHeight
-                )
-                .transition(.opacity)
-            }
-        }
+        NetflixShelfArtwork(
+            movie: item.movie,
+            landscape: isExpanded,
+            width: cardWidth,
+            height: NetflixShelfLayout.artworkHeight
+        )
         .animation(.easeInOut(duration: 0.2), value: isExpanded)
     }
 }
@@ -557,25 +544,24 @@ private struct NetflixShelfArtwork: View {
     let height: CGFloat
 
     var body: some View {
-        AsyncImage(url: landscape ? (movie.backdropURL ?? movie.posterURL) : (movie.posterURL ?? movie.backdropURL)) { phase in
-            switch phase {
-            case let .success(image):
-                image
-                    .resizable()
-                    .scaledToFill()
-            case .empty:
-                ZStack {
+        ArtworkImage(
+            request: ArtworkRequest(
+                posterURL: movie.posterURL,
+                backdropURL: movie.backdropURL,
+                preference: landscape ? .backdrop : .poster
+            )
+        ) { isLoading in
+            ZStack {
+                if isLoading {
                     Color.teaPanel
                     ProgressView()
                         .tint(Color.teaAccent)
-                }
-            default:
-                LinearGradient(
-                    colors: [Color.teaPanelElevated, Color.teaBackground],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-                .overlay {
+                } else {
+                    LinearGradient(
+                        colors: [Color.teaPanelElevated, Color.teaBackground],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
                     Image(systemName: "film.stack")
                         .font(.system(size: 52))
                         .foregroundStyle(Color.teaAccentLight.opacity(0.38))
@@ -592,6 +578,32 @@ private struct NetflixShelfArtwork: View {
             )
         }
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+}
+
+struct ArtworkImage<Placeholder: View>: View {
+    let request: ArtworkRequest
+    @ViewBuilder let placeholder: (Bool) -> Placeholder
+
+    @State private var state = ArtworkLoadState()
+
+    var body: some View {
+        Group {
+            if let resource = state.resource,
+               let image = UIImage(data: resource.data) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .id(resource.sourceURL)
+                    .transition(.opacity)
+            } else {
+                placeholder(state.isLoading)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: state.resource?.sourceURL)
+        .task(id: request) {
+            await state.load(request)
+        }
     }
 }
 
@@ -700,76 +712,32 @@ struct MovieNavigationCard: View {
 struct PosterImage: View {
     let movie: Movie
 
-    @State private var imageData: Data?
-    @State private var isLoading = false
-
     var body: some View {
-        Group {
-            if let imageData, let image = UIImage(data: imageData) {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFill()
-            } else if isLoading {
-                ZStack {
+        ArtworkImage(
+            request: ArtworkRequest(
+                posterURL: movie.posterURL,
+                backdropURL: movie.backdropURL,
+                preference: .poster
+            )
+        ) { isLoading in
+            ZStack {
+                if isLoading {
                     Color.teaPanel
                     ProgressView()
+                        .tint(Color.teaAccent)
+                } else {
+                    LinearGradient(
+                        colors: [Color.teaPanelElevated, Color.teaBackground],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                    Image(systemName: "film.stack")
+                        .font(.system(size: 54))
+                        .foregroundStyle(Color.teaAccentLight.opacity(0.38))
                 }
-            } else {
-                placeholder
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .task(id: movie) {
-            await loadArtwork()
-        }
-    }
-
-    private var placeholder: some View {
-        ZStack {
-            LinearGradient(
-                colors: [Color.teaPanelElevated, Color.teaBackground],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            Image(systemName: "film.stack")
-                .font(.system(size: 54))
-                .foregroundStyle(Color.teaAccentLight.opacity(0.38))
-        }
-    }
-
-    private func loadArtwork() async {
-        imageData = nil
-        let urls = [movie.posterURL, movie.backdropURL].compactMap { $0 }
-        guard !urls.isEmpty else { return }
-
-        isLoading = true
-        defer { isLoading = false }
-        for url in urls {
-            for attempt in 0..<2 {
-                do {
-                    var request = URLRequest(
-                        url: url,
-                        cachePolicy: attempt == 0 ? .returnCacheDataElseLoad : .reloadIgnoringLocalCacheData,
-                        timeoutInterval: 20
-                    )
-                    request.setValue("image/avif,image/webp,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
-                    let (data, response) = try await URLSession.shared.data(for: request)
-                    guard let response = response as? HTTPURLResponse,
-                          (200..<300).contains(response.statusCode),
-                          UIImage(data: data) != nil else {
-                        continue
-                    }
-                    imageData = data
-                    return
-                } catch is CancellationError {
-                    return
-                } catch {
-                    if attempt == 0 {
-                        try? await Task.sleep(for: .milliseconds(350))
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -777,18 +745,18 @@ struct BackdropImage: View {
     let movie: Movie
 
     var body: some View {
-        AsyncImage(url: movie.backdropURL) { phase in
-            if case let .success(image) = phase {
-                image
-                    .resizable()
-                    .scaledToFill()
-            } else {
-                LinearGradient(
-                    colors: [Color.teaPanelElevated, Color.teaBackground],
-                    startPoint: .topTrailing,
-                    endPoint: .bottomLeading
-                )
-            }
+        ArtworkImage(
+            request: ArtworkRequest(
+                posterURL: movie.posterURL,
+                backdropURL: movie.backdropURL,
+                preference: .backdrop
+            )
+        ) { _ in
+            LinearGradient(
+                colors: [Color.teaPanelElevated, Color.teaBackground],
+                startPoint: .topTrailing,
+                endPoint: .bottomLeading
+            )
         }
     }
 }

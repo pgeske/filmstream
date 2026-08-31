@@ -363,23 +363,16 @@ private struct EpisodeStillImage: View {
     let episode: Episode
 
     var body: some View {
-        AsyncImage(url: episode.stillURL) { phase in
-            switch phase {
-            case let .success(image):
-                image
-                    .resizable()
-                    .scaledToFill()
-            default:
-                ZStack {
-                    LinearGradient(
-                        colors: [Color.teaPanelElevated, Color.teaPanel],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                    Image(systemName: "play.rectangle.fill")
-                        .font(.system(size: 42))
-                        .foregroundStyle(Color.teaAccent.opacity(0.7))
-                }
+        ArtworkImage(request: ArtworkRequest(urls: [episode.stillURL].compactMap { $0 })) { _ in
+            ZStack {
+                LinearGradient(
+                    colors: [Color.teaPanelElevated, Color.teaPanel],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                Image(systemName: "play.rectangle.fill")
+                    .font(.system(size: 42))
+                    .foregroundStyle(Color.teaAccent.opacity(0.7))
             }
         }
     }
