@@ -44,6 +44,7 @@ type Config struct {
 	BitmapSubtitleEncoder string
 	LocalSourcePath       func(string) (string, bool)
 	SourceUnavailable     func(string) error
+	SourceStalled         func(string, error) error
 }
 
 type Stream struct {
@@ -82,6 +83,7 @@ type Manager struct {
 	bitmapSubtitleEncoder string
 	localSourcePath       func(string) (string, bool)
 	sourceUnavailable     func(string) error
+	sourceStalled         func(string, error) error
 
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -315,6 +317,7 @@ func New(cfg Config) (*Manager, error) {
 		bitmapSubtitleEncoder: cfg.BitmapSubtitleEncoder,
 		localSourcePath:       cfg.LocalSourcePath,
 		sourceUnavailable:     cfg.SourceUnavailable,
+		sourceStalled:         cfg.SourceStalled,
 		ctx:                   ctx,
 		cancel:                cancel,
 		streams:               make(map[string]*runningStream),
@@ -388,10 +391,15 @@ func (m *Manager) Start(
 	); matched {
 		return stream, err
 	}
-	if stream, covered := m.resumeCoveredStream(
-		playbackID, startSeconds, preferredLanguages, bitmapSubtitleIndex,
-	); covered {
-		return stream, nil
+	coveredStream, covered, err := m.resumeCoveredStream(
+		startupContext, playbackID, startSeconds, preferredLanguages, bitmapSubtitleIndex,
+	)
+	if err != nil {
+		m.stopPlaybackStream(playbackID)
+		return Stream{}, err
+	}
+	if covered {
+		return coveredStream, nil
 	}
 	m.stopPlaybackStream(playbackID)
 
@@ -524,6 +532,25 @@ func (m *Manager) Start(
 	return stream.info, nil
 }
 
+func (m *Manager) preparedStreamNeedsGrowth(
+	stream *runningStream,
+	wasParked bool,
+	complete bool,
+) bool {
+	if complete || wasParked {
+		return wasParked
+	}
+	playlistInfo, err := os.Stat(filepath.Join(stream.dir, "index.m3u8"))
+	return err != nil || time.Since(playlistInfo.ModTime()) > m.parkedResumeTimeout
+}
+
+func (m *Manager) sourceStallError(playbackID string, cause error) error {
+	if m.sourceStalled == nil {
+		return nil
+	}
+	return m.sourceStalled(playbackID, cause)
+}
+
 func (m *Manager) resumePreparedStream(
 	ctx context.Context,
 	playbackID string,
@@ -555,7 +582,8 @@ func (m *Manager) resumePreparedStream(
 		return Stream{}, false, nil
 	}
 	wasParked := stream.parked
-	bufferedSegments, _, _ := playlistStatus(stream.dir)
+	bufferedSegments, _, complete := playlistStatus(stream.dir)
+	needsGrowth := m.preparedStreamNeedsGrowth(stream, wasParked, complete)
 	if wasParked {
 		if err := stream.command.Process.Signal(syscall.SIGCONT); err != nil {
 			stream.processMu.Unlock()
@@ -574,11 +602,18 @@ func (m *Manager) resumePreparedStream(
 	}
 	stream.processMu.Unlock()
 
-	if wasParked {
+	if needsGrowth {
 		if err := m.waitForPlaylistGrowth(ctx, stream, bufferedSegments); err != nil {
-			m.logger.Warn("prepared HLS source did not resume; rebuilding stream",
-				"playback_id", playbackID, "error", err)
+			stalledErr := fmt.Errorf("prepared HLS stream did not advance: %w", err)
+			m.logger.Warn("prepared HLS stream did not advance",
+				"playback_id", playbackID, "requested_start_seconds", startSeconds,
+				"error", err)
 			m.stopPlaybackStream(playbackID)
+			if !wasParked {
+				if sourceErr := m.sourceStallError(playbackID, stalledErr); sourceErr != nil {
+					return Stream{}, true, sourceErr
+				}
+			}
 			return Stream{}, false, nil
 		}
 	}
@@ -619,32 +654,34 @@ func (m *Manager) Prepared(
 }
 
 func (m *Manager) resumeCoveredStream(
+	ctx context.Context,
 	playbackID string,
 	startSeconds float64,
 	preferredLanguages []string,
 	bitmapSubtitleIndex int,
-) (Stream, bool) {
+) (Stream, bool, error) {
 	m.mu.RLock()
 	stream := m.streams[playbackID]
 	m.mu.RUnlock()
 	if stream == nil || !equalStrings(stream.languages, preferredLanguages) ||
 		stream.bitmapSubtitleIndex != bitmapSubtitleIndex {
-		return Stream{}, false
+		return Stream{}, false, nil
 	}
 	stream.processMu.Lock()
-	defer stream.processMu.Unlock()
 	select {
 	case <-stream.done:
-		return Stream{}, false
+		stream.processMu.Unlock()
+		return Stream{}, false, nil
 	default:
 	}
 	m.mu.RLock()
 	isCurrent := m.streams[playbackID] == stream
 	m.mu.RUnlock()
 	if !isCurrent {
-		return Stream{}, false
+		stream.processMu.Unlock()
+		return Stream{}, false, nil
 	}
-	_, packagedSeconds, _ := playlistStatus(stream.dir)
+	bufferedSegments, packagedSeconds, complete := playlistStatus(stream.dir)
 	position := stream.timeline.playerSecondsForMedia(startSeconds)
 	// The event playlist retains every packaged segment, so a request inside
 	// the packaged range (with one segment of headroom) can seek within the
@@ -653,16 +690,19 @@ func (m *Manager) resumeCoveredStream(
 	// throw away the buffer and re-probe the source at the worst possible time.
 	headroom := float64(m.segmentSeconds)
 	if position < 0 || position > packagedSeconds-headroom {
+		stream.processMu.Unlock()
 		m.logger.Info("prepared HLS stream does not cover requested position; rebuilding",
 			"playback_id", playbackID, "requested_start_seconds", startSeconds,
 			"timeline_origin_seconds", stream.info.TimelineOriginSeconds,
 			"packaged_seconds", packagedSeconds)
-		return Stream{}, false
+		return Stream{}, false, nil
 	}
-	if stream.parked {
+	wasParked := stream.parked
+	if wasParked {
 		if err := stream.command.Process.Signal(syscall.SIGCONT); err != nil {
+			stream.processMu.Unlock()
 			m.logger.Warn("resume covered HLS stream", "playback_id", playbackID, "error", err)
-			return Stream{}, false
+			return Stream{}, false, nil
 		}
 		stream.parked = false
 		stream.parkedAt = time.Time{}
@@ -671,14 +711,37 @@ func (m *Manager) resumeCoveredStream(
 			stream.parkTimer = nil
 		}
 	}
+	needsGrowth := m.preparedStreamNeedsGrowth(stream, wasParked, complete)
+	stream.processMu.Unlock()
+
+	// A retained event playlist can still cover the requested position after
+	// its source has stopped delivering pieces. Reusing that stale range lets
+	// the client play its last few buffered segments and enter the same recovery
+	// loop again. Confirm that an old or resumed playlist can still advance;
+	// healthy, actively growing streams keep the fast in-range reuse path.
+	if needsGrowth {
+		if err := m.waitForPlaylistGrowth(ctx, stream, bufferedSegments); err != nil {
+			stalledErr := fmt.Errorf("covered HLS stream did not advance: %w", err)
+			m.logger.Warn("covered HLS stream did not advance",
+				"playback_id", playbackID, "requested_start_seconds", startSeconds,
+				"packaged_seconds", packagedSeconds, "error", err)
+			if !wasParked {
+				if sourceErr := m.sourceStallError(playbackID, stalledErr); sourceErr != nil {
+					return Stream{}, false, sourceErr
+				}
+			}
+			return Stream{}, false, nil
+		}
+		_, packagedSeconds, _ = playlistStatus(stream.dir)
+	}
 	if !playlistReady(stream.dir, m.bufferSeconds) {
-		return Stream{}, false
+		return Stream{}, false, nil
 	}
 	m.logger.Info("reused prepared HLS stream for in-range position",
 		"playback_id", playbackID, "requested_start_seconds", startSeconds,
 		"timeline_origin_seconds", stream.info.TimelineOriginSeconds,
 		"packaged_seconds", packagedSeconds)
-	return stream.info, true
+	return stream.info, true, nil
 }
 
 func (m *Manager) Park(ctx context.Context, playbackID string, minimumSeconds int) error {
