@@ -1271,11 +1271,16 @@ func (s *Server) searchAndRank(
 	indexerSearchDuration := time.Duration(0)
 	rankingDuration := time.Duration(0)
 	rawCandidates := 0
+	rawCandidatesByIndexer := make(map[string]int)
+	rejectionReasons := make(map[string]int)
+	var attemptedTitles []string
 	var rankedCandidates []catalog.RankedCandidate
 	defer func() {
 		s.logger.Info("release search stages",
-			"media_type", request.MediaType, "protocol", protocol, "title_queries", len(titles),
-			"raw_candidates", rawCandidates, "ranked_candidates", len(rankedCandidates),
+			"media_type", request.MediaType, "protocol", protocol,
+			"title_queries", len(attemptedTitles), "queries", attemptedTitles,
+			"raw_candidates", rawCandidates, "raw_candidates_by_indexer", rawCandidatesByIndexer,
+			"ranked_candidates", len(rankedCandidates), "rejection_reasons", rejectionReasons,
 			"indexer_search_duration", indexerSearchDuration,
 			"metadata_ranking_duration", rankingDuration, "total_duration", time.Since(totalStarted))
 	}()
@@ -1283,6 +1288,7 @@ func (s *Server) searchAndRank(
 	hadSuccessfulSearch := false
 	seenCandidates := make(map[string]bool)
 	for _, title := range titles {
+		attemptedTitles = append(attemptedTitles, title)
 		search := request
 		search.Query = title
 		var candidates []catalog.Candidate
@@ -1290,21 +1296,39 @@ func (s *Server) searchAndRank(
 		searchStarted := time.Now()
 		if protocol == "" {
 			candidates, err = s.indexers.Search(ctx, search)
-		} else if search.MediaType == "show" && protocol == catalog.ProtocolTorrent {
-			candidates, err = s.indexers.SearchProtocol(ctx, search, protocol)
 		} else {
-			candidates, err = s.indexers.SearchFirstProtocol(ctx, search, protocol)
+			candidates, err = s.indexers.SearchProtocolUntil(ctx, search, protocol, func(candidates []catalog.Candidate) bool {
+				return len(catalog.Rank(search, candidates)) >= maxUnavailablePlaybackAttempts
+			})
 		}
 		indexerSearchDuration += time.Since(searchStarted)
 		rawCandidates += len(candidates)
+		for _, candidate := range candidates {
+			rawCandidatesByIndexer[candidate.Indexer]++
+		}
 		if err != nil {
 			failures = append(failures, err)
 			continue
 		}
 		hadSuccessfulSearch = true
 		rankingStarted := time.Now()
-		rankedForTitle := catalog.Rank(search, candidates)
+		rankedForTitle, diagnostics := catalog.RankWithDiagnostics(search, candidates)
 		rankingDuration += time.Since(rankingStarted)
+		for reason, count := range diagnostics.RejectionReasons {
+			rejectionReasons[reason] += count
+		}
+		for _, rejection := range diagnostics.Rejections {
+			seeders := -1
+			if rejection.Candidate.Seeders != nil {
+				seeders = *rejection.Candidate.Seeders
+			}
+			s.logger.Debug("release candidate rejected",
+				"query", title, "indexer", rejection.Candidate.Indexer,
+				"name", rejection.Candidate.Name, "reason", rejection.Reason,
+				"year", rejection.Candidate.Year, "resolution", rejection.Candidate.Resolution,
+				"codec", rejection.Candidate.Codec, "size_bytes", rejection.Candidate.SizeBytes,
+				"seeders", seeders, "categories", rejection.Candidate.Categories)
+		}
 		for _, ranked := range rankedForTitle {
 			key := ranked.Candidate.Indexer + ":" + firstNonEmpty(ranked.Candidate.ID, ranked.Candidate.Name)
 			if seenCandidates[key] {
@@ -1312,6 +1336,9 @@ func (s *Server) searchAndRank(
 			}
 			seenCandidates[key] = true
 			rankedCandidates = append(rankedCandidates, ranked)
+		}
+		if len(rankedForTitle) > 0 {
+			break
 		}
 	}
 	if !hadSuccessfulSearch && len(failures) > 0 {

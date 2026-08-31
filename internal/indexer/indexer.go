@@ -132,6 +132,66 @@ func (r *Registry) SearchProtocol(
 	return matches, nil
 }
 
+// SearchProtocolUntil starts every configured search concurrently and returns as
+// soon as the accumulated candidates satisfy the caller. Irrelevant fast results
+// therefore cannot hide a matching result from another indexer, while a strong
+// primary result does not wait for every slower source.
+func (r *Registry) SearchProtocolUntil(
+	ctx context.Context,
+	request catalog.SearchRequest,
+	protocol string,
+	sufficient func([]catalog.Candidate) bool,
+) ([]catalog.Candidate, error) {
+	r.mu.RLock()
+	ordered := append([]Indexer(nil), r.ordered...)
+	r.mu.RUnlock()
+	if len(ordered) == 0 {
+		return nil, errors.New("no indexers are configured")
+	}
+
+	searchContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type result struct {
+		candidates []catalog.Candidate
+		err        error
+	}
+	results := make(chan result, len(ordered))
+	for _, configured := range ordered {
+		go func(configured Indexer) {
+			candidates, err := configured.Search(searchContext, request)
+			matches := make([]catalog.Candidate, 0, len(candidates))
+			for _, candidate := range candidates {
+				candidate.Indexer = configured.Name()
+				if candidate.Protocol == protocol {
+					matches = append(matches, candidate)
+				}
+			}
+			results <- result{candidates: matches, err: err}
+		}(configured)
+	}
+
+	var candidates []catalog.Candidate
+	var failures []string
+	successes := 0
+	for range ordered {
+		result := <-results
+		if result.err != nil {
+			failures = append(failures, result.err.Error())
+			continue
+		}
+		successes++
+		candidates = append(candidates, result.candidates...)
+		if sufficient != nil && sufficient(candidates) {
+			cancel()
+			return candidates, nil
+		}
+	}
+	if successes == 0 && len(failures) > 0 {
+		return nil, fmt.Errorf("all indexers failed: %s", strings.Join(failures, "; "))
+	}
+	return candidates, nil
+}
+
 func (r *Registry) SearchFirstProtocol(
 	ctx context.Context,
 	request catalog.SearchRequest,

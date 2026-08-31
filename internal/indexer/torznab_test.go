@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 
 	"github.com/pgeske/filmstream/internal/catalog"
@@ -67,26 +68,34 @@ func TestTorznabNormalizesPunctuationInSearchQueries(t *testing.T) {
 	if got := torznabQuery("Harry Potter and the Philosopher's Stone"); got != "Harry Potter and the Philosophers Stone" {
 		t.Fatalf("normalized possessive query = %q", got)
 	}
-	if got := broadMovieQuery("The Good, the Bad and the Ugly", 1966); got != "The Good the 1966" {
-		t.Fatalf("broad query = %q", got)
+	if got := movieFallbackQueries("The Good, the Bad and the Ugly", 1966); !slices.Equal(got, []string{
+		"The Good the Bad and the Ugly 1966", "The Good the Bad and the Ugly",
+	}) {
+		t.Fatalf("fallback queries = %q", got)
 	}
 }
 
-func TestTorznabAugmentsSparseMovieResultsWithBasicSearch(t *testing.T) {
+func TestTorznabMovieSearchFallsBackAfterPolicyRejections(t *testing.T) {
+	var queries []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Query().Get("t") {
+		searchType := r.URL.Query().Get("t")
+		if searchType != "caps" {
+			queries = append(queries, searchType+":"+r.URL.Query().Get("q"))
+		}
+		switch searchType {
 		case "caps":
-			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><movie-search available="yes" supportedParams="q,year"/></searching></caps>`)
+			// Prowlarr's TorrentLeech capability does not advertise year, so it must not be sent.
+			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><movie-search available="yes" supportedParams="q,imdbid"/></searching></caps>`)
 		case "movie":
-			if r.URL.Query().Get("q") != "Movie Part One" {
-				t.Errorf("movie query = %q", r.URL.Query().Get("q"))
+			if r.URL.Query().Get("year") != "" {
+				t.Errorf("unsupported year parameter = %q", r.URL.Query().Get("year"))
 			}
-			fmt.Fprint(w, `<?xml version="1.0"?><rss><channel><item><title>Movie.2001.1080p.x264-OLD</title><guid>old</guid><enclosure url="/old" length="1000" type="application/x-nzb"/></item></channel></rss>`)
+			fmt.Fprint(w, `<?xml version="1.0"?><rss><channel><item><title>Pirates.of.the.Caribbean.Dead.Men.Tell.No.Tales.2017.2160p.DV.HEVC.REMUX</title><guid>duplicate</guid><enclosure url="/bad" length="50000000000" type="application/x-bittorrent"/></item></channel></rss>`)
 		case "search":
-			if r.URL.Query().Get("q") != "Movie Part One 2001" {
-				t.Errorf("broad query = %q", r.URL.Query().Get("q"))
+			if r.URL.Query().Get("q") != "Pirates of the Caribbean Dead Men Tell No Tales 2017" {
+				t.Errorf("fallback query = %q", r.URL.Query().Get("q"))
 			}
-			fmt.Fprint(w, `<?xml version="1.0"?><rss><channel><item><title>Movie.2001.1080p.x265-NEW</title><guid>new</guid><pubDate>Tue, 30 Sep 2025 12:00:00 +0000</pubDate><enclosure url="/new" length="1000" type="application/x-nzb"/></item></channel></rss>`)
+			fmt.Fprint(w, `<?xml version="1.0"?><rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel><item><title>Pirates.of.the.Caribbean.Dead.Men.Tell.No.Tales.2017.2160p.DV.HEVC.REMUX</title><guid>duplicate</guid><enclosure url="/bad" length="50000000000" type="application/x-bittorrent"/></item><item><title>Pirates.of.the.Caribbean.Dead.Men.Tell.No.Tales.2017.1080p.BluRay.x265-Ralphy</title><guid>valid</guid><pubDate>Tue, 30 Sep 2025 12:00:00 +0000</pubDate><enclosure url="/valid" length="6000000000" type="application/x-bittorrent"/><torznab:attr name="category" value="2000"/><torznab:attr name="category" value="2030"/></item></channel></rss>`)
 		default:
 			http.Error(w, "unsupported", http.StatusBadRequest)
 		}
@@ -97,12 +106,96 @@ func TestTorznabAugmentsSparseMovieResultsWithBasicSearch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	candidates, err := configured.Search(t.Context(), catalog.SearchRequest{Query: "Movie, Part One", Year: 2001})
+	request := catalog.SearchRequest{
+		Query: "Pirates of the Caribbean: Dead Men Tell No Tales", Year: 2017, MediaType: "movie",
+		Preferences: catalog.Preferences{
+			Resolution: "1080p", Codecs: []string{"h264", "h265"},
+			MaxSizeBytes: 60 << 30, StreamingOptimized: true,
+		},
+	}
+	candidates, err := configured.Search(t.Context(), request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(candidates) != 2 || candidates[0].ID != "old" || candidates[1].ID != "new" || candidates[1].PublishedUnix == 0 {
+	if !slices.Equal(queries, []string{
+		"movie:Pirates of the Caribbean Dead Men Tell No Tales",
+		"search:Pirates of the Caribbean Dead Men Tell No Tales 2017",
+	}) {
+		t.Fatalf("queries = %q", queries)
+	}
+	if len(candidates) != 2 || candidates[0].ID != "duplicate" || candidates[1].ID != "valid" ||
+		!slices.Equal(candidates[1].Categories, []int{2000, 2030}) || candidates[1].PublishedUnix == 0 {
 		t.Fatalf("candidates = %+v", candidates)
+	}
+	if ranked := catalog.Rank(request, candidates); len(ranked) != 1 || ranked[0].Candidate.ID != "valid" {
+		t.Fatalf("ranked = %+v", ranked)
+	}
+}
+
+func TestTorznabMovieSearchFallsBackWithoutYearOnlyWhenNeeded(t *testing.T) {
+	var queries []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch searchType := r.URL.Query().Get("t"); searchType {
+		case "caps":
+			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><movie-search available="yes" supportedParams="q"/></searching></caps>`)
+		case "movie", "search":
+			query := r.URL.Query().Get("q")
+			queries = append(queries, searchType+":"+query)
+			if searchType == "search" && query == "Dune Part Two" {
+				fmt.Fprint(w, `<?xml version="1.0"?><rss><channel><item><title>Dune.Part.Two.2024.1080p.WEB-DL.H264-GROUP</title><guid>valid</guid><enclosure url="/valid" length="7000000000" type="application/x-bittorrent"/></item></channel></rss>`)
+				return
+			}
+			fmt.Fprint(w, `<?xml version="1.0"?><rss><channel></channel></rss>`)
+		default:
+			http.Error(w, "unsupported", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	configured, err := NewTorznab("test", server.URL, "", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := configured.Search(t.Context(), catalog.SearchRequest{
+		Query: "Dune: Part Two", Year: 2024, MediaType: "movie",
+		Preferences: catalog.Preferences{Codecs: []string{"h264"}, StreamingOptimized: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(queries, []string{
+		"movie:Dune Part Two", "search:Dune Part Two 2024", "search:Dune Part Two",
+	}) || len(candidates) != 1 {
+		t.Fatalf("queries = %q, candidates = %+v", queries, candidates)
+	}
+}
+
+func TestTorznabMovieSearchStopsAfterValidPrimaryQuery(t *testing.T) {
+	searches := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("t") {
+		case "caps":
+			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><movie-search available="yes" supportedParams="q"/></searching></caps>`)
+		case "movie":
+			searches++
+			fmt.Fprint(w, `<?xml version="1.0"?><rss><channel><item><title>Dune.Part.Two.2024.1080p.WEB-DL.H264-GROUP</title><guid>valid</guid><enclosure url="/valid" length="7000000000" type="application/x-bittorrent"/></item></channel></rss>`)
+		case "search":
+			searches++
+			t.Error("valid primary movie query unexpectedly used a fallback")
+		default:
+			http.Error(w, "unsupported", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	configured, err := NewTorznab("test", server.URL, "", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := configured.Search(t.Context(), catalog.SearchRequest{
+		Query: "Dune: Part Two", Year: 2024, MediaType: "movie",
+		Preferences: catalog.Preferences{Codecs: []string{"h264"}, StreamingOptimized: true},
+	})
+	if err != nil || len(candidates) != 1 || searches != 1 {
+		t.Fatalf("candidates = %+v, searches = %d, error = %v", candidates, searches, err)
 	}
 }
 

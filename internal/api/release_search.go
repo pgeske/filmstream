@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -11,8 +12,9 @@ import (
 )
 
 const (
-	releaseSearchTimeout = 45 * time.Second
-	releaseSearchTTL     = 10 * time.Minute
+	releaseSearchTimeout     = 45 * time.Second
+	releaseSearchTTL         = 10 * time.Minute
+	releaseSearchNegativeTTL = 15 * time.Second
 )
 
 type releaseSearchState struct {
@@ -22,7 +24,7 @@ type releaseSearchState struct {
 	expiresAt time.Time
 }
 
-func (s *Server) queueShowReleaseSearch(request CreatePlaybackRequest) {
+func (s *Server) queueReleaseSearch(request CreatePlaybackRequest) {
 	key := releaseSearchKey(request)
 	if key == "" {
 		return
@@ -52,21 +54,22 @@ func (s *Server) queueShowReleaseSearch(request CreatePlaybackRequest) {
 		started := time.Now()
 		searchContext, cancel := context.WithTimeout(ctx, releaseSearchTimeout)
 		defer cancel()
-		ranked, err := s.searchShowReleases(searchContext, request)
+		ranked, err := s.searchReleases(searchContext, request)
+		cacheTTL := releaseSearchCacheTTL(ranked, err)
 
 		s.releaseSearchMu.Lock()
 		if s.releaseSearches[key] == state {
 			state.ranked = ranked
 			state.err = err
-			state.expiresAt = time.Now().Add(releaseSearchTTL)
+			state.expiresAt = time.Now().Add(cacheTTL)
 			close(state.ready)
 		}
 		s.releaseSearchMu.Unlock()
 		s.logger.Info("prefetched release search stages", "media_id", request.MediaID,
-			"candidates", len(ranked), "cache_ttl", releaseSearchTTL,
+			"candidates", len(ranked), "cache_ttl", cacheTTL,
 			"total_duration", time.Since(started), "error", err)
 		if err != nil && searchContext.Err() == nil {
-			s.logger.Warn("prewarm TV release search", "media_id", request.MediaID, "error", err)
+			s.logger.Warn("prewarm release search", "media_id", request.MediaID, "error", err)
 		}
 	}()
 }
@@ -100,17 +103,21 @@ func (s *Server) cachedReleaseSearch(
 	if s.releaseSearches[key] != state || state.err != nil || time.Now().After(state.expiresAt) {
 		return nil, false
 	}
-	return append([]catalog.RankedCandidate(nil), state.ranked...), true
+	ranked := make([]catalog.RankedCandidate, len(state.ranked))
+	copy(ranked, state.ranked)
+	return ranked, true
 }
 
-func (s *Server) searchShowReleases(
+func (s *Server) searchReleases(
 	ctx context.Context,
 	request CreatePlaybackRequest,
 ) ([]catalog.RankedCandidate, error) {
+	preferSeasonPack := request.MediaType == string(metadata.MediaTypeShow) &&
+		s.shouldPreferSeasonPack(ctx, request)
 	return s.searchAndRank(ctx, catalog.SearchRequest{
 		Query: request.Query, Year: request.Year, MediaType: request.MediaType,
 		SeasonNumber: request.SeasonNumber, EpisodeNumber: request.EpisodeNumber,
-		PreferSeasonPack: s.shouldPreferSeasonPack(ctx, request),
+		PreferSeasonPack: preferSeasonPack,
 		Preferences:      request.Preferences,
 	}, request.OriginalTitle, catalog.ProtocolTorrent)
 }
@@ -141,6 +148,13 @@ func (s *Server) shouldPreferSeasonPack(ctx context.Context, request CreatePlayb
 	return true
 }
 
+func releaseSearchCacheTTL(ranked []catalog.RankedCandidate, err error) time.Duration {
+	if err != nil || len(ranked) == 0 {
+		return releaseSearchNegativeTTL
+	}
+	return releaseSearchTTL
+}
+
 func (s *Server) cacheReleaseSearch(request CreatePlaybackRequest, ranked []catalog.RankedCandidate) {
 	key := releaseSearchKey(request)
 	if key == "" {
@@ -150,7 +164,7 @@ func (s *Server) cacheReleaseSearch(request CreatePlaybackRequest, ranked []cata
 	close(ready)
 	state := &releaseSearchState{
 		ready: ready, ranked: append([]catalog.RankedCandidate(nil), ranked...),
-		expiresAt: time.Now().Add(releaseSearchTTL),
+		expiresAt: time.Now().Add(releaseSearchCacheTTL(ranked, nil)),
 	}
 	s.releaseSearchMu.Lock()
 	if s.releaseSearches == nil {
@@ -175,10 +189,22 @@ func releaseSearchKey(request CreatePlaybackRequest) string {
 		mediaID = fmt.Sprintf("%s:%d", query, request.Year)
 	}
 	preferences := request.Preferences
-	return fmt.Sprintf("%s/%s/%s/%d/%d/%s/%s/%s/%d/%t",
+	return fmt.Sprintf("%s/%s/%s/%s/%d/%d/%d/%s/%s/%s/%d/%t",
 		strings.ToLower(strings.TrimSpace(request.MediaType)), mediaID, query,
+		strings.ToLower(strings.TrimSpace(request.OriginalTitle)), request.Year,
 		request.SeasonNumber, request.EpisodeNumber,
-		strings.ToLower(preferences.Resolution), strings.Join(preferences.Codecs, ","),
-		strings.Join(preferences.Languages, ","), preferences.MaxSizeBytes,
+		strings.ToLower(preferences.Resolution), normalizedReleaseSearchValues(preferences.Codecs),
+		normalizedReleaseSearchValues(preferences.Languages), preferences.MaxSizeBytes,
 		preferences.StreamingOptimized)
+}
+
+func normalizedReleaseSearchValues(values []string) string {
+	normalized := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = strings.ToLower(strings.TrimSpace(value)); value != "" {
+			normalized = append(normalized, value)
+		}
+	}
+	slices.Sort(normalized)
+	return strings.Join(normalized, ",")
 }
