@@ -64,6 +64,46 @@ import Testing
     #expect(playback.burnedSubtitleIndex == 6)
 }
 
+@Test func interruptionRecoveryPreservesPausedMediaPosition() {
+    let originalTimeline = HLSPlaybackTimeline(
+        requestedSeconds: 0,
+        originSeconds: 0
+    )
+    let pausedPosition = 815.5001203429999
+
+    let recoveryStart = originalTimeline.recoveryStartSeconds(
+        forMediaSeconds: pausedPosition
+    )
+    #expect(recoveryStart == pausedPosition)
+
+    // Values captured from the Modern Family production recovery that rebuilt at 815.5s.
+    let resumedTimeline = HLSPlaybackTimeline(
+        requestedSeconds: recoveryStart,
+        originSeconds: 812.8430000000001,
+        playerTimeOffsetSeconds: 0.26099999999996726
+    )
+    let resumedPlayerTime = resumedTimeline.playerSeconds(
+        forMediaSeconds: recoveryStart
+    )
+    #expect(abs(resumedPlayerTime - 2.3961203429998) < 0.000_000_001)
+    #expect(
+        abs(
+            resumedTimeline.mediaSeconds(forPlayerSeconds: resumedPlayerTime)
+                - pausedPosition
+        ) < 0.000_000_001
+    )
+}
+
+@Test func interruptionRecoveryFallsBackToRequestedPositionForInvalidPlayerTime() {
+    let timeline = HLSPlaybackTimeline(
+        requestedSeconds: 235.863280322,
+        originSeconds: 234.485,
+        playerTimeOffsetSeconds: 0.083
+    )
+
+    #expect(timeline.recoveryStartSeconds(forMediaSeconds: .nan) == 235.863280322)
+}
+
 @Test func mapsProductionResumeSubtitlesToAVPlayerTime() {
     let cases = [
         (
