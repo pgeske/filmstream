@@ -3,48 +3,88 @@ import SwiftUI
 
 struct IOSRootView: View {
     @Environment(IOSAppModel.self) private var model
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var selectedTab = IOSRootTab.home
+    @State private var sidebarSelection: IOSRootTab? = .home
 
     var body: some View {
-        TabView(selection: $selectedTab) {
-            NavigationStack {
-                IOSHomeView {
-                    selectedTab = .search
+        Group {
+            if horizontalSizeClass == .regular {
+                NavigationSplitView {
+                    ZStack {
+                        MobileTeaBackground()
+                        List(selection: $sidebarSelection) {
+                            Section {
+                                Label("Home", systemImage: "house.fill")
+                                    .tag(IOSRootTab.home)
+                                Label("Search", systemImage: "magnifyingglass")
+                                    .tag(IOSRootTab.search)
+                            } header: {
+                                MobileBrandHeader(compact: true)
+                                    .padding(.bottom, 16)
+                                    .textCase(nil)
+                            }
+                        }
+                        .scrollContentBackground(.hidden)
+                        .listStyle(.sidebar)
+                        .onChange(of: sidebarSelection) { _, selection in
+                            if let selection {
+                                selectedTab = selection
+                            }
+                        }
+                    }
+                    .navigationSplitViewColumnWidth(min: 220, ideal: 250, max: 300)
+                } detail: {
+                    navigationStack(for: selectedTab)
                 }
-                .navigationDestination(for: Movie.self) { movie in
-                        if movie.isShow {
-                            IOSShowDetailView(show: movie)
-                        } else {
-                            IOSMovieDetailView(movie: movie)
+                .navigationSplitViewStyle(.balanced)
+            } else {
+                TabView(selection: $selectedTab) {
+                    navigationStack(for: .home)
+                        .tabItem {
+                            Label("Home", systemImage: "house.fill")
                         }
-                    }
-            }
-            .tabItem {
-                Label("Home", systemImage: "house.fill")
-            }
-            .tag(IOSRootTab.home)
+                        .tag(IOSRootTab.home)
 
-            NavigationStack {
-                IOSSearchView()
-                    .navigationDestination(for: Movie.self) { movie in
-                        if movie.isShow {
-                            IOSShowDetailView(show: movie)
-                        } else {
-                            IOSMovieDetailView(movie: movie)
+                    navigationStack(for: .search)
+                        .tabItem {
+                            Label("Search", systemImage: "magnifyingglass")
                         }
-                    }
+                        .tag(IOSRootTab.search)
+                }
+                .toolbarBackground(Color.mobileTeaBackground.opacity(0.96), for: .tabBar)
+                .toolbarBackground(.visible, for: .tabBar)
+                .toolbarColorScheme(.dark, for: .tabBar)
             }
-            .tabItem {
-                Label("Search", systemImage: "magnifyingglass")
-            }
-            .tag(IOSRootTab.search)
         }
         .tint(Color.mobileTeaAccent)
-        .toolbarBackground(Color.mobileTeaBackground.opacity(0.96), for: .tabBar)
-        .toolbarBackground(.visible, for: .tabBar)
-        .toolbarColorScheme(.dark, for: .tabBar)
+        .onChange(of: selectedTab) { _, selection in
+            sidebarSelection = selection
+        }
         .task {
             await model.loadHome()
+        }
+    }
+
+    private func navigationStack(for tab: IOSRootTab) -> some View {
+        NavigationStack {
+            Group {
+                switch tab {
+                case .home:
+                    IOSHomeView {
+                        selectedTab = .search
+                    }
+                case .search:
+                    IOSSearchView()
+                }
+            }
+            .navigationDestination(for: Movie.self) { movie in
+                if movie.isShow {
+                    IOSShowDetailView(show: movie)
+                } else {
+                    IOSMovieDetailView(movie: movie)
+                }
+            }
         }
     }
 }
@@ -56,14 +96,22 @@ private enum IOSRootTab: Hashable {
 
 struct IOSHomeView: View {
     @Environment(IOSAppModel.self) private var model
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     let onOpenSearch: () -> Void
+
+    private var shelfCardWidth: CGFloat {
+        horizontalSizeClass == .regular ? 340 : 300
+    }
 
     var body: some View {
         ZStack {
             MobileTeaBackground()
 
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 36) {
+                LazyVStack(
+                    alignment: .leading,
+                    spacing: horizontalSizeClass == .regular ? 44 : 36
+                ) {
                     header
                     continueWatchingSection
                     recommendationSections
@@ -92,7 +140,7 @@ struct IOSHomeView: View {
                         .padding(.horizontal, 18)
                 }
                 .padding(.top, 10)
-                .padding(.bottom, 110)
+                .padding(.bottom, horizontalSizeClass == .regular ? 54 : 110)
             }
             .refreshable {
                 await model.loadHome()
@@ -133,7 +181,8 @@ struct IOSHomeView: View {
                                 MobileMovieCard(
                                     movie: movie,
                                     progress: entry.progress,
-                                    contentRating: model.ratings(for: movie)?.contentRating
+                                    contentRating: model.ratings(for: movie)?.contentRating,
+                                    width: shelfCardWidth
                                 )
                             }
                             .buttonStyle(MobileCardButtonStyle())
@@ -201,7 +250,8 @@ struct IOSHomeView: View {
                             NavigationLink(value: movie) {
                                 MobileMovieCard(
                                     movie: movie,
-                                    contentRating: model.ratings(for: movie)?.contentRating
+                                    contentRating: model.ratings(for: movie)?.contentRating,
+                                    width: shelfCardWidth
                                 )
                             }
                             .buttonStyle(MobileCardButtonStyle())
@@ -281,7 +331,8 @@ struct IOSHomeView: View {
                             NavigationLink(value: movie) {
                                 MobileMovieCard(
                                     movie: movie,
-                                    contentRating: model.ratings(for: movie)?.contentRating
+                                    contentRating: model.ratings(for: movie)?.contentRating,
+                                    width: shelfCardWidth
                                 )
                             }
                             .buttonStyle(MobileCardButtonStyle())

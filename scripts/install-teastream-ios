@@ -46,28 +46,35 @@ if requested_id:
         in (device.get("identifier"), device.get("hardwareProperties", {}).get("udid"))
     ]
 
+def device_description(device):
+    properties = device.get("deviceProperties", {})
+    hardware = device.get("hardwareProperties", {})
+    name = properties.get("name", "iOS device")
+    marketing_name = hardware.get("marketingName") or hardware.get("deviceType")
+    return f"{name} ({marketing_name})" if marketing_name else name
+
 if not candidates:
     if requested_id:
-        print(f"No paired physical iPhone matches IOS_DEVICE_ID={requested_id}.", file=sys.stderr)
+        print(f"No paired physical iPhone or iPad matches IOS_DEVICE_ID={requested_id}.", file=sys.stderr)
     else:
-        print("No paired physical iPhone is available.", file=sys.stderr)
-    print("Connect and trust the iPhone, enable Developer Mode if prompted, then retry.", file=sys.stderr)
+        print("No paired physical iPhone or iPad is available.", file=sys.stderr)
+    print("Connect and trust the device, enable Developer Mode if prompted, then retry.", file=sys.stderr)
     raise SystemExit(1)
 
 if len(candidates) > 1:
-    print("More than one paired physical iPhone is available:", file=sys.stderr)
+    print("More than one paired physical iPhone or iPad is available:", file=sys.stderr)
     for device in candidates:
-        name = device.get("deviceProperties", {}).get("name", "iPhone")
+        description = device_description(device)
         udid = device.get("hardwareProperties", {}).get("udid", "unknown")
-        print(f"  {name}: {udid}", file=sys.stderr)
+        print(f"  {description}: {udid}", file=sys.stderr)
     print("Retry with IOS_DEVICE_ID set to the desired UDID.", file=sys.stderr)
     raise SystemExit(1)
 
 device = candidates[0]
-name = device.get("deviceProperties", {}).get("name", "iPhone")
+name = device_description(device)
 udid = device.get("hardwareProperties", {}).get("udid")
 if not udid:
-    print("The selected iPhone did not report a UDID.", file=sys.stderr)
+    print("The selected iOS device did not report a UDID.", file=sys.stderr)
     raise SystemExit(1)
 print(f"{udid}\t{name}")
 PY

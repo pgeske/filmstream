@@ -60,17 +60,26 @@ struct MobileTeaStreamMark: View {
 }
 
 struct MobileBrandHeader: View {
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    var compact = false
+
     var body: some View {
-        HStack(spacing: 11) {
-            MobileTeaStreamMark()
+        HStack(spacing: compact ? 9 : horizontalSizeClass == .regular ? 14 : 11) {
+            MobileTeaStreamMark(
+                size: compact ? 34 : horizontalSizeClass == .regular ? 48 : 40
+            )
             HStack(spacing: 0) {
                 Text("TEA")
                     .foregroundStyle(Color.mobileTeaAccentLight)
                 Text("STREAM")
                     .foregroundStyle(Color.mobileTeaCream)
             }
-            .font(.system(size: 23, weight: .black, design: .rounded))
-            .tracking(1.5)
+            .font(.system(
+                size: compact ? 18 : horizontalSizeClass == .regular ? 29 : 23,
+                weight: .black,
+                design: .rounded
+            ))
+            .tracking(compact ? 1.1 : horizontalSizeClass == .regular ? 1.9 : 1.5)
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("TeaStream")
@@ -78,11 +87,12 @@ struct MobileBrandHeader: View {
 }
 
 struct MobileSectionHeader: View {
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     let title: String
 
     var body: some View {
         Text(title)
-            .font(.title2.weight(.bold))
+            .font(horizontalSizeClass == .regular ? .title.weight(.bold) : .title2.weight(.bold))
             .foregroundStyle(Color.mobileTeaCream)
     }
 }
@@ -93,6 +103,7 @@ struct MobileCardButtonStyle: ButtonStyle {
             .opacity(configuration.isPressed ? 0.84 : 1)
             .scaleEffect(configuration.isPressed ? 0.975 : 1)
             .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+            .hoverEffect(.lift)
     }
 }
 
@@ -274,6 +285,41 @@ struct MobileBackdropImage: View {
     }
 }
 
+/// The regular-width detail treatment mirrors tvOS without compromising compact scrolling.
+struct IOSCinematicDetailBackground: View {
+    let movie: Movie
+
+    var body: some View {
+        MobileBackdropImage(movie: movie)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .clipped()
+            .overlay {
+                LinearGradient(
+                    stops: [
+                        .init(color: Color.mobileTeaBackground.opacity(0.99), location: 0),
+                        .init(color: Color.mobileTeaBackground.opacity(0.9), location: 0.34),
+                        .init(color: Color.mobileTeaBackground.opacity(0.24), location: 0.76),
+                        .init(color: .clear, location: 1),
+                    ],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+            }
+            .overlay {
+                LinearGradient(
+                    stops: [
+                        .init(color: .clear, location: 0.48),
+                        .init(color: Color.mobileTeaBackground.opacity(0.64), location: 0.82),
+                        .init(color: Color.mobileTeaBackground, location: 1),
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            }
+            .ignoresSafeArea()
+    }
+}
+
 struct MobileRatingBadges: View {
     let ratings: MovieRatings?
 
@@ -379,6 +425,7 @@ struct MobileDetailButtonStyle: ButtonStyle {
             .opacity(configuration.isPressed ? 0.82 : 1)
             .scaleEffect(configuration.isPressed ? 0.985 : 1)
             .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+            .hoverEffect(.highlight)
     }
 
     private var foregroundColor: Color {

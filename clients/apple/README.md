@@ -1,6 +1,6 @@
 # TeaStream for Apple platforms
 
-TeaStream is Filmstream's native SwiftUI experience for iPhone, Apple TV, and Mac. The iPhone target provides touch-first home and search tabs, compact movie and show details, season browsing, and custom playback controls. Apple TV retains its existing bundle identifier and remote-focused interface, while Mac uses a desktop-native sidebar and pointer-friendly layouts. All three apps reuse `FilmstreamCore` for API models, networking, metadata, HLS playback, subtitles, and watch progress; none embeds VLC or retains server credentials.
+TeaStream is Filmstream's native SwiftUI experience for iPhone, iPad, Apple TV, and Mac. The shared iOS target preserves touch-first tabs and compact layouts on iPhone while giving iPad a native sidebar, TV-inspired cinematic details, adaptive search and episode layouts, keyboard and pointer affordances, and Picture in Picture playback. Apple TV retains its existing bundle identifier and remote-focused interface, while Mac uses a desktop-native sidebar and pointer-friendly layouts. All apps reuse `FilmstreamCore` for API models, networking, metadata, HLS playback, subtitles, and watch progress; none embeds VLC or retains server credentials.
 
 ## Generate and build
 
@@ -17,6 +17,11 @@ xcodebuild -project FilmstreamApple.xcodeproj \
   build
 
 xcodebuild -project FilmstreamApple.xcodeproj \
+  -scheme FilmstreamIOS \
+  -destination 'platform=iOS Simulator,name=iPad Pro 13-inch (M5)' \
+  build
+
+xcodebuild -project FilmstreamApple.xcodeproj \
   -scheme FilmstreamTV \
   -destination 'platform=tvOS Simulator,name=Apple TV 4K (3rd generation)' \
   build
@@ -29,23 +34,23 @@ xcodebuild -project FilmstreamApple.xcodeproj \
 
 The corresponding repository shortcuts are `make ios-build`, `make tvos-build`, and `make macos-build`.
 
-## Install on a physical iPhone
+## Install on a physical iPhone or iPad
 
-Connect and trust the iPhone, sign in under **Xcode > Settings > Apple Accounts**, and enable Developer Mode if iOS requests it. From the repository root, build, sign, install, and launch TeaStream with:
+Connect and trust the iPhone or iPad, sign in under **Xcode > Settings > Apple Accounts**, and enable Developer Mode if iOS requests it. The device must appear as paired in `xcrun devicectl list devices`. From the repository root, build, sign, install, and launch TeaStream with:
 
 ```bash
 make ios-install
 ```
 
-The command discovers one paired physical iPhone and one Apple Development team without persisting either identifier. When discovery or signing is ambiguous, pass invocation-only values:
+The command discovers one paired physical iPhone or iPad and one Apple Development team without persisting either identifier. If multiple iOS devices are paired, it lists each device name, model, and UDID. Disambiguate the device or signing team with invocation-only values:
 
 ```bash
 make ios-install \
-  IOS_DEVICE_ID=<iphone-udid> \
+  IOS_DEVICE_ID=<iphone-or-ipad-udid> \
   IOS_DEVELOPMENT_TEAM=<team-id>
 ```
 
-Set `IOS_DERIVED_DATA_PATH` to override `clients/apple/.derivedData/ios-device`.
+Set `IOS_DERIVED_DATA_PATH` to override `clients/apple/.derivedData/ios-device`. On first launch, allow local-network access and confirm the device can resolve the private server hostname through Tailscale.
 
 ## Install on a physical Apple TV
 
@@ -71,7 +76,7 @@ TeaStream defaults to `http://filmstream.home.alyoshukai.com`; each target conta
 
 ## Server capabilities
 
-The home screens pair Continue Watching with separate Recommended Shows and Recommended Movies shelves, in that order, followed by mixed movie/show TMDB-powered Popular Now and Top Rated rails. One shared taste prompt controls both recommendation shelves through a focused native editor on each platform. After a prompt save, cached picks stay visible with a lightweight updating indicator while the client checks for completed recommendations about every five seconds for up to two minutes; normal Home and foreground refreshes pick up generations that finish later. Cards identify the media type, genre, year, and season count where applicable. On tvOS, focused titles expand into cinematic landscape cards and move to the leading shelf position; iPhone and Mac use touch- and pointer-appropriate versions of the same metadata. Movie discovery requires an existing digital, physical, or TV release, so upcoming and theater-only movies stay off the shelf. Search starts automatically after two title characters with a short debounce; selecting any result opens its adaptive details and playback actions. All clients use:
+The home screens pair Continue Watching with separate Recommended Shows and Recommended Movies shelves, in that order, followed by mixed movie/show TMDB-powered Popular Now and Top Rated rails. One shared taste prompt controls both recommendation shelves through a focused native editor on each platform. After a prompt save, cached picks stay visible with a lightweight updating indicator while the client checks for completed recommendations about every five seconds for up to two minutes; normal Home and foreground refreshes pick up generations that finish later. Cards identify the media type, genre, year, and season count where applicable. On tvOS, focused titles expand into cinematic landscape cards and move to the leading shelf position; iPad carries that cinematic visual language into pointer-friendly shelves and details, while iPhone and Mac use size-appropriate versions of the same metadata. Movie discovery requires an existing digital, physical, or TV release, so upcoming and theater-only movies stay off the shelf. Search starts automatically after two title characters with a short debounce; selecting any result opens its adaptive details and playback actions. All clients use:
 
 - `GET /v1/catalog/search` for mixed movie/show metadata and artwork;
 - `GET /v1/catalog/discover` for mixed home-screen discovery sections;
@@ -91,7 +96,7 @@ The home screens pair Continue Watching with separate Recommended Shows and Reco
 
 The HLS backend requires FFmpeg and FFprobe. It copies compatible H.264/H.265 video without re-encoding unless a bitmap subtitle is selected, converts the title's original-language audio track to AAC with English fallback, and paces packaging close to playback speed. PGS and other supported bitmap subtitles are burned into a hardware-accelerated H.264 rendition because AVPlayer HLS cannot carry them directly. It prepares a 12-second initial media buffer before opening the player, configures AVPlayer to target the same forward buffer, marks the beginning of each event playlist as the preferred start point, and preserves audio pre-roll when seeking so copied video and transcoded audio stay synchronized. TV browsing prefetches and caches ranked indexer results without mounting a torrent or downloading episode payload. An explicit play request chooses the top metadata-ranked release without serially mounting and probing every candidate; actual HLS startup creates bounded source demand, validates serveability, and discovers subtitle tracks. While an episode is actually playing, the backend keeps only the next episode's first 30 seconds ready; it no longer preloads every Continue Watching show or the current episode after exit. This preserves fast transitions without creating unrelated torrent seeding obligations. Play requests join an in-progress warmup rather than restarting it. Before serving a parked buffer, the backend verifies that its source connection is producing new segments and rebuilds stale packaging automatically. Durable torrent sessions restore asynchronously so seeding cannot block the health endpoint after a deployment. The tvOS player also reconnects its current stream after system sleep and recovers prolonged buffering without requiring the viewer to leave playback. Known Dolby Vision releases are skipped initially in favor of compatible SDR or HDR10 alternatives. Streaming selection uses torrents for both movies and shows by default; operators can still opt into Usenet-preferred or Usenet-only movie playback. Torrent selection rejects AI upscales and 2160p remuxes, then ranks the requested quality and reported swarm popularity deterministically. Serveability is validated only after the selected release has real playback demand; an unavailable source is quarantined and the next cached ranking is tried without repeating the indexer search. The server privately caches successful season-scoped torrent metadata and reuses the known-good release without searching again for every episode. Usenet modes additionally cache successful NZBs.
 
-During tvOS playback, Center or Play/Pause toggles playback, left/right seeks 30 seconds, and Up opens subtitles. Episodes automatically advance at the end on Apple TV, iPhone, and Mac, with no extra Next Episode control in the playback chrome. TeaStream registers the active tvOS player with the system media command center so AirPods and other play/pause controls operate the show instead of resuming another Apple TV app. iPhone and Mac provide equivalent native controls and timeline scrubbing. Mac playback also includes a Picture in Picture button once the video is ready. All clients expose embedded text and bitmap subtitle tracks and remember the selected language across movies and seeks. Apple playback requests use the selected metadata-ranked release, while HLS startup discovers its supported embedded subtitle tracks. Filmstream converts a selected SRT, ASS/SSA, WebVTT, or other text track into a growing WebVTT sidecar in a separate paced process. Text cues retain their authored full-episode timestamps. The backend verifies the source keyframe against the first packaged video packet, and clients restore the packaged first-packet offset that AVPlayer removes when it normalizes the playlist to player time zero. PGS, VobSub, and other bitmap tracks retain their authored typography and placement by being composited into the video with NVENC; switching one on or off rebuilds the HLS rendition at the current playback position. Resume packaging anchors to the preceding source video keyframe and verifies the packaged timeline before exposing it.
+During tvOS playback, Center or Play/Pause toggles playback, left/right seeks 30 seconds, and Up opens subtitles. Episodes automatically advance at the end on Apple TV, iPhone, iPad, and Mac, with no extra Next Episode control in the playback chrome. TeaStream registers the active tvOS player with the system media command center so AirPods and other play/pause controls operate the show instead of resuming another Apple TV app. iPhone, iPad, and Mac provide equivalent controls and full-title timeline scrubbing. iOS and Mac playback also include Picture in Picture once the video is ready; iOS publishes native Now Playing play/pause commands for hardware controls and the system Picture in Picture overlay. All clients expose embedded text and bitmap subtitle tracks and remember the selected language across movies and seeks. Apple playback requests use the selected metadata-ranked release, while HLS startup discovers its supported embedded subtitle tracks. Filmstream converts a selected SRT, ASS/SSA, WebVTT, or other text track into a growing WebVTT sidecar in a separate paced process. Text cues retain their authored full-episode timestamps. The backend verifies the source keyframe against the first packaged video packet, and clients restore the packaged first-packet offset that AVPlayer removes when it normalizes the playlist to player time zero. PGS, VobSub, and other bitmap tracks retain their authored typography and placement by being composited into the video with NVENC; switching one on or off rebuilds the HLS rendition at the current playback position. Resume packaging anchors to the preceding source video keyframe and verifies the packaged timeline before exposing it.
 
 The timeline always represents the full movie or episode rather than the currently generated HLS window. Seeking outside that window asks the server to resume HLS packaging at the target timestamp, which can briefly buffer while the new window starts.
 
@@ -99,6 +104,6 @@ Configure the server's optional `metadata` provider with a TMDB API read token t
 
 Long cold starts distinguish Finding a Release from Buffering Video instead of showing one indefinite preparation state. Detail pages show only IMDb and Rotten Tomatoes scores; TMDB votes remain catalog-ranking metadata rather than user-facing ratings. Top Rated requires substantially more votes so established movies and shows are favored over obscure new entries.
 
-A movie with saved progress presents explicit Resume, Play from Beginning, and Remove from Continue Watching actions. A show anchors continuation to its latest meaningful playback activity: an unfinished episode resumes, while a completed episode advances to the next aired episode across gaps and season boundaries instead of backfilling earlier unwatched seasons. Explicitly replaying an older episode makes that newer activity the anchor. The primary action includes the selected `Sx Ex`, and Episodes & More opens the episode browser with a season sidebar on tvOS and platform-native touch or pointer layouts on iPhone and Mac. Removing a show clears all progress for the series; playing it again starts fresh and resumes normal episode tracking.
+A movie with saved progress presents explicit Resume, Play from Beginning, and Remove from Continue Watching actions. A show anchors continuation to its latest meaningful playback activity: an unfinished episode resumes, while a completed episode advances to the next aired episode across gaps and season boundaries instead of backfilling earlier unwatched seasons. Explicitly replaying an older episode makes that newer activity the anchor. The primary action includes the selected `Sx Ex`, and Episodes & More opens the episode browser with a season sidebar on tvOS, iPad, and Mac, while compact iPhone and multitasking widths retain horizontal touch navigation. Removing a show clears all progress for the series; playing it again starts fresh and resumes normal episode tracking.
 
 Media data and images are provided by TMDB. This product uses the TMDB API but is not endorsed or certified by TMDB. External rating data is provided by OMDb.

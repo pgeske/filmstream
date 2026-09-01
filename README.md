@@ -8,7 +8,7 @@ Use it only with media you are authorized to access, download, or share.
 
 - Local backend bound to `127.0.0.1:8943`
 - Bubble Tea terminal UI with search, continue watching, progress, and history controls
-- TeaStream, cozy native iPhone, Apple TV, and Mac clients with mixed movie/show discovery, season and episode browsing, selectable subtitles, AVPlayer HLS playback, and shared progress
+- TeaStream, cozy native iPhone, iPad, Apple TV, and Mac clients with mixed movie/show discovery, season and episode browsing, selectable subtitles, AVPlayer HLS playback, and shared progress
 - One-command CLI that starts the backend when needed and launches MPV
 - A small, trusted open-movie catalog plus an Internet Archive reference indexer
 - Standard Torznab indexers, including Prowlarr and Jackett endpoints for both NZBs and torrents
@@ -103,7 +103,7 @@ An automatically started server logs to `~/.cache/filmstream/server.log`.
 
 ## Apple clients
 
-TeaStream provides native SwiftUI apps for iPhone, Apple TV, and Mac in `clients/apple`. All targets reuse `FilmstreamCore` for API models, networking, metadata, HLS preparation, subtitles, and watch progress. `FilmstreamIOS` uses touch-first tabs and playback controls, `FilmstreamTV` retains its remote-focused interface and existing bundle identifier, and `FilmstreamMac` provides a desktop sidebar and pointer-friendly shelves.
+TeaStream provides native SwiftUI apps for iPhone, iPad, Apple TV, and Mac in `clients/apple`. All targets reuse `FilmstreamCore` for API models, networking, metadata, HLS preparation, subtitles, and watch progress. `FilmstreamIOS` adapts between compact iPhone tabs and iPad sidebar, cinematic, pointer-friendly layouts, `FilmstreamTV` retains its remote-focused interface and existing bundle identifier, and `FilmstreamMac` provides a desktop sidebar and pointer-friendly shelves.
 
 ```bash
 make apple-test

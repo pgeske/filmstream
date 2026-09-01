@@ -32,18 +32,14 @@ struct IOSMovieDetailView: View {
 
     var body: some View {
         GeometryReader { geometry in
-            ZStack {
-                MobileTeaBackground()
-
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
-                        backdrop(width: geometry.size.width)
-                        content
-                    }
-                    .padding(.bottom, 36)
-                }
-                .frame(width: geometry.size.width, height: geometry.size.height)
-                .ignoresSafeArea(edges: .top)
+            let layout = IOSAdaptiveLayout(
+                width: geometry.size.width,
+                height: geometry.size.height
+            )
+            if layout.usesCinematicDetail {
+                cinematicLayout(width: geometry.size.width)
+            } else {
+                compactLayout(width: geometry.size.width, layout: layout)
             }
         }
         .navigationTitle("")
@@ -66,6 +62,39 @@ struct IOSMovieDetailView: View {
             }
         ) { prepared in
             IOSPlayerView(movie: movie, prepared: prepared, api: model.api)
+        }
+    }
+
+    private func compactLayout(width: CGFloat, layout: IOSAdaptiveLayout) -> some View {
+        ZStack {
+            MobileTeaBackground()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    backdrop(width: width)
+                    detailContent(showsTitle: false)
+                        .frame(maxWidth: layout.isWide ? 760 : .infinity)
+                        .frame(maxWidth: .infinity)
+                }
+                .padding(.bottom, 36)
+            }
+            .frame(width: width)
+            .ignoresSafeArea(edges: .top)
+        }
+    }
+
+    private func cinematicLayout(width: CGFloat) -> some View {
+        ZStack(alignment: .leading) {
+            IOSCinematicDetailBackground(movie: movie)
+
+            ScrollView(.vertical, showsIndicators: false) {
+                detailContent(showsTitle: true)
+                    .frame(maxWidth: min(600, width * 0.62), alignment: .leading)
+                    .padding(.leading, max(44, width * 0.06))
+                    .padding(.trailing, 30)
+                    .padding(.vertical, 54)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
     }
 
@@ -108,8 +137,15 @@ struct IOSMovieDetailView: View {
             }
     }
 
-    private var content: some View {
-        VStack(alignment: .leading, spacing: 18) {
+    private func detailContent(showsTitle: Bool) -> some View {
+        VStack(alignment: .leading, spacing: showsTitle ? 20 : 18) {
+            if showsTitle {
+                Text(movie.title)
+                    .font(.system(size: 48, weight: .black, design: .rounded))
+                    .foregroundStyle(Color.mobileTeaCream)
+                    .lineLimit(2)
+            }
+
             VStack(alignment: .leading, spacing: 6) {
                 Text(metadataSummary)
                     .foregroundStyle(Color.mobileTeaMuted)
