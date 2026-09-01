@@ -695,7 +695,11 @@ private final class NativePlaybackController: ObservableObject {
             queue: .main
         ) { [weak self] time in
             Task { @MainActor in
-                guard let self, !self.isSeeking else { return }
+                guard let self,
+                      !self.stopped,
+                      !self.isSeeking,
+                      !self.wasInterrupted,
+                      !self.isRecovering else { return }
                 let current = time.seconds
                 if current.isFinite, current >= 0 {
                     self.positionSeconds = min(
@@ -876,7 +880,7 @@ private final class NativePlaybackController: ObservableObject {
 
     func reconnectAfterInterruption() async {
         guard wasInterrupted else { return }
-        await recoverPlayback(reusePreparedStream: true)
+        await recoverPlayback()
     }
 
     func jump(by seconds: Double) {
@@ -903,7 +907,7 @@ private final class NativePlaybackController: ObservableObject {
                 return
             }
             self.bufferingRecoveryTask = nil
-            await self.recoverPlayback(reusePreparedStream: false)
+            await self.recoverPlayback()
         }
     }
 
@@ -939,7 +943,7 @@ private final class NativePlaybackController: ObservableObject {
         playbackFailureTask = nil
     }
 
-    private func recoverPlayback(reusePreparedStream: Bool) async {
+    private func recoverPlayback() async {
         guard !stopped, !isRecovering else { return }
         isRecovering = true
         wasInterrupted = false
@@ -948,25 +952,23 @@ private final class NativePlaybackController: ObservableObject {
         errorMessage = nil
         player.pause()
 
-        let resumePosition = max(0, positionSeconds)
-        var requestedStart = reusePreparedStream ? timeline.requestedSeconds : resumePosition
+        let resumePosition = timeline.recoveryStartSeconds(forMediaSeconds: positionSeconds)
         do {
             let refreshed: PreparedPlayback
             do {
                 refreshed = try await api.prepareNativePlayback(
                     playback,
-                    startSeconds: requestedStart
+                    startSeconds: resumePosition
                 )
             } catch {
-                requestedStart = resumePosition
                 let replacement = try await api.createPlayback(
                     for: movie,
-                    startSeconds: requestedStart
+                    startSeconds: resumePosition
                 )
                 refreshed = try await api.prepareNativePlaybackWithRetry(
                     replacement,
                     for: movie,
-                    startSeconds: requestedStart
+                    startSeconds: resumePosition
                 )
             }
             guard !stopped else { return }

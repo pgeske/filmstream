@@ -647,6 +647,11 @@ public struct HLSPlaybackTimeline: Hashable, Sendable {
     public func playerSeconds(forMediaSeconds mediaSeconds: Double) -> Double {
         mediaSeconds - mediaOriginSeconds
     }
+
+    public func recoveryStartSeconds(forMediaSeconds mediaSeconds: Double) -> Double {
+        guard mediaSeconds.isFinite else { return requestedSeconds }
+        return max(0, mediaSeconds)
+    }
 }
 
 public enum PlaybackPreparationStage: Hashable, Sendable {
