@@ -19,60 +19,19 @@ struct IOSShowEpisodesView: View {
     }
 
     var body: some View {
-        ZStack {
-            MobileTeaBackground()
+        GeometryReader { geometry in
+            let layout = IOSAdaptiveLayout(
+                width: geometry.size.width,
+                height: geometry.size.height
+            )
+            ZStack {
+                MobileTeaBackground()
 
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 18) {
-                    seasonPicker
-
-                    HStack(alignment: .firstTextBaseline, spacing: 12) {
-                        Text(loadedSeason?.name ?? "Season \(selectedSeasonNumber)")
-                            .font(.title2.weight(.bold))
-                            .foregroundStyle(Color.mobileTeaCream)
-
-                        Spacer()
-
-                        if let preparationStage {
-                            HStack(spacing: 8) {
-                                ProgressView()
-                                    .controlSize(.small)
-                                    .tint(Color.mobileTeaAccent)
-                                Text(preparationStageLabel(preparationStage))
-                                    .font(.caption.weight(.bold))
-                                    .foregroundStyle(Color.mobileTeaAccentLight)
-                            }
-                        }
-                    }
-
-                    if let errorMessage {
-                        Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
-                            .font(.footnote.weight(.semibold))
-                            .foregroundStyle(Color.mobileTeaAmber)
-                            .padding(13)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(
-                                Color.mobileTeaPanel.opacity(0.72),
-                                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            )
-                    }
-
-                    if isLoading {
-                        HStack(spacing: 10) {
-                            ProgressView()
-                                .tint(Color.mobileTeaAccent)
-                            Text("Loading episodes…")
-                                .foregroundStyle(Color.mobileTeaMuted)
-                        }
-                        .frame(maxWidth: .infinity, minHeight: 160)
-                    } else {
-                        ForEach(loadedSeason?.episodes ?? []) { episode in
-                            episodeCard(episode)
-                        }
-                    }
+                if layout.usesEpisodeSidebar {
+                    wideLayout
+                } else {
+                    compactLayout
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 20)
             }
         }
         .navigationTitle("Episodes & More")
@@ -101,6 +60,168 @@ struct IOSShowEpisodesView: View {
             )
             .id(session.id)
         }
+    }
+
+    private var compactLayout: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 18) {
+                seasonPicker
+                episodeListHeader
+                errorBanner
+
+                if isLoading {
+                    loadingState
+                } else {
+                    ForEach(loadedSeason?.episodes ?? []) { episode in
+                        episodeCard(episode, wide: false)
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 20)
+        }
+    }
+
+    private var wideLayout: some View {
+        HStack(alignment: .top, spacing: 28) {
+            seasonSidebar
+                .frame(width: 220)
+
+            VStack(alignment: .leading, spacing: 16) {
+                episodeListHeader
+                errorBanner
+
+                if isLoading {
+                    loadingState
+                } else {
+                    ScrollView(.vertical, showsIndicators: false) {
+                        LazyVStack(spacing: 14) {
+                            ForEach(loadedSeason?.episodes ?? []) { episode in
+                                episodeCard(episode, wide: true)
+                            }
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 8)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .padding(.horizontal, 28)
+        .padding(.vertical, 24)
+    }
+
+    private var episodeListHeader: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(loadedSeason?.name ?? "Season \(selectedSeasonNumber)")
+                .font(.title2.weight(.bold))
+                .foregroundStyle(Color.mobileTeaCream)
+
+            Spacer()
+
+            if let preparationStage {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(Color.mobileTeaAccent)
+                    Text(preparationStageLabel(preparationStage))
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(Color.mobileTeaAccentLight)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var errorBanner: some View {
+        if let errorMessage {
+            Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(Color.mobileTeaAmber)
+                .padding(13)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    Color.mobileTeaPanel.opacity(0.72),
+                    in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+                )
+        }
+    }
+
+    private var loadingState: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .tint(Color.mobileTeaAccent)
+            Text("Loading episodes…")
+                .foregroundStyle(Color.mobileTeaMuted)
+        }
+        .frame(maxWidth: .infinity, minHeight: 160)
+    }
+
+    private var seasonSidebar: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            MobileTeaStreamMark(size: 42)
+
+            Text(details.show.title)
+                .font(.system(size: 28, weight: .black, design: .rounded))
+                .foregroundStyle(Color.mobileTeaCream)
+                .lineLimit(3)
+
+            Text(details.show.seasonCountLabel ?? "Episodes")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Color.mobileTeaMuted)
+
+            ScrollView(.vertical, showsIndicators: false) {
+                LazyVStack(spacing: 7) {
+                    ForEach(details.seasons) { season in
+                        sidebarSeasonButton(season)
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+        }
+        .frame(maxHeight: .infinity, alignment: .top)
+    }
+
+    private func sidebarSeasonButton(_ season: SeasonSummary) -> some View {
+        let isSelected = selectedSeasonNumber == season.number
+        return Button {
+            withAnimation(.snappy(duration: 0.2)) {
+                selectedSeasonNumber = season.number
+            }
+        } label: {
+            HStack(spacing: 10) {
+                RoundedRectangle(cornerRadius: 2, style: .continuous)
+                    .fill(isSelected ? Color.mobileTeaAccentLight : Color.mobileTeaCream.opacity(0.12))
+                    .frame(width: 4, height: 34)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(season.name)
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(Color.mobileTeaCream)
+                    Text("\(season.episodeCount) episodes")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(Color.mobileTeaMuted)
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                Color.mobileTeaPanel.opacity(isSelected ? 0.82 : 0.28),
+                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(
+                        isSelected ? Color.mobileTeaAccentLight.opacity(0.42) : .clear,
+                        lineWidth: 1
+                    )
+            }
+        }
+        .buttonStyle(MobileCardButtonStyle())
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
     private var seasonPicker: some View {
@@ -167,75 +288,24 @@ struct IOSShowEpisodesView: View {
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
-    private func episodeCard(_ episode: Episode) -> some View {
+    private func episodeCard(_ episode: Episode, wide: Bool) -> some View {
         let history = history(for: episode)
         return Button {
             Task { await preparePlayback(for: episode) }
         } label: {
-            VStack(alignment: .leading, spacing: 12) {
-                MobileEpisodeStillImage(episode: episode)
-                    .aspectRatio(16 / 9, contentMode: .fit)
-                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                    .overlay {
-                        if preparingEpisodeID == episode.id {
-                            ZStack {
-                                Color.black.opacity(0.52)
-                                ProgressView()
-                                    .controlSize(.large)
-                                    .tint(Color.mobileTeaAccentLight)
-                            }
-                        } else {
-                            Image(systemName: "play.fill")
-                                .font(.system(size: 18, weight: .bold))
-                                .foregroundStyle(Color.mobileTeaCream)
-                                .frame(width: 50, height: 50)
-                                .background(Color.mobileTeaBackground.opacity(0.84), in: Circle())
-                                .overlay {
-                                    Circle()
-                                        .stroke(Color.mobileTeaAccentLight.opacity(0.72), lineWidth: 1.5)
-                                }
-                                .shadow(color: .black.opacity(0.4), radius: 10, y: 5)
-                                .accessibilityHidden(true)
-                        }
+            Group {
+                if wide {
+                    HStack(alignment: .top, spacing: 18) {
+                        episodeArtwork(episode, history: history)
+                            .frame(width: 210, height: 118)
+                        episodeMetadata(episode, history: history, wide: true)
                     }
-                    .overlay(alignment: .bottom) {
-                        if let history, history.progress > 0 {
-                            ProgressView(value: history.progress)
-                                .tint(Color.mobileTeaAccent)
-                                .padding(.horizontal, 12)
-                                .padding(.bottom, 9)
-                        }
+                } else {
+                    VStack(alignment: .leading, spacing: 12) {
+                        episodeArtwork(episode, history: history)
+                            .aspectRatio(16 / 9, contentMode: .fit)
+                        episodeMetadata(episode, history: history, wide: false)
                     }
-
-                HStack(alignment: .firstTextBaseline, spacing: 9) {
-                    Text(String(episode.episodeNumber))
-                        .font(.headline.monospacedDigit().weight(.bold))
-                        .foregroundStyle(Color.mobileTeaAccentLight)
-                    Text(episode.title)
-                        .font(.headline.weight(.bold))
-                        .foregroundStyle(Color.mobileTeaCream)
-                        .multilineTextAlignment(.leading)
-                    Spacer()
-                    if let runtime = episode.runtimeMinutes, runtime > 0 {
-                        Text("\(runtime)m")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(Color.mobileTeaMuted)
-                    }
-                }
-
-                if let overview = episode.overview, !overview.isEmpty {
-                    Text(overview)
-                        .font(.subheadline)
-                        .foregroundStyle(Color.mobileTeaCream.opacity(0.72))
-                        .lineSpacing(3)
-                        .lineLimit(4)
-                        .multilineTextAlignment(.leading)
-                }
-
-                if let history, history.progress > 0 {
-                    Text(history.completed ? "Watched" : "\(Int(history.progress * 100))% watched")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(Color.mobileTeaAccentLight)
                 }
             }
             .padding(13)
@@ -255,6 +325,85 @@ struct IOSShowEpisodesView: View {
         }
         .buttonStyle(MobileCardButtonStyle())
         .disabled(preparingEpisodeID != nil)
+    }
+
+    private func episodeArtwork(
+        _ episode: Episode,
+        history: WatchHistoryEntry?
+    ) -> some View {
+        MobileEpisodeStillImage(episode: episode)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay {
+                if preparingEpisodeID == episode.id {
+                    ZStack {
+                        Color.black.opacity(0.52)
+                        ProgressView()
+                            .controlSize(.large)
+                            .tint(Color.mobileTeaAccentLight)
+                    }
+                } else {
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 18, weight: .bold))
+                        .foregroundStyle(Color.mobileTeaCream)
+                        .frame(width: 50, height: 50)
+                        .background(Color.mobileTeaBackground.opacity(0.84), in: Circle())
+                        .overlay {
+                            Circle()
+                                .stroke(Color.mobileTeaAccentLight.opacity(0.72), lineWidth: 1.5)
+                        }
+                        .shadow(color: .black.opacity(0.4), radius: 10, y: 5)
+                        .accessibilityHidden(true)
+                }
+            }
+            .overlay(alignment: .bottom) {
+                if let history, history.progress > 0 {
+                    ProgressView(value: history.progress)
+                        .tint(Color.mobileTeaAccent)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 9)
+                }
+            }
+    }
+
+    private func episodeMetadata(
+        _ episode: Episode,
+        history: WatchHistoryEntry?,
+        wide: Bool
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .firstTextBaseline, spacing: 9) {
+                Text(String(episode.episodeNumber))
+                    .font(.headline.monospacedDigit().weight(.bold))
+                    .foregroundStyle(Color.mobileTeaAccentLight)
+                Text(episode.title)
+                    .font(.headline.weight(.bold))
+                    .foregroundStyle(Color.mobileTeaCream)
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(wide ? 2 : nil)
+                Spacer()
+                if let runtime = episode.runtimeMinutes, runtime > 0 {
+                    Text("\(runtime)m")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color.mobileTeaMuted)
+                }
+            }
+
+            if let overview = episode.overview, !overview.isEmpty {
+                Text(overview)
+                    .font(.subheadline)
+                    .foregroundStyle(Color.mobileTeaCream.opacity(0.72))
+                    .lineSpacing(3)
+                    .lineLimit(wide ? 3 : 4)
+                    .multilineTextAlignment(.leading)
+            }
+
+            if let history, history.progress > 0 {
+                Text(history.completed ? "Watched" : "\(Int(history.progress * 100))% watched")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(Color.mobileTeaAccentLight)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func history(for episode: Episode) -> WatchHistoryEntry? {

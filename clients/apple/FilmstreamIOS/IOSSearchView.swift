@@ -3,14 +3,14 @@ import SwiftUI
 
 struct IOSSearchView: View {
     @Environment(IOSAppModel.self) private var model
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var query = ""
     @State private var results: [Movie] = []
     @State private var isSearching = false
     @State private var errorMessage: String?
 
     private let columns = [
-        GridItem(.flexible(), spacing: 14),
-        GridItem(.flexible(), spacing: 14),
+        GridItem(.adaptive(minimum: 150, maximum: 230), spacing: 18),
     ]
 
     var body: some View {
@@ -39,9 +39,11 @@ struct IOSSearchView: View {
                             .foregroundStyle(Color.mobileTeaMuted.opacity(0.75))
                     }
                 }
-                .padding(.horizontal, 18)
+                .frame(maxWidth: 1_120, alignment: .leading)
+                .padding(.horizontal, horizontalSizeClass == .regular ? 30 : 18)
                 .padding(.top, 16)
                 .padding(.bottom, 32)
+                .frame(maxWidth: .infinity)
             }
         }
         .navigationTitle("Search")

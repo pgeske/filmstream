@@ -34,18 +34,14 @@ struct IOSShowDetailView: View {
 
     var body: some View {
         GeometryReader { geometry in
-            ZStack {
-                MobileTeaBackground()
-
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 0) {
-                        backdrop(width: geometry.size.width)
-                        content
-                    }
-                    .padding(.bottom, 36)
-                }
-                .frame(width: geometry.size.width, height: geometry.size.height)
-                .ignoresSafeArea(edges: .top)
+            let layout = IOSAdaptiveLayout(
+                width: geometry.size.width,
+                height: geometry.size.height
+            )
+            if layout.usesCinematicDetail {
+                cinematicLayout(width: geometry.size.width)
+            } else {
+                compactLayout(width: geometry.size.width, layout: layout)
             }
         }
         .navigationTitle("")
@@ -75,6 +71,39 @@ struct IOSShowDetailView: View {
                 }
             )
             .id(session.id)
+        }
+    }
+
+    private func compactLayout(width: CGFloat, layout: IOSAdaptiveLayout) -> some View {
+        ZStack {
+            MobileTeaBackground()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    backdrop(width: width)
+                    detailContent(showsTitle: false)
+                        .frame(maxWidth: layout.isWide ? 760 : .infinity)
+                        .frame(maxWidth: .infinity)
+                }
+                .padding(.bottom, 36)
+            }
+            .frame(width: width)
+            .ignoresSafeArea(edges: .top)
+        }
+    }
+
+    private func cinematicLayout(width: CGFloat) -> some View {
+        ZStack(alignment: .leading) {
+            IOSCinematicDetailBackground(movie: details?.show ?? show)
+
+            ScrollView(.vertical, showsIndicators: false) {
+                detailContent(showsTitle: true)
+                    .frame(maxWidth: min(620, width * 0.64), alignment: .leading)
+                    .padding(.leading, max(44, width * 0.06))
+                    .padding(.trailing, 30)
+                    .padding(.vertical, 54)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
     }
 
@@ -117,8 +146,15 @@ struct IOSShowDetailView: View {
             }
     }
 
-    private var content: some View {
-        VStack(alignment: .leading, spacing: 18) {
+    private func detailContent(showsTitle: Bool) -> some View {
+        VStack(alignment: .leading, spacing: showsTitle ? 20 : 18) {
+            if showsTitle {
+                Text((details?.show ?? show).title)
+                    .font(.system(size: 48, weight: .black, design: .rounded))
+                    .foregroundStyle(Color.mobileTeaCream)
+                    .lineLimit(2)
+            }
+
             Text(metadataSummary)
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(Color.mobileTeaMuted)

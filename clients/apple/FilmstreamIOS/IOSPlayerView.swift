@@ -1,12 +1,16 @@
 import AVFoundation
+import AVKit
 import Combine
 import FilmstreamCore
 import Foundation
+import MediaPlayer
 import SwiftUI
 import UIKit
 
 struct IOSPlayerView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
 
     let movie: Movie
     let prepared: PreparedPlayback
@@ -15,6 +19,7 @@ struct IOSPlayerView: View {
     let onPlayNext: (@MainActor (Episode) async throws -> Void)?
 
     @StateObject private var controller: IOSPlaybackController
+    @StateObject private var pictureInPicture = IOSPictureInPictureController()
     @State private var didClose = false
     @State private var didSaveEndProgress = false
     @State private var isChromeVisible = true
@@ -36,7 +41,7 @@ struct IOSPlayerView: View {
         self.nextEpisode = nextEpisode
         self.onPlayNext = onPlayNext
         _controller = StateObject(
-            wrappedValue: IOSPlaybackController(prepared: prepared, api: api)
+            wrappedValue: IOSPlaybackController(movie: movie, prepared: prepared, api: api)
         )
     }
 
@@ -44,23 +49,40 @@ struct IOSPlayerView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            IOSPlayerSurface(player: controller.player)
-                .ignoresSafeArea()
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    toggleChromeVisibility()
+            IOSPlayerSurface(
+                player: controller.player,
+                pictureInPicture: pictureInPicture
+            )
+            .ignoresSafeArea()
+            .contentShape(Rectangle())
+            .onTapGesture {
+                toggleChromeVisibility()
+            }
+            .onContinuousHover { phase in
+                if case .active = phase {
+                    revealChrome()
                 }
+            }
 
             if let subtitle = controller.activeSubtitleText {
                 VStack {
                     Spacer()
                     Text(subtitle)
-                        .font(.system(size: 22, weight: .semibold, design: .rounded))
+                        .font(.system(
+                            size: horizontalSizeClass == .regular ? 30 : 22,
+                            weight: .semibold,
+                            design: .rounded
+                        ))
                         .foregroundStyle(.white)
                         .multilineTextAlignment(.center)
                         .lineSpacing(3)
                         .padding(.horizontal, 24)
-                        .padding(.bottom, isChromeVisible ? 180 : 28)
+                        .padding(
+                            .bottom,
+                            isChromeVisible
+                                ? (verticalSizeClass == .compact ? 145 : 190)
+                                : 28
+                        )
                         .shadow(color: .black, radius: 3, x: 1, y: 1)
                         .shadow(color: .black.opacity(0.9), radius: 7)
                         .animation(.easeOut(duration: 0.2), value: isChromeVisible)
@@ -68,10 +90,10 @@ struct IOSPlayerView: View {
                 .allowsHitTesting(false)
             }
 
-            if isChromeVisible {
-                chrome
-                    .transition(.opacity)
-            }
+            chrome
+                .opacity(isChromeVisible ? 1 : 0)
+                .allowsHitTesting(isChromeVisible)
+                .accessibilityHidden(!isChromeVisible)
 
             if let errorMessage = nextEpisodeError ?? controller.errorMessage {
                 VStack(spacing: 12) {
@@ -111,6 +133,7 @@ struct IOSPlayerView: View {
         .persistentSystemOverlays(.hidden)
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
+            controller.activateMediaSession()
             controller.play()
             scheduleAutoHide()
         }
@@ -132,6 +155,19 @@ struct IOSPlayerView: View {
             if didReachEnd, nextEpisode != nil, onPlayNext != nil {
                 startNextEpisode()
             }
+        }
+        .alert(
+            "Unable to Start Picture in Picture",
+            isPresented: Binding(
+                get: { pictureInPicture.errorMessage != nil },
+                set: { if !$0 { pictureInPicture.clearError() } }
+            )
+        ) {
+            Button("OK") {
+                pictureInPicture.clearError()
+            }
+        } message: {
+            Text(pictureInPicture.errorMessage ?? "Picture in Picture is unavailable.")
         }
         .task {
             while !Task.isCancelled {
@@ -171,6 +207,7 @@ struct IOSPlayerView: View {
                     }
             }
             .buttonStyle(MobileCardButtonStyle())
+            .keyboardShortcut(.cancelAction)
             .accessibilityLabel("Close player")
 
             Text(movie.title)
@@ -178,6 +215,25 @@ struct IOSPlayerView: View {
                 .lineLimit(1)
 
             Spacer()
+
+            Button {
+                pictureInPicture.toggle()
+                revealChrome()
+            } label: {
+                Image(systemName: pictureInPicture.isActive ? "pip.exit" : "pip.enter")
+                    .font(.headline)
+                    .frame(width: 44, height: 44)
+                    .background(.black.opacity(0.58), in: Circle())
+                    .overlay {
+                        Circle()
+                            .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                    }
+            }
+            .buttonStyle(MobileCardButtonStyle())
+            .disabled(!pictureInPicture.isPossible && !pictureInPicture.isActive)
+            .accessibilityLabel(
+                pictureInPicture.isActive ? "Exit Picture in Picture" : "Picture in Picture"
+            )
 
             Menu {
                 if controller.subtitleOptions.isEmpty {
@@ -269,6 +325,8 @@ struct IOSPlayerView: View {
                     controller.jump(by: -30)
                     revealChrome()
                 }
+                .keyboardShortcut(.leftArrow, modifiers: [])
+
                 playerButton(
                     systemImage: controller.isPlaying ? "pause.fill" : "play.fill",
                     label: controller.isPlaying ? "Pause" : "Play",
@@ -277,10 +335,13 @@ struct IOSPlayerView: View {
                     controller.togglePlayback()
                     revealChrome()
                 }
+                .keyboardShortcut(.space, modifiers: [])
+
                 playerButton(systemImage: "goforward.30", label: "Forward 30 seconds") {
                     controller.jump(by: 30)
                     revealChrome()
                 }
+                .keyboardShortcut(.rightArrow, modifiers: [])
                 Spacer()
             }
         }
@@ -288,6 +349,8 @@ struct IOSPlayerView: View {
         .padding(.horizontal, 20)
         .padding(.top, 42)
         .padding(.bottom, 16)
+        .frame(maxWidth: 1_050)
+        .frame(maxWidth: .infinity)
         .background(
             LinearGradient(
                 colors: [.clear, .black.opacity(0.88)],
@@ -500,10 +563,13 @@ private struct IOSPlaybackLoadingIndicator: View {
 
 private struct IOSPlayerSurface: UIViewRepresentable {
     let player: AVPlayer
+    let pictureInPicture: IOSPictureInPictureController
 
     func makeUIView(context: Context) -> IOSPlayerSurfaceView {
         let view = IOSPlayerSurfaceView()
         view.player = player
+        view.pictureInPicture = pictureInPicture
+        pictureInPicture.attach(to: view.playerLayer)
         return view
     }
 
@@ -511,22 +577,28 @@ private struct IOSPlayerSurface: UIViewRepresentable {
         if view.player !== player {
             view.player = player
         }
+        view.pictureInPicture = pictureInPicture
+        pictureInPicture.attach(to: view.playerLayer)
     }
 
     static func dismantleUIView(_ view: IOSPlayerSurfaceView, coordinator: Void) {
+        view.pictureInPicture?.detach(from: view.playerLayer)
         view.player = nil
+        view.pictureInPicture = nil
     }
 }
 
 private final class IOSPlayerSurfaceView: UIView {
     override class var layerClass: AnyClass { AVPlayerLayer.self }
 
+    weak var pictureInPicture: IOSPictureInPictureController?
+
     var player: AVPlayer? {
         get { playerLayer.player }
         set { playerLayer.player = newValue }
     }
 
-    private var playerLayer: AVPlayerLayer {
+    var playerLayer: AVPlayerLayer {
         layer as! AVPlayerLayer
     }
 
@@ -538,6 +610,101 @@ private final class IOSPlayerSurfaceView: UIView {
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+}
+
+@MainActor
+private final class IOSPictureInPictureController: NSObject, ObservableObject {
+    @Published private(set) var isPossible = false
+    @Published private(set) var isActive = false
+    @Published private(set) var errorMessage: String?
+
+    private weak var playerLayer: AVPlayerLayer?
+    private var controller: AVPictureInPictureController?
+    private var possibleObservation: NSKeyValueObservation?
+
+    func attach(to playerLayer: AVPlayerLayer) {
+        guard self.playerLayer !== playerLayer else { return }
+        detach()
+        self.playerLayer = playerLayer
+
+        guard AVPictureInPictureController.isPictureInPictureSupported() else {
+            isPossible = false
+            return
+        }
+
+        let contentSource = AVPictureInPictureController.ContentSource(playerLayer: playerLayer)
+        let controller = AVPictureInPictureController(contentSource: contentSource)
+        controller.delegate = self
+        controller.canStartPictureInPictureAutomaticallyFromInline = true
+        self.controller = controller
+        possibleObservation = controller.observe(
+            \.isPictureInPicturePossible,
+            options: [.initial, .new]
+        ) { [weak self] controller, _ in
+            let isPossible = controller.isPictureInPicturePossible
+            Task { @MainActor in
+                self?.isPossible = isPossible
+            }
+        }
+    }
+
+    func toggle() {
+        guard let controller else { return }
+        errorMessage = nil
+        if controller.isPictureInPictureActive {
+            controller.stopPictureInPicture()
+        } else if controller.isPictureInPicturePossible {
+            controller.startPictureInPicture()
+        }
+    }
+
+    func detach(from playerLayer: AVPlayerLayer? = nil) {
+        guard playerLayer == nil || self.playerLayer === playerLayer else { return }
+        if controller?.isPictureInPictureActive == true {
+            controller?.stopPictureInPicture()
+        }
+        possibleObservation?.invalidate()
+        possibleObservation = nil
+        controller?.delegate = nil
+        controller?.contentSource = nil
+        controller = nil
+        self.playerLayer = nil
+        isPossible = false
+        isActive = false
+    }
+
+    func clearError() {
+        errorMessage = nil
+    }
+}
+
+extension IOSPictureInPictureController: @preconcurrency AVPictureInPictureControllerDelegate {
+    func pictureInPictureControllerDidStartPictureInPicture(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) {
+        isActive = true
+    }
+
+    func pictureInPictureControllerDidStopPictureInPicture(
+        _ pictureInPictureController: AVPictureInPictureController
+    ) {
+        isActive = false
+    }
+
+    func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
+        failedToStartPictureInPictureWithError error: any Error
+    ) {
+        isActive = false
+        errorMessage = error.localizedDescription
+    }
+
+    func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
+        restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
+    ) {
+        completionHandler(true)
     }
 }
 
@@ -577,6 +744,7 @@ private final class IOSPlaybackController: ObservableObject {
     @Published private(set) var activeSubtitleText: String?
 
     private let api: FilmstreamAPI
+    private let movie: Movie
     private let playback: Playback
     private var timeline: HLSPlaybackTimeline
     private var burnedSubtitleIndex: Int?
@@ -584,6 +752,7 @@ private final class IOSPlaybackController: ObservableObject {
     private var statusObservation: NSKeyValueObservation?
     private var playbackObservation: NSKeyValueObservation?
     private var itemEndObserver: NSObjectProtocol?
+    private var remoteCommandTargets: [(MPRemoteCommand, Any)] = []
     private var seekTask: Task<Void, Never>?
     private var subtitleTask: Task<Void, Never>?
     private var subtitleSwitchTask: Task<Void, Never>?
@@ -595,9 +764,15 @@ private final class IOSPlaybackController: ObservableObject {
     private var resumeAfterSeek = true
     private var wantsToPlay = false
     private var stopped = false
+    private var mediaSessionIsActive = false
+    private var mediaSessionID: String?
+    private var lastNowPlayingSecond = -1
 
-    init(prepared: PreparedPlayback, api: FilmstreamAPI) {
+    private static var activeMediaSessionID: String?
+
+    init(movie: Movie, prepared: PreparedPlayback, api: FilmstreamAPI) {
         self.api = api
+        self.movie = movie
         playback = prepared.playback
         timeline = prepared.hls.timeline
         positionSeconds = timeline.requestedSeconds
@@ -606,9 +781,6 @@ private final class IOSPlaybackController: ObservableObject {
         subtitleOptions = prepared.hls.subtitles ?? []
         selectedSubtitle = Self.preferredSubtitle(in: subtitleOptions)
         burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
-
-        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
-        try? AVAudioSession.sharedInstance().setActive(true)
 
         player.automaticallyWaitsToMinimizeStalling = true
         player.actionAtItemEnd = .pause
@@ -637,6 +809,11 @@ private final class IOSPlaybackController: ObservableObject {
                         self.durationSeconds > 0 ? self.durationSeconds : .greatestFiniteMagnitude
                     )
                     self.updateActiveSubtitle()
+                    let elapsedSecond = Int(self.positionSeconds)
+                    if elapsedSecond / 5 != self.lastNowPlayingSecond / 5 {
+                        self.lastNowPlayingSecond = elapsedSecond
+                        self.publishNowPlayingInfo()
+                    }
                 }
             }
         }
@@ -649,6 +826,7 @@ private final class IOSPlaybackController: ObservableObject {
                 switch player.timeControlStatus {
                 case .playing:
                     self.cancelPlaybackFailure()
+                    self.wantsToPlay = true
                     self.isPlaying = true
                     self.isWaiting = false
                     self.stateLabel = "Playing"
@@ -659,6 +837,9 @@ private final class IOSPlaybackController: ObservableObject {
                     self.schedulePlaybackFailure()
                 case .paused:
                     self.cancelPlaybackFailure()
+                    if self.subtitleSwitchTask == nil {
+                        self.wantsToPlay = false
+                    }
                     self.isPlaying = false
                     self.isWaiting = false
                     self.stateLabel = "Paused"
@@ -666,6 +847,7 @@ private final class IOSPlaybackController: ObservableObject {
                     self.isWaiting = true
                     self.stateLabel = "Preparing Stream…"
                 }
+                self.publishNowPlayingInfo()
             }
         }
     }
@@ -677,6 +859,7 @@ private final class IOSPlaybackController: ObservableObject {
         isPlaying = true
         didReachEnd = false
         player.play()
+        publishNowPlayingInfo()
     }
 
     func pause() {
@@ -684,6 +867,41 @@ private final class IOSPlaybackController: ObservableObject {
         wantsToPlay = false
         isPlaying = false
         player.pause()
+        publishNowPlayingInfo()
+    }
+
+    func activateMediaSession() {
+        guard !mediaSessionIsActive else { return }
+        let audioSession = AVAudioSession.sharedInstance()
+        try? audioSession.setCategory(.playback, mode: .moviePlayback)
+        try? audioSession.setActive(true)
+
+        let commands = MPRemoteCommandCenter.shared()
+        commands.playCommand.isEnabled = true
+        commands.pauseCommand.isEnabled = true
+        commands.togglePlayPauseCommand.isEnabled = true
+        let playTarget = commands.playCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.play() }
+            return .success
+        }
+        let pauseTarget = commands.pauseCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.pause() }
+            return .success
+        }
+        let toggleTarget = commands.togglePlayPauseCommand.addTarget { [weak self] _ in
+            Task { @MainActor in self?.togglePlayback() }
+            return .success
+        }
+        remoteCommandTargets = [
+            (commands.playCommand, playTarget),
+            (commands.pauseCommand, pauseTarget),
+            (commands.togglePlayPauseCommand, toggleTarget),
+        ]
+        let sessionID = UUID().uuidString
+        mediaSessionID = sessionID
+        Self.activeMediaSessionID = sessionID
+        mediaSessionIsActive = true
+        publishNowPlayingInfo()
     }
 
     func togglePlayback() {
@@ -693,11 +911,57 @@ private final class IOSPlaybackController: ObservableObject {
             isPlaying = resumeAfterSeek
             return
         }
-        if wantsToPlay {
+        if player.timeControlStatus == .playing || (wantsToPlay && player.timeControlStatus != .paused) {
             pause()
         } else {
             play()
         }
+    }
+
+    private func publishNowPlayingInfo() {
+        guard mediaSessionIsActive else { return }
+        var info: [String: Any] = [
+            MPMediaItemPropertyTitle: movie.episodeTitle ?? movie.title,
+            MPNowPlayingInfoPropertyExternalContentIdentifier: mediaSessionID ?? playback.id,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: positionSeconds,
+            MPNowPlayingInfoPropertyPlaybackRate: wantsToPlay ? 1.0 : 0.0,
+        ]
+        if let seriesTitle = movie.seriesTitle {
+            info[MPMediaItemPropertyAlbumTitle] = seriesTitle
+        }
+        if let episodeLabel = movie.episodeLabel {
+            info[MPMediaItemPropertyArtist] = episodeLabel
+        }
+        if durationSeconds > 0 {
+            info[MPMediaItemPropertyPlaybackDuration] = durationSeconds
+        }
+        let center = MPNowPlayingInfoCenter.default()
+        center.nowPlayingInfo = info
+        center.playbackState = wantsToPlay ? .playing : .paused
+    }
+
+    private func deactivateMediaSession() {
+        guard mediaSessionIsActive else { return }
+        for (command, target) in remoteCommandTargets {
+            command.removeTarget(target)
+        }
+        remoteCommandTargets.removeAll()
+        mediaSessionIsActive = false
+        let sessionID = mediaSessionID
+        mediaSessionID = nil
+        guard Self.activeMediaSessionID == sessionID else { return }
+        Self.activeMediaSessionID = nil
+        let commands = MPRemoteCommandCenter.shared()
+        commands.playCommand.isEnabled = false
+        commands.pauseCommand.isEnabled = false
+        commands.togglePlayPauseCommand.isEnabled = false
+        let center = MPNowPlayingInfoCenter.default()
+        center.nowPlayingInfo = nil
+        center.playbackState = .stopped
+        try? AVAudioSession.sharedInstance().setActive(
+            false,
+            options: .notifyOthersOnDeactivation
+        )
     }
 
     func jump(by seconds: Double) {
@@ -781,6 +1045,7 @@ private final class IOSPlaybackController: ObservableObject {
         subtitleSwitchTask?.cancel()
         subtitleSwitchTask = nil
         cancelPlaybackFailure()
+        deactivateMediaSession()
         if let itemEndObserver {
             NotificationCenter.default.removeObserver(itemEndObserver)
             self.itemEndObserver = nil
@@ -1044,6 +1309,7 @@ private final class IOSPlaybackController: ObservableObject {
                 self.isWaiting = false
                 self.didReachEnd = true
                 self.stateLabel = "Episode Finished"
+                self.publishNowPlayingInfo()
             }
         }
         player.replaceCurrentItem(with: item)
