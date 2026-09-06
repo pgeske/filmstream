@@ -1062,12 +1062,10 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 	var selected *catalog.RankedCandidate
 	if request.Query != "" {
 		isShow := request.MediaType == "show"
-		preferSeasonPack := isShow && s.shouldPreferSeasonPack(r.Context(), request)
 		search := catalog.SearchRequest{
 			Query: request.Query, Year: request.Year, MediaType: request.MediaType,
 			SeasonNumber: request.SeasonNumber, EpisodeNumber: request.EpisodeNumber,
-			PreferSeasonPack: preferSeasonPack,
-			Preferences:      preferences,
+			Preferences: preferences,
 		}
 		allowUsenet := !isShow && s.playbackSourceMode != config.PlaybackSourceTorrentOnly
 		allowTorrent := isShow || s.playbackSourceMode != config.PlaybackSourceUsenetOnly
@@ -1165,6 +1163,9 @@ func (s *Server) createPlayback(w http.ResponseWriter, r *http.Request) {
 						protocol = catalog.ProtocolTorrent
 					}
 					searchStarted := time.Now()
+					// Cached releases and rankings already made this decision. Avoid
+					// blocking their fast path on show/season metadata requests.
+					search.PreferSeasonPack = isShow && s.shouldPreferSeasonPack(r.Context(), request)
 					ranked, searchErr = s.searchAndRank(r.Context(), search, request.OriginalTitle, protocol)
 					externalSearchDuration += time.Since(searchStarted)
 					if searchErr == nil {
@@ -1465,11 +1466,12 @@ func (s *Server) createCachedPlayback(
 	if cacheMediaID == "" {
 		return nil, nil, nil
 	}
+	// Season-pack preference only chooses between candidates; it cannot change
+	// eligibility when validating a single cached release.
 	cachedSearch := catalog.SearchRequest{
 		Query: request.Query, Year: request.Year, MediaType: request.MediaType,
 		SeasonNumber: request.SeasonNumber, EpisodeNumber: request.EpisodeNumber,
-		PreferSeasonPack: request.MediaType == string(metadata.MediaTypeShow) && s.shouldPreferSeasonPack(ctx, request),
-		Preferences:      request.Preferences,
+		Preferences: request.Preferences,
 	}
 	if len(catalog.Rank(cachedSearch, []catalog.Candidate{cached.Selected.Candidate})) == 0 {
 		if removeErr := s.playbackCache.Remove(cacheMediaID, request.Query, request.Year); removeErr != nil {

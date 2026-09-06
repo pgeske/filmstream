@@ -37,6 +37,16 @@ type fakeResolver struct{}
 
 type fakeMetadata struct{}
 
+type countingShowMetadata struct {
+	fakeMetadata
+	showCalls int
+}
+
+func (m *countingShowMetadata) Show(ctx context.Context, id string) (metadata.Show, error) {
+	m.showCalls++
+	return m.fakeMetadata.Show(ctx, id)
+}
+
 type imdbDiscoveryMetadata struct {
 	fakeMetadata
 	calls int
@@ -629,7 +639,7 @@ func TestCreatePlaybackReusesCachedUsenetReleaseWithoutSearching(t *testing.T) {
 // A persisted release must be replayed without re-searching even when the freshly
 // mounted swarm has not connected any peers yet; otherwise slow tracker or DHT
 // startup would evict a known-good release and force a full search on every replay.
-func TestCreatePlaybackReusesCachedTorrentReleaseWithoutSearching(t *testing.T) {
+func TestCreatePlaybackReusesCachedTorrentReleaseWithoutSearchingOrLoadingMetadata(t *testing.T) {
 	dataDir := t.TempDir()
 	torrentContents := createAPITestTorrentForFile(t, dataDir, "Original.Show.S01E02.mp4")
 	var searches atomic.Int32
@@ -667,6 +677,8 @@ func TestCreatePlaybackReusesCachedTorrentReleaseWithoutSearching(t *testing.T) 
 	server := New(registry, torrentEngine, catalog.Preferences{Codecs: []string{"h264"}}, slog.Default())
 	server.playbackSourceMode = config.PlaybackSourceTorrentOnly
 	server.hlsManager = &fakeHLSManager{}
+	provider := &countingShowMetadata{}
+	server.SetMetadataProvider(provider)
 	store := playbackcache.New(t.TempDir())
 	server.SetPlaybackCache(store)
 
@@ -718,6 +730,21 @@ func TestCreatePlaybackReusesCachedTorrentReleaseWithoutSearching(t *testing.T) 
 	create()
 	if searches.Load() != 0 {
 		t.Fatalf("second replay searched indexers %d times, want 0", searches.Load())
+	}
+
+	// A prefetched ranking must skip the metadata lookup too, even when no
+	// successful release has been persisted yet.
+	server.playbackCache = nil
+	selected.Candidate.Indexer = "torrent"
+	selected.Candidate.TorrentURL = indexerServer.URL + "/download/season"
+	server.cacheReleaseSearch(CreatePlaybackRequest{
+		MediaID: "tmdb-tv:3:s1:e2", MediaType: "show", Query: "Original Show", Year: 2020,
+		SeriesID: "tmdb-tv:3", SeasonNumber: 1, EpisodeNumber: 2,
+		Preferences: catalog.Preferences{Codecs: []string{"h264"}},
+	}, []catalog.RankedCandidate{selected})
+	create()
+	if searches.Load() != 0 || provider.showCalls != 0 {
+		t.Fatalf("cached paths made %d release searches and %d metadata calls", searches.Load(), provider.showCalls)
 	}
 }
 

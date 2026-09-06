@@ -50,6 +50,59 @@ func TestEngineServesRangesWithoutRequestingTheWholeFile(t *testing.T) {
 	}
 }
 
+func TestSlowMetainfoDownloadDoesNotBlockCachedMount(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentPath, _, _ := createTestTorrent(t, dataDir)
+	contents, err := os.ReadFile(torrentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	downloadStarted := make(chan struct{})
+	unblockDownload := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(downloadStarted)
+		select {
+		case <-unblockDownload:
+			_, _ = w.Write(contents)
+		case <-r.Context().Done():
+		}
+	}))
+	defer upstream.Close()
+	engine := newTestEngine(t, dataDir, Config{})
+	defer engine.Close()
+	slowResult := make(chan error, 1)
+	go func() {
+		_, err := engine.Create(t.Context(), Source{TorrentURL: upstream.URL})
+		slowResult <- err
+	}()
+	// Always release the blocked network call before closing the engine, even
+	// when the assertion fails. Both mounts must still register successfully.
+	defer func() {
+		close(unblockDownload)
+		if err := <-slowResult; err != nil {
+			t.Error(err)
+		}
+	}()
+	select {
+	case <-downloadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("metainfo download did not start")
+	}
+	cachedResult := make(chan error, 1)
+	go func() {
+		_, err := engine.Create(t.Context(), Source{TorrentPath: torrentPath})
+		cachedResult <- err
+	}()
+	select {
+	case err := <-cachedResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cached mount waited for unrelated metainfo download")
+	}
+}
+
 func TestEngineColdTorrentStartsDialingWhenSourceReadCreatesDemand(t *testing.T) {
 	seedDataDir := t.TempDir()
 	torrentPath, _, contents := createTestTorrent(t, seedDataDir)

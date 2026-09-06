@@ -393,13 +393,34 @@ func (e *Engine) Create(ctx context.Context, source Source) (*Session, error) {
 	} else if source.TorrentPath != "" {
 		sourceKind = "torrent_path"
 	}
-	e.lifecycleMu.Lock()
-	defer e.lifecycleMu.Unlock()
 	addStarted := time.Now()
-	t, err := e.addTorrent(ctx, source)
-	addSourceDuration := time.Since(addStarted)
+	// Download metadata before locking the torrent lifecycle. A slow indexer
+	// must not hold up a cached replay, another mount, or required seed cleanup.
+	var meta *metainfo.MetaInfo
+	var err error
+	if source.TorrentURL != "" {
+		meta, err = e.downloadMetainfo(ctx, source.TorrentURL)
+	} else if source.TorrentPath != "" {
+		meta, err = metainfo.LoadFromFile(source.TorrentPath)
+		if err != nil {
+			err = fmt.Errorf("load torrent file: %w", err)
+		}
+	}
 	if err != nil {
 		return nil, err
+	}
+
+	e.lifecycleMu.Lock()
+	defer e.lifecycleMu.Unlock()
+	var t *torrent.Torrent
+	if meta != nil {
+		t, err = e.client.AddTorrent(meta)
+	} else {
+		t, err = e.client.AddMagnet(source.MagnetURI)
+	}
+	addSourceDuration := time.Since(addStarted)
+	if err != nil {
+		return nil, fmt.Errorf("add %s: %w", sourceKind, err)
 	}
 	metadataContext, cancel := context.WithTimeout(ctx, e.metadataTimeout)
 	defer cancel()
@@ -1253,37 +1274,6 @@ func transferRatio(downloaded, uploaded int64) float64 {
 
 func ratioTargetMet(downloaded int64, ratio, target float64) bool {
 	return target <= 0 || downloaded > 0 && ratio >= target
-}
-
-func (e *Engine) addTorrent(ctx context.Context, source Source) (*torrent.Torrent, error) {
-	switch {
-	case source.MagnetURI != "":
-		t, err := e.client.AddMagnet(source.MagnetURI)
-		if err != nil {
-			return nil, fmt.Errorf("add magnet: %w", err)
-		}
-		return t, nil
-	case source.TorrentPath != "":
-		meta, err := metainfo.LoadFromFile(source.TorrentPath)
-		if err != nil {
-			return nil, fmt.Errorf("load torrent file: %w", err)
-		}
-		t, err := e.client.AddTorrent(meta)
-		if err != nil {
-			return nil, fmt.Errorf("add torrent file: %w", err)
-		}
-		return t, nil
-	default:
-		meta, err := e.downloadMetainfo(ctx, source.TorrentURL)
-		if err != nil {
-			return nil, err
-		}
-		t, err := e.client.AddTorrent(meta)
-		if err != nil {
-			return nil, fmt.Errorf("add torrent URL: %w", err)
-		}
-		return t, nil
-	}
 }
 
 func (e *Engine) downloadMetainfo(ctx context.Context, torrentURL string) (*metainfo.MetaInfo, error) {
