@@ -1285,7 +1285,6 @@ func (s *Server) searchAndRank(
 			"metadata_ranking_duration", rankingDuration, "total_duration", time.Since(totalStarted))
 	}()
 	var failures []error
-	hadSuccessfulSearch := false
 	seenCandidates := make(map[string]bool)
 	for _, title := range titles {
 		attemptedTitles = append(attemptedTitles, title)
@@ -1308,9 +1307,8 @@ func (s *Server) searchAndRank(
 		}
 		if err != nil {
 			failures = append(failures, err)
-			continue
+			s.logger.Warn("release search incomplete", "query", title, "protocol", protocol, "error", err)
 		}
-		hadSuccessfulSearch = true
 		rankingStarted := time.Now()
 		rankedForTitle, diagnostics := catalog.RankWithDiagnostics(search, candidates)
 		rankingDuration += time.Since(rankingStarted)
@@ -1341,7 +1339,7 @@ func (s *Server) searchAndRank(
 			break
 		}
 	}
-	if !hadSuccessfulSearch && len(failures) > 0 {
+	if len(rankedCandidates) == 0 && len(failures) > 0 {
 		return nil, errors.Join(failures...)
 	}
 	sort.SliceStable(rankedCandidates, func(i, j int) bool {
