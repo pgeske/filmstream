@@ -50,6 +50,59 @@ func TestEngineServesRangesWithoutRequestingTheWholeFile(t *testing.T) {
 	}
 }
 
+func TestSlowMetainfoDownloadDoesNotBlockCachedMount(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentPath, _, _ := createTestTorrent(t, dataDir)
+	contents, err := os.ReadFile(torrentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	downloadStarted := make(chan struct{})
+	unblockDownload := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(downloadStarted)
+		select {
+		case <-unblockDownload:
+			_, _ = w.Write(contents)
+		case <-r.Context().Done():
+		}
+	}))
+	defer upstream.Close()
+	engine := newTestEngine(t, dataDir, Config{})
+	defer engine.Close()
+	slowResult := make(chan error, 1)
+	go func() {
+		_, err := engine.Create(t.Context(), Source{TorrentURL: upstream.URL})
+		slowResult <- err
+	}()
+	// Always release the blocked network call before closing the engine, even
+	// when the assertion fails. Both mounts must still register successfully.
+	defer func() {
+		close(unblockDownload)
+		if err := <-slowResult; err != nil {
+			t.Error(err)
+		}
+	}()
+	select {
+	case <-downloadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("metainfo download did not start")
+	}
+	cachedResult := make(chan error, 1)
+	go func() {
+		_, err := engine.Create(t.Context(), Source{TorrentPath: torrentPath})
+		cachedResult <- err
+	}()
+	select {
+	case err := <-cachedResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cached mount waited for unrelated metainfo download")
+	}
+}
+
 func TestEngineColdTorrentStartsDialingWhenSourceReadCreatesDemand(t *testing.T) {
 	seedDataDir := t.TempDir()
 	torrentPath, _, contents := createTestTorrent(t, seedDataDir)
@@ -453,6 +506,51 @@ func TestEngineMarksAStalledHLSPlaybackUnavailable(t *testing.T) {
 	second := engine.MarkSourceUnavailable(session.ID, errors.New("second stall"))
 	if second != unavailable {
 		t.Fatalf("second source error = %v, want original %v", second, unavailable)
+	}
+}
+
+func TestServeReadinessRenewsBudgetAfterSourceRecovers(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentPath, _, _ := createTestTorrent(t, dataDir)
+	engine := newTestEngine(t, dataDir, Config{})
+	defer engine.Close()
+	session, err := engine.Create(t.Context(), Source{TorrentPath: torrentPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Verify the fixture before simulating an old, successful playback. A later
+	// resume must not inherit the original playback's exhausted startup clock.
+	if err := engine.ensureServeReadiness(t.Context(), session, 0); err != nil {
+		t.Fatal(err)
+	}
+	engine.serveMu.Lock()
+	session.serveDeadline = time.Now().Add(-18 * time.Hour)
+	session.serveInitialPending = 10
+	session.serveDialObserved = true
+	engine.serveMu.Unlock()
+	if err := engine.ensureServeReadiness(t.Context(), session, 0); err != nil {
+		t.Fatal(err)
+	}
+	engine.serveMu.Lock()
+	cleared := session.serveDeadline.IsZero()
+	engine.serveMu.Unlock()
+	if !cleared {
+		t.Fatal("successful source read retained the previous readiness window")
+	}
+	before := time.Now()
+	deadline, unavailable := engine.serveReadinessState(session)
+	if unavailable != nil || deadline.Before(before.Add(engine.serveWait)) {
+		t.Fatalf("new readiness window = %s, error = %v", deadline, unavailable)
+	}
+	engine.serveMu.Lock()
+	resetDiagnostics := session.serveInitialPending == 0 && !session.serveDialObserved
+	engine.serveMu.Unlock()
+	if !resetDiagnostics {
+		t.Fatal("new readiness window retained old dial diagnostics")
+	}
+	shared, _ := engine.serveReadinessState(session)
+	if !shared.Equal(deadline) {
+		t.Fatal("consecutive blocked ranges must share the same deadline")
 	}
 }
 

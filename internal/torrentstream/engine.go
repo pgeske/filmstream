@@ -393,13 +393,34 @@ func (e *Engine) Create(ctx context.Context, source Source) (*Session, error) {
 	} else if source.TorrentPath != "" {
 		sourceKind = "torrent_path"
 	}
-	e.lifecycleMu.Lock()
-	defer e.lifecycleMu.Unlock()
 	addStarted := time.Now()
-	t, err := e.addTorrent(ctx, source)
-	addSourceDuration := time.Since(addStarted)
+	// Download metadata before locking the torrent lifecycle. A slow indexer
+	// must not hold up a cached replay, another mount, or required seed cleanup.
+	var meta *metainfo.MetaInfo
+	var err error
+	if source.TorrentURL != "" {
+		meta, err = e.downloadMetainfo(ctx, source.TorrentURL)
+	} else if source.TorrentPath != "" {
+		meta, err = metainfo.LoadFromFile(source.TorrentPath)
+		if err != nil {
+			err = fmt.Errorf("load torrent file: %w", err)
+		}
+	}
 	if err != nil {
 		return nil, err
+	}
+
+	e.lifecycleMu.Lock()
+	defer e.lifecycleMu.Unlock()
+	var t *torrent.Torrent
+	if meta != nil {
+		t, err = e.client.AddTorrent(meta)
+	} else {
+		t, err = e.client.AddMagnet(source.MagnetURI)
+	}
+	addSourceDuration := time.Since(addStarted)
+	if err != nil {
+		return nil, fmt.Errorf("add %s: %w", sourceKind, err)
 	}
 	metadataContext, cancel := context.WithTimeout(ctx, e.metadataTimeout)
 	defer cancel()
@@ -735,7 +756,18 @@ func requestReadStart(r *http.Request, size int64) int64 {
 // local data, then waits a bounded window for the swarm. Without this, a
 // playback mounted on a dead swarm stalls silently inside the first read until
 // the client's request times out with no log or error anywhere.
-func (e *Engine) ensureServeReadiness(ctx context.Context, session *Session, readStart int64) error {
+func (e *Engine) ensureServeReadiness(ctx context.Context, session *Session, readStart int64) (err error) {
+	defer func() {
+		if err == nil {
+			// A source that can serve reads has recovered. Do not carry its old
+			// startup deadline into a later seek or resume after peers disconnect.
+			e.serveMu.Lock()
+			if session.serveUnavailable == nil {
+				session.serveDeadline = time.Time{}
+			}
+			e.serveMu.Unlock()
+		}
+	}()
 	deadline, unavailable := e.serveReadinessState(session)
 	if unavailable != nil {
 		return unavailable
@@ -821,14 +853,16 @@ func (e *Engine) observeServeDial(session *Session, stats torrent.TorrentStats) 
 	e.serveMu.Unlock()
 }
 
-// serveReadinessState starts one deadline for the session. FFprobe and FFmpeg
-// make several range requests during startup; giving every request a new wait
-// allowed those requests to chain 15-second stalls for minutes.
+// serveReadinessState shares one deadline across consecutive blocked reads.
+// FFprobe and FFmpeg make several range requests during startup; only a source
+// that becomes ready may renew the budget, never a failed or canceled read.
 func (e *Engine) serveReadinessState(session *Session) (time.Time, error) {
 	e.serveMu.Lock()
 	defer e.serveMu.Unlock()
 	if session.serveDeadline.IsZero() {
 		session.serveDeadline = time.Now().Add(e.serveWait)
+		session.serveInitialPending = 0
+		session.serveDialObserved = false
 	}
 	return session.serveDeadline, session.serveUnavailable
 }
@@ -1240,37 +1274,6 @@ func transferRatio(downloaded, uploaded int64) float64 {
 
 func ratioTargetMet(downloaded int64, ratio, target float64) bool {
 	return target <= 0 || downloaded > 0 && ratio >= target
-}
-
-func (e *Engine) addTorrent(ctx context.Context, source Source) (*torrent.Torrent, error) {
-	switch {
-	case source.MagnetURI != "":
-		t, err := e.client.AddMagnet(source.MagnetURI)
-		if err != nil {
-			return nil, fmt.Errorf("add magnet: %w", err)
-		}
-		return t, nil
-	case source.TorrentPath != "":
-		meta, err := metainfo.LoadFromFile(source.TorrentPath)
-		if err != nil {
-			return nil, fmt.Errorf("load torrent file: %w", err)
-		}
-		t, err := e.client.AddTorrent(meta)
-		if err != nil {
-			return nil, fmt.Errorf("add torrent file: %w", err)
-		}
-		return t, nil
-	default:
-		meta, err := e.downloadMetainfo(ctx, source.TorrentURL)
-		if err != nil {
-			return nil, err
-		}
-		t, err := e.client.AddTorrent(meta)
-		if err != nil {
-			return nil, fmt.Errorf("add torrent URL: %w", err)
-		}
-		return t, nil
-	}
 }
 
 func (e *Engine) downloadMetainfo(ctx context.Context, torrentURL string) (*metainfo.MetaInfo, error) {

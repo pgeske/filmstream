@@ -135,7 +135,9 @@ func (r *Registry) SearchProtocol(
 // SearchProtocolUntil starts every configured search concurrently and returns as
 // soon as the accumulated candidates satisfy the caller. Irrelevant fast results
 // therefore cannot hide a matching result from another indexer, while a strong
-// primary result does not wait for every slower source.
+// primary result does not wait for every slower source. If searches fail before
+// enough matches arrive, return partial candidates with the error so the caller
+// can distinguish an empty ranking from an incomplete search.
 func (r *Registry) SearchProtocolUntil(
 	ctx context.Context,
 	request catalog.SearchRequest,
@@ -186,8 +188,11 @@ func (r *Registry) SearchProtocolUntil(
 			return candidates, nil
 		}
 	}
-	if successes == 0 && len(failures) > 0 {
-		return nil, fmt.Errorf("all indexers failed: %s", strings.Join(failures, "; "))
+	if len(failures) > 0 {
+		if successes == 0 {
+			return nil, fmt.Errorf("all indexers failed: %s", strings.Join(failures, "; "))
+		}
+		return candidates, fmt.Errorf("some indexers failed: %s", strings.Join(failures, "; "))
 	}
 	return candidates, nil
 }

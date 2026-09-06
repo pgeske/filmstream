@@ -85,6 +85,52 @@ func TestMovieAndShowReleaseSearchBothSkipIrrelevantFastIndexer(t *testing.T) {
 	}
 }
 
+func TestReleaseSearchDoesNotHideIndexerFailuresBehindIrrelevantResults(t *testing.T) {
+	for _, usable := range []bool{false, true} {
+		t.Run(fmt.Sprintf("usable=%t", usable), func(t *testing.T) {
+			failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			}))
+			defer failing.Close()
+			registry, err := indexer.NewRegistry([]config.Indexer{
+				{Name: "fixtures", Type: "open_media", Endpoint: "https://example.test/torrents"},
+				{Name: "release-indexer", Type: "torznab", Endpoint: failing.URL},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := newReleaseOnlyTestServer(registry, catalog.Preferences{})
+			var logs bytes.Buffer
+			server.logger = slog.New(slog.NewTextHandler(&logs, nil))
+			request := catalog.SearchRequest{
+				Query: "Modern Family", MediaType: "show", SeasonNumber: 2, EpisodeNumber: 18,
+			}
+			if usable {
+				request = catalog.SearchRequest{Query: "Sintel", Year: 2010, MediaType: "movie"}
+			}
+			ranked, err := server.searchAndRank(t.Context(), request, "", catalog.ProtocolTorrent)
+			if usable {
+				if err != nil || len(ranked) == 0 {
+					t.Fatalf("usable partial results = %+v, error = %v", ranked, err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "release-indexer") || len(ranked) != 0 {
+				t.Fatalf("incomplete search = %+v, error = %v", ranked, err)
+			}
+			if !strings.Contains(logs.String(), "release search incomplete") {
+				t.Fatalf("missing incomplete-search diagnostic: %s", logs.String())
+			}
+			if !usable {
+				response := httptest.NewRecorder()
+				server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/playbacks",
+					strings.NewReader(`{"query":"Modern Family","media_type":"show","series_id":"tmdb-tv:1421","season_number":2,"episode_number":18}`)))
+				if response.Code != http.StatusBadGateway || !strings.Contains(response.Body.String(), "release-indexer") {
+					t.Fatalf("incomplete search response = %d %s", response.Code, response.Body.String())
+				}
+			}
+		})
+	}
+}
+
 func TestTorrentMoviePrewarmCachesPopularMovieRankingsWithoutMounting(t *testing.T) {
 	var searches atomic.Int32
 	indexerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
