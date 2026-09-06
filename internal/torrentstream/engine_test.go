@@ -456,6 +456,51 @@ func TestEngineMarksAStalledHLSPlaybackUnavailable(t *testing.T) {
 	}
 }
 
+func TestServeReadinessRenewsBudgetAfterSourceRecovers(t *testing.T) {
+	dataDir := t.TempDir()
+	torrentPath, _, _ := createTestTorrent(t, dataDir)
+	engine := newTestEngine(t, dataDir, Config{})
+	defer engine.Close()
+	session, err := engine.Create(t.Context(), Source{TorrentPath: torrentPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Verify the fixture before simulating an old, successful playback. A later
+	// resume must not inherit the original playback's exhausted startup clock.
+	if err := engine.ensureServeReadiness(t.Context(), session, 0); err != nil {
+		t.Fatal(err)
+	}
+	engine.serveMu.Lock()
+	session.serveDeadline = time.Now().Add(-18 * time.Hour)
+	session.serveInitialPending = 10
+	session.serveDialObserved = true
+	engine.serveMu.Unlock()
+	if err := engine.ensureServeReadiness(t.Context(), session, 0); err != nil {
+		t.Fatal(err)
+	}
+	engine.serveMu.Lock()
+	cleared := session.serveDeadline.IsZero()
+	engine.serveMu.Unlock()
+	if !cleared {
+		t.Fatal("successful source read retained the previous readiness window")
+	}
+	before := time.Now()
+	deadline, unavailable := engine.serveReadinessState(session)
+	if unavailable != nil || deadline.Before(before.Add(engine.serveWait)) {
+		t.Fatalf("new readiness window = %s, error = %v", deadline, unavailable)
+	}
+	engine.serveMu.Lock()
+	resetDiagnostics := session.serveInitialPending == 0 && !session.serveDialObserved
+	engine.serveMu.Unlock()
+	if !resetDiagnostics {
+		t.Fatal("new readiness window retained old dial diagnostics")
+	}
+	shared, _ := engine.serveReadinessState(session)
+	if !shared.Equal(deadline) {
+		t.Fatal("consecutive blocked ranges must share the same deadline")
+	}
+}
+
 func TestEngineFailsFastWhenSwarmCannotServeReads(t *testing.T) {
 	dataDir := t.TempDir()
 	torrentPath, videoPath, _ := createTestTorrent(t, dataDir)

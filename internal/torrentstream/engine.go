@@ -735,7 +735,18 @@ func requestReadStart(r *http.Request, size int64) int64 {
 // local data, then waits a bounded window for the swarm. Without this, a
 // playback mounted on a dead swarm stalls silently inside the first read until
 // the client's request times out with no log or error anywhere.
-func (e *Engine) ensureServeReadiness(ctx context.Context, session *Session, readStart int64) error {
+func (e *Engine) ensureServeReadiness(ctx context.Context, session *Session, readStart int64) (err error) {
+	defer func() {
+		if err == nil {
+			// A source that can serve reads has recovered. Do not carry its old
+			// startup deadline into a later seek or resume after peers disconnect.
+			e.serveMu.Lock()
+			if session.serveUnavailable == nil {
+				session.serveDeadline = time.Time{}
+			}
+			e.serveMu.Unlock()
+		}
+	}()
 	deadline, unavailable := e.serveReadinessState(session)
 	if unavailable != nil {
 		return unavailable
@@ -821,14 +832,16 @@ func (e *Engine) observeServeDial(session *Session, stats torrent.TorrentStats) 
 	e.serveMu.Unlock()
 }
 
-// serveReadinessState starts one deadline for the session. FFprobe and FFmpeg
-// make several range requests during startup; giving every request a new wait
-// allowed those requests to chain 15-second stalls for minutes.
+// serveReadinessState shares one deadline across consecutive blocked reads.
+// FFprobe and FFmpeg make several range requests during startup; only a source
+// that becomes ready may renew the budget, never a failed or canceled read.
 func (e *Engine) serveReadinessState(session *Session) (time.Time, error) {
 	e.serveMu.Lock()
 	defer e.serveMu.Unlock()
 	if session.serveDeadline.IsZero() {
 		session.serveDeadline = time.Now().Add(e.serveWait)
+		session.serveInitialPending = 0
+		session.serveDialObserved = false
 	}
 	return session.serveDeadline, session.serveUnavailable
 }
