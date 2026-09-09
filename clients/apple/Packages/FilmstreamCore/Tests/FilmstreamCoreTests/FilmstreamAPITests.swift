@@ -138,8 +138,8 @@ import Testing
 // The retry tests share a static URLProtocol handler, so they must not run concurrently.
 @Suite(.serialized)
 private struct FilmstreamAPIRetryTests {
-    @Test(arguments: [400, 401, 403, 503])
-    func nativePreparationDoesNotReplaceSessionForNonrecoverableErrors(status: Int) async throws {
+    @Test(arguments: [400, 401, 403, 409, 503], [true, false])
+    func nativePreparationDoesNotReplaceSessionForNonrecoverableErrors(status: Int, probeSubtitles: Bool) async throws {
         let attempts = AttemptCounter()
         RetryTestURLProtocol.handler = { _ in
             _ = attempts.increment()
@@ -155,10 +155,58 @@ private struct FilmstreamAPIRetryTests {
         let playback = try JSONDecoder().decode(Playback.self, from: Data(#"{"id":"existing","name":"Episode","file_name":"episode.mkv","file_size":1000,"stream_url":"https://filmstream.test/stream"}"#.utf8))
         await #expect(throws: FilmstreamError.server(status: status, message: "fixture failure")) {
             try await api.prepareNativePlaybackWithRetry(
-                playback, for: Movie(id: "episode", title: "Episode"), startSeconds: 60
+                playback, for: Movie(id: "episode", title: "Episode"), startSeconds: 60,
+                useSavedSubtitlePreference: probeSubtitles
             )
         }
         #expect(attempts.current == 1)
+    }
+
+    @Test(.timeLimit(.minutes(1)), arguments: [404, 502], [true, false])
+    func recoverablePreparationReplacesAtMostOnce(status: Int, replacementSucceeds: Bool) async throws {
+        let creations = AttemptCounter()
+        let preparations = AttemptCounter()
+        let cleanup = AsyncStream.makeStream(of: String.self)
+        var cleanupEvents = cleanup.stream.makeAsyncIterator()
+        RetryTestURLProtocol.handler = { request in
+            let path = request.url!.path
+            if request.httpMethod == "DELETE" {
+                cleanup.continuation.yield(path)
+                return .success((200, Data(#"{"status":"ok"}"#.utf8)))
+            }
+            if path == "/v1/playbacks" {
+                _ = creations.increment()
+                return .success((201, Data(#"{"id":"replacement","name":"Fixture","file_name":"fixture.mkv","file_size":1000,"stream_url":"https://filmstream.test/stream"}"#.utf8)))
+            }
+            _ = preparations.increment()
+            if path == "/v1/playbacks/replacement/hls", replacementSucceeds {
+                return .success((201, Data(#"{"playback_id":"replacement","playlist_url":"https://filmstream.test/index.m3u8","start_seconds":60,"video_codec":"h264"}"#.utf8)))
+            }
+            return .success((status, Data(#"{"error":"producer unavailable"}"#.utf8)))
+        }
+        defer { RetryTestURLProtocol.handler = nil }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RetryTestURLProtocol.self]
+        let api = FilmstreamAPI(
+            baseURL: URL(string: "https://filmstream.test")!,
+            session: URLSession(configuration: configuration)
+        )
+        let playback = try JSONDecoder().decode(Playback.self, from: Data(#"{"id":"existing","name":"Fixture","file_name":"fixture.mkv","file_size":1000,"stream_url":"https://filmstream.test/stream"}"#.utf8))
+        do {
+            let prepared = try await api.prepareNativePlaybackWithRetry(
+                playback, for: Movie(id: "fixture", title: "Fixture"), startSeconds: 60,
+                useSavedSubtitlePreference: false
+            )
+            #expect(replacementSucceeds)
+            #expect(prepared.playback.id == "replacement")
+        } catch {
+            #expect(!replacementSucceeds)
+            #expect(error as? FilmstreamError == .server(status: status, message: "producer unavailable"))
+            // A failed retry cleans only its own replacement, never the original.
+            #expect(await cleanupEvents.next() == "/v1/playbacks/replacement/hls")
+        }
+        #expect(creations.current == 1)
+        #expect(preparations.current == 2)
     }
 
     @Test func canceledNativePreparationDoesNotCreateAReplacementSession() async throws {

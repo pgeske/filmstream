@@ -1185,6 +1185,11 @@ func (m *Manager) monitorSource(parent context.Context, playbackID string) (cont
 }
 
 func (m *Manager) preferSourceUnavailable(playbackID string, fallback error) error {
+	// Retirement remains cancellation even if the source also becomes unavailable.
+	// Otherwise an abandoned operation can invalidate a cache or trigger replacement.
+	if errors.Is(fallback, context.Canceled) {
+		return fallback
+	}
 	if m.sourceUnavailable != nil {
 		if err := m.sourceUnavailable(playbackID); err != nil {
 			return err

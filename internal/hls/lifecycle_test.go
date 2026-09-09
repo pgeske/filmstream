@@ -307,6 +307,26 @@ printf '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:2.0,\nsegment-000000.m4s\n#E
 	}
 }
 
+func TestParkedPrewarmIsNotProducerFailure(t *testing.T) {
+	manager := newLifecycleTestManager(t, nil, "")
+	if _, err := manager.Start(t.Context(), "prewarm", 0, nil, -1); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Park(t.Context(), "prewarm", 8); err != nil {
+		t.Fatal(err)
+	}
+	status, ok := manager.Status("prewarm")
+	if !ok || status.State != "parked" || status.Error != "" || status.Complete {
+		t.Fatalf("parked prewarm status = %+v, exists=%v", status, ok)
+	}
+	if !manager.Prepared("prewarm", 0, nil, -1, 8) {
+		t.Fatal("parked buffer was not available for an explicit resume growth check")
+	}
+	if _, err := manager.AssetPath("prewarm", "index.m3u8"); err != nil {
+		t.Fatalf("parked playlist was treated as failed: %v", err)
+	}
+}
+
 func TestRetiredLifetimeCannotQuarantineReplay(t *testing.T) {
 	marked := false
 	manager := newLifecycleTestManager(t, func(string, error) error {
@@ -362,6 +382,39 @@ printf '{"streams":[{"index":2,"codec_name":"subrip","codec_type":"subtitle"}]}'
 	manager.probeMu.Unlock()
 	if !retained {
 		t.Fatal("canceled waiter discarded the shared probe")
+	}
+}
+
+func TestStoppedProbePreservesCancellationWhenSourceAlsoFails(t *testing.T) {
+	manager := newLifecycleTestManager(t, nil, "")
+	lifetime := manager.lifetimeForPlayback("stopped")
+	// A retired session may also report a source error. That must not turn
+	// the old operation's cancellation into a 502/replacement on the client.
+	manager.sourceUnavailable = func(string) error {
+		if lifetime.ctx.Err() != nil {
+			return errors.New("fixture source unavailable")
+		}
+		return nil
+	}
+	gate := filepath.Join(t.TempDir(), "probe")
+	manager.ffprobePath = writeExecutable(t, "stopped-probe", fmt.Sprintf(`#!/bin/sh
+touch %q
+exec sleep 60
+`, gate))
+	result := make(chan error, 1)
+	go func() {
+		_, err := manager.ProbeSubtitles(t.Context(), "stopped")
+		result <- err
+	}()
+	waitForLifecycleFile(t, gate)
+	manager.Stop("stopped")
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("retired probe returned %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retired probe did not finish")
 	}
 }
 

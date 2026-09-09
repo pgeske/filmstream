@@ -92,6 +92,24 @@ func TestCanceledHLSRequestsPreserveSelectedRelease(t *testing.T) {
 	}
 }
 
+func TestPlaybackStatusOmitsHLSWithoutPublishedPackaging(t *testing.T) {
+	server := &Server{
+		engine: &fakeTorrentPlaybackEngine{statuses: map[string]torrentstream.Status{
+			"playback": {ID: "playback", State: "seeding"},
+		}},
+		hlsManager: &fakeHLSManager{},
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/playbacks/playback", nil))
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &fields); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusOK || string(fields["state"]) != `"seeding"` || fields["hls"] != nil {
+		t.Fatalf("legacy status changed without HLS packaging: %s", response.Body)
+	}
+}
+
 type failedProducerManager struct{ fakeHLSManager }
 
 func (*failedProducerManager) Status(string) (hls.Status, bool) {
