@@ -9,6 +9,7 @@ struct MacShowEpisodesView: View {
     @State private var loadedSeason: ShowSeason?
     @State private var isLoading = false
     @State private var preparingEpisodeID: String?
+    @State private var preparation = PlaybackPreparation()
     @State private var hoveredEpisodeID: String?
     @State private var errorMessage: String?
 
@@ -34,6 +35,8 @@ struct MacShowEpisodesView: View {
         .task(id: selectedSeasonNumber) {
             await loadSelectedSeason()
         }
+        .onDisappear { preparation.cancel() }
+        .onChange(of: selectedSeasonNumber) { _, _ in preparation.cancel() }
     }
 
     private var seasonSidebar: some View {
@@ -101,7 +104,7 @@ struct MacShowEpisodesView: View {
                 }
             }
 
-            if let errorMessage {
+            if let errorMessage = preparation.errorMessage ?? errorMessage {
                 Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                     .font(.headline)
                     .foregroundStyle(Color.macTeaAmber)
@@ -123,14 +126,14 @@ struct MacShowEpisodesView: View {
         let history = history(for: episode)
         let isHovered = hoveredEpisodeID == episode.id
         return Button {
-            Task { await preparePlayback(for: episode) }
+            preparePlayback(for: episode)
         } label: {
             HStack(spacing: 18) {
                 MacEpisodeStillImage(episode: episode)
                     .frame(width: 260, height: 146)
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
                     .overlay {
-                        if preparingEpisodeID == episode.id {
+                        if preparation.isPreparing && preparingEpisodeID == episode.id {
                             ZStack {
                                 Color.black.opacity(0.5)
                                 ProgressView()
@@ -200,7 +203,7 @@ struct MacShowEpisodesView: View {
         .onHover { isHovering in
             hoveredEpisodeID = isHovering ? episode.id : nil
         }
-        .disabled(preparingEpisodeID != nil)
+        .disabled(preparation.isPreparing)
     }
 
     private func history(for episode: Episode) -> WatchHistoryEntry? {
@@ -209,40 +212,34 @@ struct MacShowEpisodesView: View {
 
     private func loadSelectedSeason() async {
         isLoading = true
-        defer { isLoading = false }
+        defer { if !Task.isCancelled { isLoading = false } }
         do {
-            loadedSeason = try await model.api.season(selectedSeasonNumber, for: details.show.id)
+            let season = try await model.api.season(selectedSeasonNumber, for: details.show.id)
+            try Task.checkCancellation()
+            loadedSeason = season
             errorMessage = nil
         } catch {
+            guard !Task.isCancelled else { return }
             errorMessage = error.localizedDescription
         }
     }
 
-    private func preparePlayback(for episode: Episode) async {
+    private func preparePlayback(for episode: Episode) {
         preparingEpisodeID = episode.id
-        defer { preparingEpisodeID = nil }
+        errorMessage = nil
         let movie = episode.playbackMovie(in: details.show)
         let startSeconds = history(for: episode).flatMap {
             !$0.completed && $0.positionSeconds >= 30 ? $0.positionSeconds : nil
         } ?? 0
-        do {
-            let nextEpisodeTask = Task {
-                try? await model.api.nextEpisode(after: episode, in: details)
-            }
-            let prepared = try await model.preparePlayback(
-                for: movie,
-                startSeconds: startSeconds,
-                onStage: { _ in }
-            )
+        preparation.start(
+            api: model.api,
+            movie: movie,
+            startSeconds: startSeconds,
+            nextEpisode: { try? await model.api.nextEpisode(after: episode, in: details) }
+        ) { prepared, nextEpisode in
             model.presentPlayback(
-                movie: movie,
-                prepared: prepared,
-                details: details,
-                nextEpisode: await nextEpisodeTask.value
+                movie: movie, prepared: prepared, details: details, nextEpisode: nextEpisode
             )
-            errorMessage = nil
-        } catch {
-            errorMessage = error.localizedDescription
         }
     }
 }

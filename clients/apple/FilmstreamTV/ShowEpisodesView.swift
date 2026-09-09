@@ -10,7 +10,8 @@ struct ShowEpisodesView: View {
     @State private var activePlayback: TVEpisodeBrowserPlaybackSession?
     @State private var isLoading = false
     @State private var preparingEpisodeID: String?
-    @State private var preparationStage: PlaybackPreparationStage?
+    @State private var preparation = PlaybackPreparation()
+    private var preparationStage: PlaybackPreparationStage? { preparation.stage }
     @State private var errorMessage: String?
     @FocusState private var focusedSeasonNumber: Int?
     @FocusState private var focusedEpisodeID: String?
@@ -39,6 +40,8 @@ struct ShowEpisodesView: View {
         .task(id: selectedSeasonNumber) {
             await loadSelectedSeason()
         }
+        .onDisappear { preparation.cancel() }
+        .onChange(of: selectedSeasonNumber) { _, _ in preparation.cancel() }
         .onAppear {
             focusedSeasonNumber = selectedSeasonNumber
         }
@@ -164,7 +167,7 @@ struct ShowEpisodesView: View {
                 }
             }
 
-            if let errorMessage {
+            if let errorMessage = preparation.errorMessage ?? errorMessage {
                 Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                     .font(.headline)
                     .foregroundStyle(Color.teaAmber)
@@ -186,14 +189,14 @@ struct ShowEpisodesView: View {
         let history = history(for: episode)
         let isFocused = focusedEpisodeID == episode.id
         return Button {
-            Task { await preparePlayback(for: episode) }
+            preparePlayback(for: episode)
         } label: {
             HStack(spacing: 24) {
                 EpisodeStillImage(episode: episode)
                     .frame(width: 310, height: 174)
                     .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                     .overlay(alignment: .center) {
-                        if preparingEpisodeID == episode.id {
+                        if preparation.isPreparing && preparingEpisodeID == episode.id {
                             ZStack {
                                 Color.black.opacity(0.48)
                                 ProgressView()
@@ -273,7 +276,7 @@ struct ShowEpisodesView: View {
         .buttonStyle(EpisodeBrowserButtonStyle())
         .focusEffectDisabled()
         .focused($focusedEpisodeID, equals: episode.id)
-        .disabled(preparingEpisodeID != nil)
+        .disabled(preparation.isPreparing)
     }
 
     private func history(for episode: Episode) -> WatchHistoryEntry? {
@@ -282,11 +285,14 @@ struct ShowEpisodesView: View {
 
     private func loadSelectedSeason() async {
         isLoading = true
-        defer { isLoading = false }
+        defer { if !Task.isCancelled { isLoading = false } }
         do {
-            loadedSeason = try await model.api.season(selectedSeasonNumber, for: details.show.id)
+            let season = try await model.api.season(selectedSeasonNumber, for: details.show.id)
+            try Task.checkCancellation()
+            loadedSeason = season
             errorMessage = nil
         } catch {
+            guard !Task.isCancelled else { return }
             errorMessage = error.localizedDescription
         }
     }
@@ -300,48 +306,38 @@ struct ShowEpisodesView: View {
         }
     }
 
-    private func preparePlayback(for episode: Episode) async {
+    private func preparePlayback(for episode: Episode) {
         preparingEpisodeID = episode.id
-        defer {
-            preparingEpisodeID = nil
-            preparationStage = nil
-        }
+        errorMessage = nil
         let movie = episode.playbackMovie(in: details.show)
         let startSeconds = history(for: episode).flatMap {
             !$0.completed && $0.positionSeconds >= 30 ? $0.positionSeconds : nil
         } ?? 0
-        do {
-            let nextEpisodeTask = Task {
-                try? await model.api.nextEpisode(after: episode, in: details)
-            }
-            let prepared = try await model.preparePlayback(
-                for: movie,
-                startSeconds: startSeconds,
-                onStage: { preparationStage = $0 }
-            )
-            let nextEpisode = await nextEpisodeTask.value
+        preparation.start(
+            api: model.api,
+            movie: movie,
+            startSeconds: startSeconds,
+            nextEpisode: { try? await model.api.nextEpisode(after: episode, in: details) }
+        ) { prepared, nextEpisode in
             activePlayback = TVEpisodeBrowserPlaybackSession(
-                movie: movie,
-                prepared: prepared,
-                nextEpisode: nextEpisode
+                movie: movie, prepared: prepared, nextEpisode: nextEpisode
             )
-            errorMessage = nil
-        } catch {
-            errorMessage = error.localizedDescription
         }
     }
 
     private func advancePlayback(to episode: Episode) async throws {
         let movie = episode.playbackMovie(in: details.show)
-        let nextEpisodeTask = Task {
-            try? await model.api.nextEpisode(after: episode, in: details)
-        }
+        async let next = try? await model.api.nextEpisode(after: episode, in: details)
         let prepared = try await model.preparePlayback(
             for: movie,
             startSeconds: 0,
             onStage: { _ in }
         )
-        let nextEpisode = await nextEpisodeTask.value
+        let nextEpisode = await next
+        guard !Task.isCancelled else {
+            Task { try? await model.api.stopNativePlayback(prepared.playback.id) }
+            throw CancellationError()
+        }
         activePlayback = TVEpisodeBrowserPlaybackSession(
             movie: movie,
             prepared: prepared,

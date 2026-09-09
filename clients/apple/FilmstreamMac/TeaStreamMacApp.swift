@@ -158,12 +158,16 @@ final class MacAppModel {
     ) async throws -> PreparedPlayback {
         onStage(.findingRelease)
         let playback = try await api.createPlayback(for: movie, startSeconds: startSeconds)
-        onStage(.bufferingVideo)
-        return try await api.prepareNativePlaybackWithRetry(
-            playback,
-            for: movie,
-            startSeconds: startSeconds
-        )
+        do {
+            try Task.checkCancellation()
+            onStage(.bufferingVideo)
+            return try await api.prepareNativePlaybackWithRetry(
+                playback, for: movie, startSeconds: startSeconds
+            )
+        } catch {
+            Task { try? await api.stopNativePlayback(playback.id) }
+            throw error
+        }
     }
 
     func presentPlayback(
@@ -183,19 +187,22 @@ final class MacAppModel {
     func advancePlayback(to episode: Episode) async throws {
         guard let details = activePlayback?.details else { return }
         let movie = episode.playbackMovie(in: details.show)
-        let nextEpisodeTask = Task {
-            try? await api.nextEpisode(after: episode, in: details)
-        }
+        async let nextEpisode = try? await api.nextEpisode(after: episode, in: details)
         let prepared = try await preparePlayback(
             for: movie,
             startSeconds: 0,
             onStage: { _ in }
         )
+        let next = await nextEpisode
+        guard !Task.isCancelled else {
+            Task { try? await api.stopNativePlayback(prepared.playback.id) }
+            throw CancellationError()
+        }
         presentPlayback(
             movie: movie,
             prepared: prepared,
             details: details,
-            nextEpisode: await nextEpisodeTask.value
+            nextEpisode: next
         )
     }
 

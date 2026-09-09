@@ -138,6 +138,54 @@ import Testing
 // The retry tests share a static URLProtocol handler, so they must not run concurrently.
 @Suite(.serialized)
 private struct FilmstreamAPIRetryTests {
+    @Test(arguments: [400, 401, 403, 503])
+    func nativePreparationDoesNotReplaceSessionForNonrecoverableErrors(status: Int) async throws {
+        let attempts = AttemptCounter()
+        RetryTestURLProtocol.handler = { _ in
+            _ = attempts.increment()
+            return .success((status, Data(#"{"error":"fixture failure"}"#.utf8)))
+        }
+        defer { RetryTestURLProtocol.handler = nil }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RetryTestURLProtocol.self]
+        let api = FilmstreamAPI(
+            baseURL: URL(string: "https://filmstream.test")!,
+            session: URLSession(configuration: configuration)
+        )
+        let playback = try JSONDecoder().decode(Playback.self, from: Data(#"{"id":"existing","name":"Episode","file_name":"episode.mkv","file_size":1000,"stream_url":"https://filmstream.test/stream"}"#.utf8))
+        await #expect(throws: FilmstreamError.server(status: status, message: "fixture failure")) {
+            try await api.prepareNativePlaybackWithRetry(
+                playback, for: Movie(id: "episode", title: "Episode"), startSeconds: 60
+            )
+        }
+        #expect(attempts.current == 1)
+    }
+
+    @Test func canceledNativePreparationDoesNotCreateAReplacementSession() async throws {
+        let attempts = AttemptCounter()
+        RetryTestURLProtocol.handler = { _ in
+            _ = attempts.increment()
+            return .success((502, Data(#"{"error":"fixture failure"}"#.utf8)))
+        }
+        defer { RetryTestURLProtocol.handler = nil }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RetryTestURLProtocol.self]
+        let api = FilmstreamAPI(
+            baseURL: URL(string: "https://filmstream.test")!,
+            session: URLSession(configuration: configuration)
+        )
+        let playback = try JSONDecoder().decode(Playback.self, from: Data(#"{"id":"existing","name":"Episode","file_name":"episode.mkv","file_size":1000,"stream_url":"https://filmstream.test/stream"}"#.utf8))
+        let task = Task {
+            // Cancel deterministically before entering the API, not by racing a sleep.
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await api.prepareNativePlaybackWithRetry(
+                playback, for: Movie(id: "episode", title: "Episode"), startSeconds: 60
+            )
+        }
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(attempts.current == 0)
+    }
+
     @Test func transientTimeoutOnGetIsRetriedOnce() async throws {
         let attempts = AttemptCounter()
         RetryTestURLProtocol.handler = { _ in

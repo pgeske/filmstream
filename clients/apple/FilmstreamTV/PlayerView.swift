@@ -18,6 +18,7 @@ struct PlayerView: View {
 
     @StateObject private var controller: NativePlaybackController
     @State private var didClose = false
+    @State private var nextEpisodeTask: Task<Void, Never>?
     @State private var didSaveEndProgress = false
     @State private var isPlaybackChromeVisible = true
     @State private var isSubtitlePickerPresented = false
@@ -46,7 +47,7 @@ struct PlayerView: View {
     var body: some View {
         ZStack(alignment: .bottom) {
             Color.black.ignoresSafeArea()
-            NativePlayerSurface(player: controller.player)
+            NativePlayerSurface(controller: controller)
                 .ignoresSafeArea()
 
             if isPlaybackChromePresented {
@@ -324,11 +325,13 @@ struct PlayerView: View {
         controller.pause()
         revealPlaybackChrome(autoHide: false)
 
-        Task { @MainActor in
+        nextEpisodeTask = Task { @MainActor in
             didSaveEndProgress = await reportProgress()
             do {
+                try Task.checkCancellation()
                 try await onPlayNext(nextEpisode)
             } catch {
+                guard !Task.isCancelled, !didClose else { return }
                 isStartingNextEpisode = false
                 nextEpisodeError = error.localizedDescription
                 if !controller.didReachEnd {
@@ -351,6 +354,8 @@ struct PlayerView: View {
     private func closePlayback() {
         guard !didClose else { return }
         didClose = true
+        nextEpisodeTask?.cancel()
+        nextEpisodeTask = nil
         let playbackID = controller.playbackID
         let position = controller.positionSeconds
         let duration = controller.durationSeconds
@@ -580,11 +585,13 @@ private struct PlaybackLoadingIndicator: View {
 }
 
 private struct NativePlayerSurface: UIViewRepresentable {
-    let player: AVPlayer
+    let controller: NativePlaybackController
+    private var player: AVPlayer { controller.player }
 
     func makeUIView(context: Context) -> PlayerViewSurface {
         let view = PlayerViewSurface()
         view.player = player
+        controller.attachVideoLayer(view.playerLayer)
         return view
     }
 
@@ -601,7 +608,7 @@ private final class PlayerViewSurface: UIView {
         set { playerLayer.player = newValue }
     }
 
-    private var playerLayer: AVPlayerLayer {
+    var playerLayer: AVPlayerLayer {
         layer as! AVPlayerLayer
     }
 
@@ -647,9 +654,12 @@ private final class NativePlaybackController: ObservableObject {
     private var seekTask: Task<Void, Never>?
     private var subtitleTask: Task<Void, Never>?
     private var subtitleSwitchTask: Task<Void, Never>?
-    private var bufferingRecoveryTask: Task<Void, Never>?
+    private var recoveryTask: Task<Void, Never>?
     private var playbackFailureTask: Task<Void, Never>?
+    private var liveness: PlaybackLiveness?
+    private weak var videoLayer: AVPlayerLayer?
     private var subtitleCues: [SubtitleCue] = []
+    // Shared by seek, subtitle replacement, recovery, and terminal cancellation.
     private var seekGeneration = 0
     private var seekOriginSeconds: Double
     private var pendingSeekSeconds: Double?
@@ -700,7 +710,8 @@ private final class NativePlaybackController: ObservableObject {
                       !self.isSeeking,
                       !self.wasInterrupted,
                       !self.isRecovering else { return }
-                let current = time.seconds
+                // Ignore a queued tick's timestamp after an item/timeline replacement.
+                let current = self.player.currentTime().seconds
                 if current.isFinite, current >= 0 {
                     self.positionSeconds = min(
                         self.timeline.mediaSeconds(forPlayerSeconds: current),
@@ -720,30 +731,23 @@ private final class NativePlaybackController: ObservableObject {
 
         playbackObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] player, _ in
             Task { @MainActor in
-                guard let self, !self.stopped, !self.isSeeking else { return }
+                guard let self, !self.stopped, !self.isSeeking,
+                      self.subtitleSwitchTask == nil, self.errorMessage == nil else { return }
                 switch player.timeControlStatus {
                 case .playing:
-                    self.bufferingRecoveryTask?.cancel()
-                    self.bufferingRecoveryTask = nil
-                    self.cancelPlaybackFailure()
                     self.isPlaying = true
-                    self.isWaiting = false
-                    self.stateLabel = "Playing"
+                    self.isWaiting = self.videoLayer?.isReadyForDisplay != true
+                    self.stateLabel = self.isWaiting ? "Buffering…" : "Playing"
+                    self.schedulePlaybackFailure()
                 case .waitingToPlayAtSpecifiedRate:
                     self.isPlaying = self.wantsToPlay
                     self.isWaiting = true
                     self.stateLabel = self.isRecovering ? "Reconnecting…" : "Buffering…"
-                    self.scheduleBufferingRecovery()
                     self.schedulePlaybackFailure()
                 case .paused:
-                    if !self.isRecovering {
-                        self.bufferingRecoveryTask?.cancel()
-                        self.bufferingRecoveryTask = nil
-                        self.cancelPlaybackFailure()
-                    }
                     self.isPlaying = false
-                    self.isWaiting = self.isRecovering
-                    self.stateLabel = self.isRecovering ? "Reconnecting…" : "Paused"
+                    self.isWaiting = self.isRecovering || self.wantsToPlay
+                    self.stateLabel = self.isRecovering ? "Reconnecting…" : (self.wantsToPlay ? "Buffering…" : "Paused")
                 @unknown default:
                     self.isWaiting = true
                     self.stateLabel = "Preparing Stream…"
@@ -754,19 +758,21 @@ private final class NativePlaybackController: ObservableObject {
     }
 
     func play() {
-        guard !stopped else { return }
-        errorMessage = nil
+        guard !stopped, errorMessage == nil else { return }
         wantsToPlay = true
         isPlaying = true
         didReachEnd = false
         player.play()
+        schedulePlaybackFailure()
         publishNowPlayingInfo()
     }
 
     func pause() {
         guard !stopped else { return }
         wantsToPlay = false
+        resumeAfterSeek = false
         isPlaying = false
+        cancelPlaybackFailure()
         player.pause()
         publishNowPlayingInfo()
     }
@@ -809,6 +815,7 @@ private final class NativePlaybackController: ObservableObject {
         guard !stopped else { return }
         if isSeeking {
             resumeAfterSeek.toggle()
+            wantsToPlay = resumeAfterSeek
             isPlaying = resumeAfterSeek
             return
         }
@@ -872,15 +879,14 @@ private final class NativePlaybackController: ObservableObject {
         isPlaying = false
         isWaiting = false
         stateLabel = "Paused"
-        bufferingRecoveryTask?.cancel()
-        bufferingRecoveryTask = nil
+        _ = beginItemOperation()
         cancelPlaybackFailure()
         player.pause()
     }
 
     func reconnectAfterInterruption() async {
         guard wasInterrupted else { return }
-        await recoverPlayback()
+        startRecovery()
     }
 
     func jump(by seconds: Double) {
@@ -889,52 +895,59 @@ private final class NativePlaybackController: ObservableObject {
         seek(to: origin + seconds)
     }
 
-    private func scheduleBufferingRecovery() {
-        bufferingRecoveryTask?.cancel()
-        bufferingRecoveryTask = nil
-        guard wantsToPlay, !isRecovering, !isSeeking, !wasInterrupted else { return }
-        bufferingRecoveryTask = Task { @MainActor [weak self] in
-            do {
-                try await Task.sleep(for: NativePlaybackConfiguration.recoveryDelay)
-            } catch {
-                return
-            }
-            guard let self,
-                  !self.stopped,
-                  self.wantsToPlay,
-                  !self.isSeeking,
-                  self.player.timeControlStatus == .waitingToPlayAtSpecifiedRate else {
-                return
-            }
-            self.bufferingRecoveryTask = nil
-            await self.recoverPlayback()
-        }
+    func attachVideoLayer(_ layer: AVPlayerLayer) {
+        videoLayer = layer
     }
 
     private func schedulePlaybackFailure() {
         guard playbackFailureTask == nil, wantsToPlay, !stopped else { return }
+        liveness = PlaybackLiveness(now: ProcessInfo.processInfo.systemUptime, playerSeconds: player.currentTime().seconds)
         playbackFailureTask = Task { @MainActor [weak self] in
-            do {
-                try await Task.sleep(for: NativePlaybackConfiguration.stallTimeout)
-            } catch {
-                return
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .seconds(1))
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled, let self else { return }
+                guard !self.stopped, self.wantsToPlay else {
+                    self.playbackFailureTask = nil
+                    return
+                }
+                let playing = self.player.timeControlStatus == .playing
+                    && !self.isSeeking && !self.isRecovering && self.subtitleSwitchTask == nil
+                let ready = self.videoLayer?.isReadyForDisplay == true
+                if playing, ready {
+                    self.isWaiting = false
+                    self.stateLabel = "Playing"
+                }
+                let action = self.liveness?.observe(
+                    now: ProcessInfo.processInfo.systemUptime,
+                    playerSeconds: self.player.currentTime().seconds,
+                    isPlaying: playing,
+                    isReadyForDisplay: ready,
+                    canRecover: !self.isSeeking && !self.isRecovering
+                        && self.subtitleSwitchTask == nil && !self.wasInterrupted
+                )
+                switch action {
+                case .recover:
+                    self.startRecovery()
+                case .fail:
+                    _ = self.beginItemOperation()
+                    self.wantsToPlay = false
+                    self.isPlaying = false
+                    self.isWaiting = false
+                    self.stateLabel = "Unable to Play Stream"
+                    self.errorMessage = self.liveness?.hasRenderedPlayback == true
+                        ? "Playback stalled and could not resume. Close the player and try this episode again."
+                        : "The stream did not begin playing. Close the player and try this episode again."
+                    self.player.pause()
+                    self.playbackFailureTask = nil
+                    return
+                default:
+                    break
+                }
             }
-            guard let self,
-                  !self.stopped,
-                  self.wantsToPlay,
-                  self.player.timeControlStatus != .playing else {
-                return
-            }
-            self.bufferingRecoveryTask?.cancel()
-            self.bufferingRecoveryTask = nil
-            self.isRecovering = false
-            self.wantsToPlay = false
-            self.isPlaying = false
-            self.isWaiting = false
-            self.stateLabel = "Unable to Play Stream"
-            self.errorMessage = "The stream did not begin playing. Close the player and try this episode again."
-            self.player.pause()
-            self.playbackFailureTask = nil
         }
     }
 
@@ -943,9 +956,17 @@ private final class NativePlaybackController: ObservableObject {
         playbackFailureTask = nil
     }
 
-    private func recoverPlayback() async {
+    private func startRecovery() {
         guard !stopped, !isRecovering else { return }
+        let generation = beginItemOperation()
         isRecovering = true
+        recoveryTask = Task { @MainActor [weak self] in
+            await self?.recoverPlayback(generation: generation)
+        }
+    }
+
+    private func recoverPlayback(generation: Int) async {
+        guard !Task.isCancelled, generation == seekGeneration, !stopped else { return }
         wasInterrupted = false
         isWaiting = true
         stateLabel = "Reconnecting…"
@@ -953,26 +974,20 @@ private final class NativePlaybackController: ObservableObject {
         player.pause()
 
         let resumePosition = timeline.recoveryStartSeconds(forMediaSeconds: positionSeconds)
+        let previousPlaybackID = playback.id
         do {
-            let refreshed: PreparedPlayback
-            do {
-                refreshed = try await api.prepareNativePlayback(
-                    playback,
-                    startSeconds: resumePosition
-                )
-            } catch {
-                let replacement = try await api.createPlayback(
-                    for: movie,
-                    startSeconds: resumePosition
-                )
-                refreshed = try await api.prepareNativePlaybackWithRetry(
-                    replacement,
-                    for: movie,
-                    startSeconds: resumePosition
-                )
+            let refreshed = try await api.prepareNativePlaybackWithRetry(
+                playback, for: movie, startSeconds: resumePosition
+            )
+            guard !Task.isCancelled, generation == seekGeneration, !stopped else {
+                if refreshed.playback.id != previousPlaybackID {
+                    Task { try? await api.stopNativePlayback(refreshed.playback.id) }
+                }
+                return
             }
-            guard !stopped else { return }
-
+            if refreshed.playback.id != previousPlaybackID {
+                Task { try? await api.stopNativePlayback(previousPlaybackID) }
+            }
             playback = refreshed.playback
             timeline = refreshed.hls.timeline
             burnedSubtitleIndex = refreshed.hls.burnedSubtitleIndex
@@ -987,13 +1002,15 @@ private final class NativePlaybackController: ObservableObject {
             let time = CMTime(seconds: playerPosition, preferredTimescale: 600)
             player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
                 Task { @MainActor in
-                    guard let self, !self.stopped else { return }
+                    guard let self, generation == self.seekGeneration, !self.stopped else { return }
+                    self.recoveryTask = nil
                     self.isRecovering = false
-                    self.isWaiting = false
+                    self.isWaiting = self.wantsToPlay
                     if !finished {
-                        self.wantsToPlay = false
-                        self.isPlaying = false
-                        self.stateLabel = "Paused"
+                        self.pause()
+                        self.isWaiting = false
+                        self.stateLabel = "Unable to Reconnect"
+                        self.errorMessage = "The player could not resume the stream."
                         return
                     }
                     if self.wantsToPlay {
@@ -1005,7 +1022,8 @@ private final class NativePlaybackController: ObservableObject {
                 }
             }
         } catch {
-            guard !Task.isCancelled, !stopped else { return }
+            guard !Task.isCancelled, generation == seekGeneration, !stopped else { return }
+            recoveryTask = nil
             isRecovering = false
             isWaiting = false
             isPlaying = false
@@ -1025,15 +1043,9 @@ private final class NativePlaybackController: ObservableObject {
     func stop() {
         guard !stopped else { return }
         stopped = true
-        seekGeneration += 1
-        seekTask?.cancel()
-        seekTask = nil
+        _ = beginItemOperation()
         subtitleTask?.cancel()
         subtitleTask = nil
-        subtitleSwitchTask?.cancel()
-        subtitleSwitchTask = nil
-        bufferingRecoveryTask?.cancel()
-        bufferingRecoveryTask = nil
         cancelPlaybackFailure()
         deactivateMediaSession()
         if let itemEndObserver {
@@ -1059,6 +1071,8 @@ private final class NativePlaybackController: ObservableObject {
             seekOriginSeconds = positionSeconds
             resumeAfterSeek = wantsToPlay
         }
+        let generation = beginItemOperation()
+        cancelPlaybackFailure()
         pendingSeekSeconds = target
         positionSeconds = target
         isSeeking = true
@@ -1067,9 +1081,6 @@ private final class NativePlaybackController: ObservableObject {
         errorMessage = nil
         player.pause()
 
-        seekGeneration += 1
-        let generation = seekGeneration
-        seekTask?.cancel()
         seekTask = Task { [weak self] in
             do {
                 try await Task.sleep(for: .milliseconds(450))
@@ -1085,11 +1096,11 @@ private final class NativePlaybackController: ObservableObject {
         guard generation == seekGeneration, !stopped else { return }
         let playerTarget = timeline.playerSeconds(forMediaSeconds: target)
         if canSeekLocally(to: playerTarget) {
+            schedulePlaybackFailure()
             let time = CMTime(seconds: playerTarget, preferredTimescale: 600)
             player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
                 Task { @MainActor in
-                    guard finished else { return }
-                    self?.finishSeek(generation: generation)
+                    self?.finishSeek(generation: generation, finished: finished)
                 }
             }
             return
@@ -1110,12 +1121,12 @@ private final class NativePlaybackController: ObservableObject {
             let time = CMTime(seconds: playerPosition, preferredTimescale: 600)
             player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
                 Task { @MainActor in
-                    guard finished else { return }
-                    self?.finishSeek(generation: generation)
+                    self?.finishSeek(generation: generation, finished: finished)
                 }
             }
         } catch {
-            guard generation == seekGeneration, !stopped else { return }
+            guard !Task.isCancelled, generation == seekGeneration, !stopped else { return }
+            cancelPlaybackFailure()
             pendingSeekSeconds = nil
             positionSeconds = seekOriginSeconds
             isSeeking = false
@@ -1128,11 +1139,18 @@ private final class NativePlaybackController: ObservableObject {
         }
     }
 
-    private func finishSeek(generation: Int) {
+    private func finishSeek(generation: Int, finished: Bool) {
         guard generation == seekGeneration, !stopped else { return }
         pendingSeekSeconds = nil
         isSeeking = false
         seekTask = nil
+        if !finished {
+            pause()
+            isWaiting = false
+            stateLabel = "Seek Failed"
+            errorMessage = "The player could not seek to the requested position."
+            return
+        }
         if resumeAfterSeek {
             play()
         } else {
@@ -1165,18 +1183,18 @@ private final class NativePlaybackController: ObservableObject {
 
     private func switchSubtitleStreamIfNeeded() {
         let desiredBitmapIndex = selectedSubtitle?.isBitmap == true ? selectedSubtitle?.index : nil
-        guard desiredBitmapIndex != burnedSubtitleIndex else {
+        guard desiredBitmapIndex != burnedSubtitleIndex || subtitleSwitchTask != nil else {
             restartSubtitleUpdates()
             return
         }
 
-        subtitleSwitchTask?.cancel()
+        let generation = beginItemOperation()
+        cancelPlaybackFailure()
         subtitleTask?.cancel()
         subtitleTask = nil
         subtitleCues = []
         activeSubtitleText = nil
         let resumePosition = max(0, positionSeconds)
-        let shouldResume = wantsToPlay
         player.pause()
         isWaiting = true
         stateLabel = "Changing Subtitles…"
@@ -1191,7 +1209,7 @@ private final class NativePlaybackController: ObservableObject {
                     bitmapSubtitleIndex: desiredBitmapIndex,
                     useSavedSubtitlePreference: false
                 )
-                guard !Task.isCancelled, !self.stopped else { return }
+                guard !Task.isCancelled, generation == self.seekGeneration, !self.stopped else { return }
                 self.timeline = prepared.hls.timeline
                 self.burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
                 self.updateSubtitleOptions(prepared.hls.subtitles ?? [])
@@ -1205,16 +1223,17 @@ private final class NativePlaybackController: ObservableObject {
                     toleranceAfter: .zero
                 ) { [weak self] finished in
                     Task { @MainActor in
-                        guard let self, !self.stopped else { return }
+                        guard let self, generation == self.seekGeneration, !self.stopped else { return }
                         self.subtitleSwitchTask = nil
-                        self.isWaiting = false
+                        self.isWaiting = self.wantsToPlay
                         guard finished else {
-                            self.wantsToPlay = false
-                            self.isPlaying = false
-                            self.stateLabel = "Paused"
+                            self.pause()
+                            self.isWaiting = false
+                            self.stateLabel = "Unable to Change Subtitles"
+                            self.errorMessage = "The player could not resume after changing subtitles."
                             return
                         }
-                        if shouldResume {
+                        if self.wantsToPlay {
                             self.play()
                         } else {
                             self.stateLabel = "Paused"
@@ -1222,8 +1241,9 @@ private final class NativePlaybackController: ObservableObject {
                     }
                 }
             } catch {
-                guard !Task.isCancelled, !self.stopped else { return }
+                guard !Task.isCancelled, generation == self.seekGeneration, !self.stopped else { return }
                 self.subtitleSwitchTask = nil
+                self.cancelPlaybackFailure()
                 self.isWaiting = false
                 self.wantsToPlay = false
                 self.isPlaying = false
@@ -1290,6 +1310,22 @@ private final class NativePlaybackController: ObservableObject {
         HLSSubtitleTrack.savedPreference(in: tracks)
     }
 
+    // One generation owns all item-changing work, including queued AVPlayer callbacks.
+    private func beginItemOperation() -> Int {
+        seekGeneration += 1
+        seekTask?.cancel()
+        seekTask = nil
+        subtitleSwitchTask?.cancel()
+        subtitleSwitchTask = nil
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        player.currentItem?.cancelPendingSeeks()
+        pendingSeekSeconds = nil
+        isSeeking = false
+        isRecovering = false
+        return seekGeneration
+    }
+
     private func installItem(url: URL) {
         statusObservation?.invalidate()
         if let itemEndObserver {
@@ -1301,8 +1337,9 @@ private final class NativePlaybackController: ObservableObject {
         NativePlaybackConfiguration.configure(item)
         statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             Task { @MainActor in
-                guard let self, !self.stopped else { return }
+                guard let self, !self.stopped, self.player.currentItem === item else { return }
                 if item.status == .failed {
+                    _ = self.beginItemOperation()
                     self.cancelPlaybackFailure()
                     self.isWaiting = false
                     self.isPlaying = false
@@ -1316,9 +1353,11 @@ private final class NativePlaybackController: ObservableObject {
             forName: .AVPlayerItemDidPlayToEndTime,
             object: item,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self, weak item] _ in
             Task { @MainActor in
-                guard let self, !self.stopped else { return }
+                guard let self, !self.stopped, self.player.currentItem === item else { return }
+                _ = self.beginItemOperation()
+                self.cancelPlaybackFailure()
                 self.positionSeconds = max(self.positionSeconds, self.durationSeconds)
                 self.wantsToPlay = false
                 self.isPlaying = false
@@ -1329,6 +1368,7 @@ private final class NativePlaybackController: ObservableObject {
             }
         }
         player.replaceCurrentItem(with: item)
+        schedulePlaybackFailure()
     }
 
     private func cacheBusted(_ url: URL) -> URL {

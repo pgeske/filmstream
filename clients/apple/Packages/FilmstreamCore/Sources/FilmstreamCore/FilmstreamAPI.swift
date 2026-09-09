@@ -335,17 +335,25 @@ public struct FilmstreamAPI: Sendable {
                 useSavedSubtitlePreference: useSavedSubtitlePreference
             )
         } catch let error as FilmstreamError {
+            try Task.checkCancellation()
             guard case let .server(status, _) = error,
                   status == 404 || status == 502 else {
                 throw error
             }
             let replacement = try await createPlayback(for: movie, startSeconds: startSeconds)
-            return try await prepareNativePlayback(
-                replacement,
-                startSeconds: startSeconds,
-                bitmapSubtitleIndex: bitmapSubtitleIndex,
-                useSavedSubtitlePreference: useSavedSubtitlePreference
-            )
+            do {
+                return try await prepareNativePlayback(
+                    replacement,
+                    startSeconds: startSeconds,
+                    bitmapSubtitleIndex: bitmapSubtitleIndex,
+                    useSavedSubtitlePreference: useSavedSubtitlePreference
+                )
+            } catch {
+                // Only the replacement belongs to this attempt. Never delete the
+                // original ID here: a newer seek may already be using it.
+                Task { try? await stopNativePlayback(replacement.id) }
+                throw error
+            }
         }
     }
 
@@ -479,11 +487,13 @@ public struct FilmstreamAPI: Sendable {
     }
 
     private func send<Response: Decodable>(_ request: URLRequest) async throws -> Response {
+        try Task.checkCancellation()
         let data: Data
         let response: URLResponse
         do {
             (data, response) = try await Self.dataWithTransientGetRetry(session, request)
         } catch {
+            try Task.checkCancellation()
             throw FilmstreamError.network(error.localizedDescription)
         }
         guard let httpResponse = response as? HTTPURLResponse else {

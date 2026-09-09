@@ -10,8 +10,9 @@ struct ShowDetailView: View {
     @State private var activePlayback: TVEpisodePlaybackSession?
     @State private var showsEpisodes = false
     @State private var isLoading = false
-    @State private var isPreparing = false
-    @State private var preparationStage: PlaybackPreparationStage?
+    @State private var preparation = PlaybackPreparation()
+    private var isPreparing: Bool { preparation.isPreparing }
+    private var preparationStage: PlaybackPreparationStage? { preparation.stage }
     @State private var isRemoving = false
     @State private var errorMessage: String?
     @FocusState private var focusedAction: ShowDetailAction?
@@ -81,7 +82,7 @@ struct ShowDetailView: View {
                         .frame(maxWidth: 800, alignment: .leading)
                 }
 
-                if let errorMessage {
+                if let errorMessage = preparation.errorMessage ?? errorMessage {
                     Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(Color.teaAmber)
                         .font(.headline)
@@ -99,6 +100,7 @@ struct ShowDetailView: View {
             focusedAction = .play
             await loadShow()
         }
+        .onDisappear { preparation.cancel() }
         .navigationDestination(isPresented: $showsEpisodes) {
             if let details {
                 ShowEpisodesView(details: details)
@@ -166,7 +168,7 @@ struct ShowDetailView: View {
     private var actionButtons: some View {
         VStack(alignment: .leading, spacing: 11) {
             Button {
-                Task { await preparePlayback(startSeconds: playbackSelection?.startSeconds ?? 0) }
+                preparePlayback(startSeconds: playbackSelection?.startSeconds ?? 0)
             } label: {
                 actionLabel(
                     title: primaryButtonTitle,
@@ -182,7 +184,7 @@ struct ShowDetailView: View {
 
             if playbackSelection != nil {
                 Button {
-                    Task { await preparePlayback(startSeconds: 0) }
+                    preparePlayback(startSeconds: 0)
                 } label: {
                     actionLabel(title: "Play from Beginning", systemImage: "arrow.counterclockwise")
                 }
@@ -293,47 +295,36 @@ struct ShowDetailView: View {
         }
     }
 
-    private func preparePlayback(startSeconds: Double) async {
+    private func preparePlayback(startSeconds: Double) {
         guard let details, let playbackSelection else { return }
-        isPreparing = true
-        defer {
-            isPreparing = false
-            preparationStage = nil
-        }
+        errorMessage = nil
         let movie = playbackSelection.episode.playbackMovie(in: details.show)
-        do {
-            let nextEpisodeTask = Task {
-                try? await model.api.nextEpisode(after: playbackSelection.episode, in: details)
-            }
-            let prepared = try await model.preparePlayback(
-                for: movie,
-                startSeconds: startSeconds,
-                onStage: { preparationStage = $0 }
-            )
-            let nextEpisode = await nextEpisodeTask.value
+        preparation.start(
+            api: model.api,
+            movie: movie,
+            startSeconds: startSeconds,
+            nextEpisode: { try? await model.api.nextEpisode(after: playbackSelection.episode, in: details) }
+        ) { prepared, nextEpisode in
             activePlayback = TVEpisodePlaybackSession(
-                movie: movie,
-                prepared: prepared,
-                nextEpisode: nextEpisode
+                movie: movie, prepared: prepared, nextEpisode: nextEpisode
             )
-            errorMessage = nil
-        } catch {
-            errorMessage = error.localizedDescription
         }
     }
 
     private func advancePlayback(to episode: Episode) async throws {
         guard let details else { return }
         let movie = episode.playbackMovie(in: details.show)
-        let nextEpisodeTask = Task {
-            try? await model.api.nextEpisode(after: episode, in: details)
-        }
+        async let next = try? await model.api.nextEpisode(after: episode, in: details)
         let prepared = try await model.preparePlayback(
             for: movie,
             startSeconds: 0,
             onStage: { _ in }
         )
-        let nextEpisode = await nextEpisodeTask.value
+        let nextEpisode = await next
+        guard !Task.isCancelled else {
+            Task { try? await model.api.stopNativePlayback(prepared.playback.id) }
+            throw CancellationError()
+        }
         activePlayback = TVEpisodePlaybackSession(
             movie: movie,
             prepared: prepared,
