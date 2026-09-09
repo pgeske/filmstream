@@ -6,8 +6,9 @@ struct MovieDetailView: View {
     let movie: Movie
 
     @State private var preparedPlayback: PreparedPlayback?
-    @State private var isPreparing = false
-    @State private var preparationStage: PlaybackPreparationStage?
+    @State private var preparation = PlaybackPreparation()
+    private var isPreparing: Bool { preparation.isPreparing }
+    private var preparationStage: PlaybackPreparationStage? { preparation.stage }
     @State private var isRemoving = false
     @State private var errorMessage: String?
     @FocusState private var focusedAction: DetailAction?
@@ -76,7 +77,7 @@ struct MovieDetailView: View {
                         .frame(maxWidth: 800, alignment: .leading)
                 }
 
-                if let errorMessage {
+                if let errorMessage = preparation.errorMessage ?? errorMessage {
                     Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(Color.teaAmber)
                         .font(.headline)
@@ -99,6 +100,7 @@ struct MovieDetailView: View {
             )
             _ = await (ratings, prewarm)
         }
+        .onDisappear { preparation.cancel() }
         .fullScreenCover(
             item: $preparedPlayback,
             onDismiss: {
@@ -135,7 +137,7 @@ struct MovieDetailView: View {
     private var actionButtons: some View {
         VStack(alignment: .leading, spacing: 12) {
             Button {
-                Task { await preparePlayback(startSeconds: history?.positionSeconds ?? 0) }
+                preparePlayback(startSeconds: history?.positionSeconds ?? 0)
             } label: {
                 actionLabel(
                     title: primaryButtonTitle,
@@ -151,7 +153,7 @@ struct MovieDetailView: View {
 
             if history != nil {
                 Button {
-                    Task { await preparePlayback(startSeconds: 0) }
+                    preparePlayback(startSeconds: 0)
                 } label: {
                     actionLabel(title: "Play from Beginning", systemImage: "arrow.counterclockwise")
                 }
@@ -211,21 +213,10 @@ struct MovieDetailView: View {
         .frame(width: 740)
     }
 
-    private func preparePlayback(startSeconds: Double) async {
-        isPreparing = true
-        defer {
-            isPreparing = false
-            preparationStage = nil
-        }
-        do {
-            preparedPlayback = try await model.preparePlayback(
-                for: movie,
-                startSeconds: startSeconds,
-                onStage: { preparationStage = $0 }
-            )
-            errorMessage = nil
-        } catch {
-            errorMessage = error.localizedDescription
+    private func preparePlayback(startSeconds: Double) {
+        errorMessage = nil
+        preparation.start(api: model.api, movie: movie, startSeconds: startSeconds) { prepared, _ in
+            preparedPlayback = prepared
         }
     }
 

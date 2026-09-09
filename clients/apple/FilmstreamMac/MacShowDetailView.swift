@@ -8,8 +8,9 @@ struct MacShowDetailView: View {
     @State private var details: SeriesDetails?
     @State private var playbackSelection: EpisodePlaybackSelection?
     @State private var isLoading = false
-    @State private var isPreparing = false
-    @State private var preparationStage: PlaybackPreparationStage?
+    @State private var preparation = PlaybackPreparation()
+    private var isPreparing: Bool { preparation.isPreparing }
+    private var preparationStage: PlaybackPreparationStage? { preparation.stage }
     @State private var isRemoving = false
     @State private var errorMessage: String?
 
@@ -68,7 +69,7 @@ struct MacShowDetailView: View {
                                 .frame(maxWidth: 680, alignment: .leading)
                         }
 
-                        if let errorMessage {
+                        if let errorMessage = preparation.errorMessage ?? errorMessage {
                             Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                                 .foregroundStyle(Color.macTeaAmber)
                                 .font(.headline)
@@ -89,6 +90,7 @@ struct MacShowDetailView: View {
         .task(id: show.id) {
             await loadShow()
         }
+        .onDisappear { preparation.cancel() }
         .onChange(of: model.watchHistory) {
             Task { await refreshPlaybackSelection() }
         }
@@ -115,7 +117,7 @@ struct MacShowDetailView: View {
     private var actionButtons: some View {
         VStack(alignment: .leading, spacing: 10) {
             Button {
-                Task { await preparePlayback(startSeconds: playbackSelection?.startSeconds ?? 0) }
+                preparePlayback(startSeconds: playbackSelection?.startSeconds ?? 0)
             } label: {
                 actionLabel(
                     title: primaryButtonTitle,
@@ -129,7 +131,7 @@ struct MacShowDetailView: View {
 
             if playbackSelection != nil {
                 Button {
-                    Task { await preparePlayback(startSeconds: 0) }
+                    preparePlayback(startSeconds: 0)
                 } label: {
                     actionLabel(title: "Play from Beginning", systemImage: "arrow.counterclockwise")
                 }
@@ -238,32 +240,19 @@ struct MacShowDetailView: View {
         }
     }
 
-    private func preparePlayback(startSeconds: Double) async {
+    private func preparePlayback(startSeconds: Double) {
         guard let details, let playbackSelection else { return }
-        isPreparing = true
-        defer {
-            isPreparing = false
-            preparationStage = nil
-        }
+        errorMessage = nil
         let movie = playbackSelection.episode.playbackMovie(in: details.show)
-        do {
-            let nextEpisodeTask = Task {
-                try? await model.api.nextEpisode(after: playbackSelection.episode, in: details)
-            }
-            let prepared = try await model.preparePlayback(
-                for: movie,
-                startSeconds: startSeconds,
-                onStage: { preparationStage = $0 }
-            )
+        preparation.start(
+            api: model.api,
+            movie: movie,
+            startSeconds: startSeconds,
+            nextEpisode: { try? await model.api.nextEpisode(after: playbackSelection.episode, in: details) }
+        ) { prepared, nextEpisode in
             model.presentPlayback(
-                movie: movie,
-                prepared: prepared,
-                details: details,
-                nextEpisode: await nextEpisodeTask.value
+                movie: movie, prepared: prepared, details: details, nextEpisode: nextEpisode
             )
-            errorMessage = nil
-        } catch {
-            errorMessage = error.localizedDescription
         }
     }
 
