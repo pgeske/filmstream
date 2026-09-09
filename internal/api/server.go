@@ -1954,13 +1954,25 @@ func (s *Server) playbackStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 
+	var packaging *hls.Status
+	s.hlsMu.RLock()
+	provider, hasStatus := s.hlsManager.(interface {
+		Status(string) (hls.Status, bool)
+	})
+	s.hlsMu.RUnlock()
+	if hasStatus {
+		if status, ok := provider.Status(id); ok {
+			packaging = &status
+		}
+	}
 	if status, ok := s.engine.Status(id); ok {
 		type response struct {
 			torrentstream.Status
 			Source   string                   `json:"source"`
 			Selected *catalog.RankedCandidate `json:"selected,omitempty"`
+			HLS      *hls.Status              `json:"hls,omitempty"`
 		}
-		writeJSON(w, http.StatusOK, response{Status: status, Source: catalog.ProtocolTorrent, Selected: selected})
+		writeJSON(w, http.StatusOK, response{Status: status, Source: catalog.ProtocolTorrent, Selected: selected, HLS: packaging})
 		return
 	}
 	if s.usenetEngine != nil {
@@ -1968,8 +1980,9 @@ func (s *Server) playbackStatus(w http.ResponseWriter, r *http.Request) {
 			type response struct {
 				usenetstream.Status
 				Selected *catalog.RankedCandidate `json:"selected,omitempty"`
+				HLS      *hls.Status              `json:"hls,omitempty"`
 			}
-			writeJSON(w, http.StatusOK, response{Status: status, Selected: selected})
+			writeJSON(w, http.StatusOK, response{Status: status, Selected: selected, HLS: packaging})
 			return
 		}
 	}
@@ -2052,6 +2065,15 @@ func (s *Server) startHLSPlayback(w http.ResponseWriter, r *http.Request) {
 	)
 	startupDuration := time.Since(started)
 	if err != nil {
+		// Canceling a waiter (or retiring its generation) says nothing about
+		// the selected release. In particular, do not evict a shared season cache.
+		if r.Context().Err() != nil {
+			return
+		}
+		if errors.Is(err, context.Canceled) {
+			writeError(w, http.StatusConflict, "HLS playback was stopped")
+			return
+		}
 		// Without this line a failed start is invisible: the probe, packager, and
 		// HLS errors used to leave nothing in the logs while the client buffered.
 		s.logger.Warn("HLS playback start failed", "id", id,
@@ -2095,6 +2117,13 @@ func (s *Server) listHLSSubtitles(w http.ResponseWriter, r *http.Request) {
 	tracks, err := manager.ProbeSubtitles(r.Context(), id)
 	probeDuration := time.Since(started)
 	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		if errors.Is(err, context.Canceled) {
+			writeError(w, http.StatusConflict, "HLS playback was stopped")
+			return
+		}
 		s.logger.Warn("HLS subtitle probe failed", "id", id,
 			"probe_duration", probeDuration, "error", err)
 		// The probe reads the same source as HLS startup, so a failure here means
@@ -2194,6 +2223,10 @@ func (s *Server) serveHLSAsset(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("asset")
 	path, err := manager.AssetPath(r.PathValue("id"), name)
 	if err != nil {
+		if errors.Is(err, hls.ErrProducerStopped) {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
 		if errors.Is(err, os.ErrNotExist) {
 			http.NotFound(w, r)
 			return

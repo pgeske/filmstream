@@ -676,7 +676,10 @@ while :; do sleep 1; done
 	if _, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1); err != nil {
 		t.Fatal(err)
 	}
-	playlistPath := filepath.Join(dataDir, "playback-1", "index.m3u8")
+	playlistPath, err := manager.AssetPath("playback-1", "index.m3u8")
+	if err != nil {
+		t.Fatal(err)
+	}
 	staleTime := time.Now().Add(-time.Second)
 	if err := os.Chtimes(playlistPath, staleTime, staleTime); err != nil {
 		t.Fatal(err)
@@ -689,6 +692,10 @@ while :; do sleep 1; done
 	if rebuilt.RequestedStartSeconds != 6 || len(markedCauses) != 1 ||
 		!strings.Contains(markedCauses[0].Error(), "covered HLS stream did not advance") {
 		t.Fatalf("covered recovery = %+v, marked causes = %v", rebuilt, markedCauses)
+	}
+	playlistPath, err = manager.AssetPath("playback-1", "index.m3u8")
+	if err != nil {
+		t.Fatal(err)
 	}
 	staleTime = time.Now().Add(-time.Second)
 	if err := os.Chtimes(playlistPath, staleTime, staleTime); err != nil {
@@ -1000,7 +1007,7 @@ func TestCanceledParkCannotStopPlaybackAfterAutoplayStarts(t *testing.T) {
 
 	// Holding the lifecycle lock models autoplay entering Start before the
 	// prewarmer reaches Park. Once the claim cancels Park, it must not run late.
-	unlockStart := manager.lockPlaybackStart("next-playback")
+	_, _, unlockStart := manager.lockPlaybackStart(t.Context(), "next-playback")
 	ctx, cancel := context.WithCancel(t.Context())
 	result := make(chan error, 1)
 	go func() {

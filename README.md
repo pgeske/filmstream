@@ -308,6 +308,8 @@ A 1.0 ratio means one uploaded byte per downloaded byte. Filmstream cannot force
 - `POST|DELETE /v1/playbacks/{id}/hls`
 - `GET /v1/playbacks/{id}/hls/{asset}`
 
+Playback status includes an optional `hls` object describing producer state and packaged seconds separately from the source's active-reader count. A stopped or failed producer cannot remain ready merely because its startup segments still exist. Canceling an HLS request does not stop an already-published producer shared by other consumers; explicit DELETE retires the playback's current generation, including unfinished startup. See [playback ownership and reliability](docs/playback-lifecycle.md) for the lifecycle contract, diagnostics, and remaining device-validation boundaries.
+
 ## Development
 
 ```bash
