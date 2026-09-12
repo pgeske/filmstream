@@ -410,6 +410,7 @@ func (s *Server) prewarmedPlaybackAvailable(state *playbackPrewarmState) bool {
 		state.target.request.StartSeconds,
 		languages,
 		state.bitmapSubtitleIndex,
+		-1,
 		prewarmBufferSeconds,
 	)
 }

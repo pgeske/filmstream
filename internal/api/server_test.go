@@ -186,7 +186,7 @@ func (f *fakeHLSManager) ProbeSubtitles(_ context.Context, id string) ([]hls.Sub
 	return f.subtitleTracks[id], nil
 }
 
-func (f *fakeHLSManager) Start(_ context.Context, id string, start float64, languages []string, bitmapSubtitle int) (hls.Stream, error) {
+func (f *fakeHLSManager) Start(_ context.Context, id string, start float64, languages []string, bitmapSubtitle int, _ int) (hls.Stream, error) {
 	f.languages = append([]string(nil), languages...)
 	f.bitmapSubtitle = bitmapSubtitle
 	if err := f.startErrors[id]; err != nil {
@@ -215,7 +215,7 @@ func (f *fakeHLSManager) AssetPath(_, name string) (string, error) {
 	return filepath.Join(f.dir, name), nil
 }
 
-func (f *fakeHLSManager) Prepared(string, float64, []string, int, int) bool {
+func (f *fakeHLSManager) Prepared(string, float64, []string, int, int, int) bool {
 	return false
 }
 
@@ -2012,6 +2012,166 @@ func rankedTorrentCandidates(count int) []catalog.RankedCandidate {
 		}})
 	}
 	return candidates
+}
+
+func TestSwarmLooksLive(t *testing.T) {
+	if swarmLooksLive(torrentstream.Status{}) {
+		t.Fatal("zero-value status must not look live")
+	}
+	if !swarmLooksLive(torrentstream.Status{TotalPeers: 3}) {
+		t.Fatal("known peers should look live")
+	}
+	if !swarmLooksLive(torrentstream.Status{CachedPercent: 10}) {
+		t.Fatal("cached data should look live")
+	}
+	if !swarmLooksLive(torrentstream.Status{OutboundDialObserved: true}) {
+		t.Fatal("observed outbound dial should look live")
+	}
+}
+
+func TestExhaustedTorrentRecoveryForcesFreshSearchThenCooldown(t *testing.T) {
+	var searches atomic.Int32
+	var indexerServer *httptest.Server
+	indexerServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("t") {
+		case "caps":
+			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><tv-search available="yes" supportedParams="q,season,ep"/></searching></caps>`)
+		case "tvsearch":
+			searches.Add(1)
+			fmt.Fprint(w, `<?xml version="1.0"?><rss xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel>
+				<item><title>The.Show.S01.Complete.1080p.WEB.H264-BAD</title><guid>release-bad</guid><enclosure url="`+indexerServer.URL+`/bad.torrent" length="1000000" type="application/x-bittorrent"/><torznab:attr name="seeders" value="120"/></item>
+			</channel></rss>`)
+		default:
+			http.Error(w, "unsupported", http.StatusBadRequest)
+		}
+	}))
+	defer indexerServer.Close()
+	registry, err := indexer.NewRegistry([]config.Indexer{{
+		Name: "torrent", Type: "torznab", Endpoint: indexerServer.URL + "/api",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mediaID := "tmdb-tv:3:s1:e2"
+	bad := catalog.RankedCandidate{Candidate: catalog.Candidate{
+		ID: "release-bad", Indexer: "torrent",
+		Name: "The.Show.S01.Complete.1080p.WEB.H264-BAD", Protocol: catalog.ProtocolTorrent,
+		Resolution: "1080p", Codec: "h264", SizeBytes: 1_000_000,
+	}, Reasons: []string{"season pack"}}
+	store := playbackcache.New(t.TempDir())
+	if _, err := store.Save("tmdb-tv:3:s1", "The Show", 2020, bad, []byte("metainfo")); err != nil {
+		t.Fatal(err)
+	}
+	healthy := catalog.RankedCandidate{Candidate: catalog.Candidate{
+		ID: "release-healthy", Indexer: "torrent",
+		Name: "The.Show.S01.Complete.1080p.WEB.H264-HEALTHY", Protocol: catalog.ProtocolTorrent,
+		Resolution: "1080p", Codec: "h264", SizeBytes: 1_000_000,
+		MagnetURI: "magnet:?xt=urn:btih:0000000000000000000000000000000000000002",
+	}, Reasons: []string{"season pack"}}
+	engine := &fakeTorrentPlaybackEngine{statuses: map[string]torrentstream.Status{
+		"playback-1": {CachedPercent: 14},
+		"playback-2": {},
+	}}
+	manager := &fakeHLSManager{startErrors: map[string]error{
+		"playback-1": fmt.Errorf("%w: tracker returned no peers", torrentstream.ErrSourceUnavailable),
+		"playback-2": fmt.Errorf("%w: tracker returned no peers", torrentstream.ErrSourceUnavailable),
+	}}
+	server := &Server{
+		indexers: registry, engine: engine, hlsManager: manager,
+		playbackSourceMode:   config.PlaybackSourceTorrentOnly,
+		defaults:             catalog.Preferences{Codecs: []string{"h264"}},
+		playbackCache:        store,
+		logger:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+		selected:             make(map[string]catalog.RankedCandidate),
+		playbackCacheKeys:    make(map[string]playbackCacheKey),
+		playbackLanguages:    make(map[string][]string),
+		playbackRequests:     make(map[string]CreatePlaybackRequest),
+		playbackResponses:    make(map[string]CreatePlaybackResponse),
+		torrentFailures:      make(map[string]time.Time),
+		torrentFreshSearchAt: make(map[string]time.Time),
+		// Enable the production behavior under test; the plain exhausted-503
+		// coverage lives in the sibling test that leaves this at zero.
+		torrentFreshSearchCooldown: 2 * time.Minute,
+		prewarmStates:              make(map[string]*playbackPrewarmState),
+		claimedPlaybacks:           make(map[string]claimedPlayback),
+		releaseSearches:            make(map[string]*releaseSearchState),
+	}
+	requestBody := `{"media_id":"tmdb-tv:3:s1:e2","media_type":"show","query":"The Show","year":2020,"series_id":"tmdb-tv:3","series_title":"The Show","season_number":1,"episode_number":2,"episode_title":"Second","preferences":{"codecs":["h264"]}}`
+	request := CreatePlaybackRequest{
+		MediaID: mediaID, MediaType: "show", Query: "The Show", Year: 2020,
+		SeriesID: "tmdb-tv:3", SeriesTitle: "The Show", SeasonNumber: 1, EpisodeNumber: 2,
+		Preferences: catalog.Preferences{Codecs: []string{"h264"}},
+	}
+	ready := make(chan struct{})
+	close(ready)
+	server.releaseSearches[releaseSearchKey(request)] = &releaseSearchState{
+		ready: ready, ranked: []catalog.RankedCandidate{bad, healthy}, expiresAt: time.Now().Add(time.Minute),
+	}
+
+	create := func() (*CreatePlaybackResponse, *httptest.ResponseRecorder) {
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, httptest.NewRequest(
+			http.MethodPost, "/v1/playbacks", strings.NewReader(requestBody),
+		))
+		if response.Code != http.StatusCreated {
+			return nil, response
+		}
+		var payload CreatePlaybackResponse
+		if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		return &payload, response
+	}
+	failHLS := func(id string) *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, httptest.NewRequest(
+			http.MethodPost, "/v1/playbacks/"+id+"/hls", strings.NewReader(`{}`),
+		))
+		return response
+	}
+
+	first, response := create()
+	if first == nil {
+		t.Fatalf("first playback = nil, status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if response := failHLS(first.ID); response.Code != http.StatusBadGateway {
+		t.Fatalf("first HLS status = %d, body = %s", response.Code, response.Body.String())
+	}
+
+	second, response := create()
+	if second == nil {
+		t.Fatalf("second playback = nil, status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if searches.Load() != 0 {
+		t.Fatalf("retry repeated the external release search %d times", searches.Load())
+	}
+	if response := failHLS(second.ID); response.Code != http.StatusBadGateway {
+		t.Fatalf("second HLS status = %d, body = %s", response.Code, response.Body.String())
+	}
+
+	// Recovery is exhausted: the next request must force one fresh external
+	// search instead of failing fast with the dead retained ranking.
+	third, response := create()
+	if third != nil || response.Code != http.StatusBadGateway {
+		t.Fatalf("forced-fresh playback = %+v, status = %d, body = %s", third, response.Code, response.Body.String())
+	}
+	if searches.Load() != 1 {
+		t.Fatalf("forced fresh search ran %d times, want 1", searches.Load())
+	}
+	if len(engine.created) != 2 {
+		t.Fatalf("forced fresh search mounted %d candidates, want no new mounts of quarantined releases", len(engine.created))
+	}
+
+	// While the cooldown is active, repeated requests fail fast again.
+	fourth, response := create()
+	if fourth != nil || response.Code != http.StatusBadGateway ||
+		!strings.Contains(response.Body.String(), "unavailable after 2 release attempts") {
+		t.Fatalf("cooldown playback = %+v, status = %d, body = %s", fourth, response.Code, response.Body.String())
+	}
+	if searches.Load() != 1 {
+		t.Fatalf("cooldown search ran %d times, want no additional searches", searches.Load())
+	}
 }
 
 func TestUnavailableTorrentRecoveryReusesRankingAndStopsAfterTwoCandidates(t *testing.T) {
