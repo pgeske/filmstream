@@ -62,7 +62,7 @@ func TestCanceledRecoveryDoesNotDestroySharedProducer(t *testing.T) {
 					marked = true
 					return errors.New("source quarantined")
 				}, "")
-				if _, err := manager.Start(t.Context(), "shared", 0, nil, -1); err != nil {
+				if _, err := manager.Start(t.Context(), "shared", 0, nil, -1, -1); err != nil {
 					t.Fatal(err)
 				}
 				original := manager.streams["shared"]
@@ -85,7 +85,7 @@ func TestCanceledRecoveryDoesNotDestroySharedProducer(t *testing.T) {
 				}
 				defer cancel()
 				cancel()
-				_, err = manager.Start(ctx, "shared", position, nil, -1)
+				_, err = manager.Start(ctx, "shared", position, nil, -1, -1)
 				if !errors.Is(err, want) {
 					t.Fatalf("recovery error = %v, want %v", err, want)
 				}
@@ -105,7 +105,7 @@ func TestStopCancelsUnpublishedStartupAndAllowsReplay(t *testing.T) {
 	manager := newLifecycleTestManager(t, nil, gate)
 	result := make(chan error, 1)
 	go func() {
-		_, err := manager.Start(t.Context(), "replay", 0, nil, -1)
+		_, err := manager.Start(t.Context(), "replay", 0, nil, -1, -1)
 		result <- err
 	}()
 	waitForLifecycleFile(t, gate+".entered")
@@ -124,14 +124,14 @@ func TestStopCancelsUnpublishedStartupAndAllowsReplay(t *testing.T) {
 	if _, err := manager.AssetPath("replay", "index.m3u8"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stopped startup published assets: %v", err)
 	}
-	if _, err := manager.Start(t.Context(), "replay", 0, nil, -1); err != nil {
+	if _, err := manager.Start(t.Context(), "replay", 0, nil, -1, -1); err != nil {
 		t.Fatalf("new generation could not replay: %v", err)
 	}
 }
 
 func TestLateStopCleanupCannotDeleteReplayAssets(t *testing.T) {
 	manager := newLifecycleTestManager(t, nil, "")
-	if _, err := manager.Start(t.Context(), "replay", 0, nil, -1); err != nil {
+	if _, err := manager.Start(t.Context(), "replay", 0, nil, -1, -1); err != nil {
 		t.Fatal(err)
 	}
 	old := manager.streams["replay"]
@@ -146,7 +146,7 @@ func TestLateStopCleanupCannotDeleteReplayAssets(t *testing.T) {
 	stopped := make(chan struct{})
 	go func() { manager.Stop("replay"); close(stopped) }()
 	<-stopping
-	_, err := manager.Start(t.Context(), "replay", 0, nil, -1)
+	_, err := manager.Start(t.Context(), "replay", 0, nil, -1, -1)
 	close(release)
 	<-stopped
 	if err != nil {
@@ -162,7 +162,7 @@ func TestLateStopCleanupCannotDeleteReplayAssets(t *testing.T) {
 
 func TestExitedProducerCannotPassReadinessFromCachedBuffer(t *testing.T) {
 	manager := newLifecycleTestManager(t, nil, "")
-	if _, err := manager.Start(t.Context(), "failed", 0, nil, -1); err != nil {
+	if _, err := manager.Start(t.Context(), "failed", 0, nil, -1, -1); err != nil {
 		t.Fatal(err)
 	}
 	stream := manager.streams["failed"]
@@ -189,7 +189,7 @@ func TestSlowProducerRecoveryKeepsConsumerAndProducerOutcomesSeparate(t *testing
 			}, "")
 			manager.parkedResumeTimeout = time.Second
 			for _, id := range []string{"slow", "unrelated"} {
-				if _, err := manager.Start(t.Context(), id, 0, nil, -1); err != nil {
+				if _, err := manager.Start(t.Context(), id, 0, nil, -1, -1); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -206,7 +206,7 @@ func TestSlowProducerRecoveryKeepsConsumerAndProducerOutcomesSeparate(t *testing
 			if status, ok := manager.Status("slow"); !ok || status.State != "buffering" || status.PackagedSeconds != 12 {
 				t.Fatalf("slow producer status = %+v, exists=%v", status, ok)
 			}
-			if manager.Prepared("slow", 0, nil, -1, 4) {
+			if manager.Prepared("slow", 0, nil, -1, -1, 4) {
 				t.Fatal("old startup buffer was reported prepared despite no live progress")
 			}
 
@@ -222,7 +222,7 @@ func TestSlowProducerRecoveryKeepsConsumerAndProducerOutcomesSeparate(t *testing
 			defer cancel()
 			result := make(chan error, 1)
 			go func() {
-				_, err := manager.Start(ctx, "slow", 0, nil, -1)
+				_, err := manager.Start(ctx, "slow", 0, nil, -1, -1)
 				result <- err
 			}()
 			select {
@@ -285,7 +285,7 @@ printf init > "$dir/init.mp4"
 printf segment > "$dir/segment-000000.m4s"
 printf '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:2.0,\nsegment-000000.m4s\n#EXT-X-ENDLIST\n' > "$dir/index.m3u8"
 `)
-	if _, err := manager.Start(t.Context(), "complete", 0, nil, -1); err != nil {
+	if _, err := manager.Start(t.Context(), "complete", 0, nil, -1, -1); err != nil {
 		t.Fatal(err)
 	}
 	stream := manager.streams["complete"]
@@ -293,13 +293,13 @@ printf '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:2.0,\nsegment-000000.m4s\n#E
 	if status, _ := manager.Status("complete"); status.State != "complete" {
 		t.Fatalf("completed producer status = %+v", status)
 	}
-	if !manager.Prepared("complete", 0, nil, -1, 30) {
+	if !manager.Prepared("complete", 0, nil, -1, -1, 30) {
 		t.Fatal("short, complete media was not prepared")
 	}
 	if err := manager.Park(t.Context(), "complete", 30); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.Start(t.Context(), "complete", 0, nil, -1); err != nil {
+	if _, err := manager.Start(t.Context(), "complete", 0, nil, -1, -1); err != nil {
 		t.Fatal(err)
 	}
 	if manager.streams["complete"] != stream {
@@ -309,7 +309,7 @@ printf '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:2.0,\nsegment-000000.m4s\n#E
 
 func TestParkedPrewarmIsNotProducerFailure(t *testing.T) {
 	manager := newLifecycleTestManager(t, nil, "")
-	if _, err := manager.Start(t.Context(), "prewarm", 0, nil, -1); err != nil {
+	if _, err := manager.Start(t.Context(), "prewarm", 0, nil, -1, -1); err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.Park(t.Context(), "prewarm", 8); err != nil {
@@ -319,7 +319,7 @@ func TestParkedPrewarmIsNotProducerFailure(t *testing.T) {
 	if !ok || status.State != "parked" || status.Error != "" || status.Complete {
 		t.Fatalf("parked prewarm status = %+v, exists=%v", status, ok)
 	}
-	if !manager.Prepared("prewarm", 0, nil, -1, 8) {
+	if !manager.Prepared("prewarm", 0, nil, -1, -1, 8) {
 		t.Fatal("parked buffer was not available for an explicit resume growth check")
 	}
 	if _, err := manager.AssetPath("prewarm", "index.m3u8"); err != nil {

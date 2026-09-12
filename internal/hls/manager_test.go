@@ -75,7 +75,7 @@ while :; do sleep 1; done
 	}
 	defer manager.Close()
 
-	stream, err := manager.Start(context.Background(), "playback-1", 120, []string{"en", "english"}, -1)
+	stream, err := manager.Start(context.Background(), "playback-1", 120, []string{"en", "english"}, -1, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +158,7 @@ while :; do sleep 1; done
 	}
 	defer manager.Close()
 
-	if _, err := manager.Start(t.Context(), "playback-1", 0, nil, -1); err != nil {
+	if _, err := manager.Start(t.Context(), "playback-1", 0, nil, -1, -1); err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.StartSubtitle(t.Context(), "playback-1", 3); err != nil {
@@ -179,7 +179,7 @@ while :; do sleep 1; done
 		t.Fatal("first subtitle process did not start")
 	}
 
-	if _, err := manager.Start(t.Context(), "playback-1", 60, nil, -1); err != nil {
+	if _, err := manager.Start(t.Context(), "playback-1", 60, nil, -1, -1); err != nil {
 		t.Fatal(err)
 	}
 	if err := syscall.Kill(firstPID, 0); !errors.Is(err, syscall.ESRCH) {
@@ -249,7 +249,7 @@ while :; do sleep 1; done
 	}
 	defer manager.Close()
 
-	stream, err := manager.Start(t.Context(), "playback-1", 120, nil, -1)
+	stream, err := manager.Start(t.Context(), "playback-1", 120, nil, -1, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,17 +313,17 @@ while :; do sleep 1; done
 	}
 	defer manager.Close()
 
-	first, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1)
+	first, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.Park(t.Context(), first.PlaybackID, 4); err != nil {
 		t.Fatal(err)
 	}
-	if !manager.Prepared(first.PlaybackID, 0, []string{"en"}, -1, 4) {
+	if !manager.Prepared(first.PlaybackID, 0, []string{"en"}, -1, -1, 4) {
 		t.Fatal("parked stream was not reported as prepared")
 	}
-	second, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1)
+	second, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,14 +398,14 @@ while :; do sleep 1; done
 	}
 	defer manager.Close()
 
-	first, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1)
+	first, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.Park(t.Context(), first.PlaybackID, 4); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.Start(t.Context(), first.PlaybackID, 0, []string{"en"}, -1); err != nil {
+	if _, err := manager.Start(t.Context(), first.PlaybackID, 0, []string{"en"}, -1, -1); err != nil {
 		t.Fatal(err)
 	}
 
@@ -471,7 +471,7 @@ while :; do sleep 1; done
 
 	firstResult := make(chan error, 1)
 	go func() {
-		_, startErr := manager.Start(t.Context(), "playback-1", 60, []string{"en"}, -1)
+		_, startErr := manager.Start(t.Context(), "playback-1", 60, []string{"en"}, -1, -1)
 		firstResult <- startErr
 	}()
 	deadline := time.Now().Add(time.Second)
@@ -485,7 +485,7 @@ while :; do sleep 1; done
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	if _, err := manager.Start(t.Context(), "playback-1", 60, []string{"en"}, -1); err != nil {
+	if _, err := manager.Start(t.Context(), "playback-1", 60, []string{"en"}, -1, -1); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-firstResult; err != nil {
@@ -556,13 +556,13 @@ while :; do sleep 1; done
 	}
 	defer manager.Close()
 
-	first, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1)
+	first, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// A recovery request inside the packaged range must reuse the running
 	// packager instead of discarding the buffered segments.
-	covered, err := manager.Start(t.Context(), "playback-1", 6, []string{"en"}, -1)
+	covered, err := manager.Start(t.Context(), "playback-1", 6, []string{"en"}, -1, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -575,7 +575,7 @@ while :; do sleep 1; done
 	if err := manager.Park(t.Context(), "playback-1", 4); err != nil {
 		t.Fatal(err)
 	}
-	resumed, err := manager.Start(t.Context(), "playback-1", 3, []string{"en"}, -1)
+	resumed, err := manager.Start(t.Context(), "playback-1", 3, []string{"en"}, -1, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -584,7 +584,7 @@ while :; do sleep 1; done
 	}
 
 	// Positions outside the packaged range still rebuild at the new position.
-	restarted, err := manager.Start(t.Context(), "playback-1", 60, []string{"en"}, -1)
+	restarted, err := manager.Start(t.Context(), "playback-1", 60, []string{"en"}, -1, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -673,7 +673,7 @@ while :; do sleep 1; done
 	}
 	defer manager.Close()
 
-	if _, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1); err != nil {
+	if _, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1, -1); err != nil {
 		t.Fatal(err)
 	}
 	playlistPath, err := manager.AssetPath("playback-1", "index.m3u8")
@@ -685,7 +685,7 @@ while :; do sleep 1; done
 		t.Fatal(err)
 	}
 
-	rebuilt, err := manager.Start(t.Context(), "playback-1", 6, []string{"en"}, -1)
+	rebuilt, err := manager.Start(t.Context(), "playback-1", 6, []string{"en"}, -1, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -701,7 +701,7 @@ while :; do sleep 1; done
 	if err := os.Chtimes(playlistPath, staleTime, staleTime); err != nil {
 		t.Fatal(err)
 	}
-	_, err = manager.Start(t.Context(), "playback-1", 6, []string{"en"}, -1)
+	_, err = manager.Start(t.Context(), "playback-1", 6, []string{"en"}, -1, -1)
 	if !errors.Is(err, errSourceStalled) {
 		t.Fatalf("stalled recovery error = %v, want %v", err, errSourceStalled)
 	}
@@ -786,7 +786,7 @@ JSON
 		defer manager.Close()
 
 		started := time.Now()
-		_, err = manager.Start(t.Context(), "playback-1", 0, nil, -1)
+		_, err = manager.Start(t.Context(), "playback-1", 0, nil, -1, -1)
 		if !errors.Is(err, errUnavailable) {
 			t.Fatalf("packager start error = %v", err)
 		}
@@ -864,7 +864,7 @@ while :; do sleep 1; done
 	if err != nil || len(tracks) != 1 {
 		t.Fatalf("tracks = %+v, error = %v", tracks, err)
 	}
-	stream, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1)
+	stream, err := manager.Start(t.Context(), "playback-1", 0, []string{"en"}, -1, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1051,7 +1051,7 @@ JSON
 		t.Fatal(err)
 	}
 	defer manager.Close()
-	if _, err := manager.Start(context.Background(), "playback-1", 0, nil, -1); err == nil || !strings.Contains(err.Error(), "Dolby Vision") {
+	if _, err := manager.Start(context.Background(), "playback-1", 0, nil, -1, -1); err == nil || !strings.Contains(err.Error(), "Dolby Vision") {
 		t.Fatalf("error = %v", err)
 	}
 }
@@ -1114,7 +1114,7 @@ Dialogue: 0,0:00:04.80,0:00:06.20,Default,,0,0,0,,Following cue
 	// This reproduces the incident shape: the next keyframe is 259.50442ms
 	// after the request, but packaging must anchor to the preceding keyframe.
 	const requested = 3.74049558
-	stream, err := manager.Start(t.Context(), "playback-1", requested, nil, -1)
+	stream, err := manager.Start(t.Context(), "playback-1", requested, nil, -1, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1419,6 +1419,38 @@ func TestPreferredAudioStreamUsesRequestedLanguageBeforeDefault(t *testing.T) {
 	}
 }
 
+func TestPreferredAudioStreamSkipsCommentaryTracks(t *testing.T) {
+	// Pan's Labyrinth-style release: main feature audio is untagged Spanish
+	// 5.1 and the only English-tagged track is the director commentary.
+	probe := mediaProbe{Streams: []mediaStream{
+		{Index: 1, CodecType: "audio", Channels: 6},
+		{Index: 2, CodecType: "audio", Channels: 2, Tags: struct {
+			Language string `json:"language"`
+			Title    string `json:"title"`
+		}{Language: "eng", Title: "Director Commentary"}},
+	}}
+	selected, found := preferredAudioStream(probe, []string{"es", "en", "english"})
+	if !found || selected.Index != 1 {
+		t.Fatalf("selected audio = %+v, found = %v; want the untagged 5.1 feature track", selected, found)
+	}
+}
+
+func TestPreferredAudioStreamPrefersCommentaryOnlyWhenNothingElseExists(t *testing.T) {
+	probe := mediaProbe{Streams: []mediaStream{
+		{Index: 1, CodecType: "audio", Channels: 2, Tags: struct {
+			Language string `json:"language"`
+			Title    string `json:"title"`
+		}{Language: "eng", Title: "Commentary"}, Disposition: struct {
+			Default int `json:"default"`
+			Forced  int `json:"forced"`
+		}{Default: 1}},
+	}}
+	selected, found := preferredAudioStream(probe, []string{"en", "english"})
+	if !found || selected.Index != 1 {
+		t.Fatalf("selected audio = %+v, found = %v; want the commentary fallback", selected, found)
+	}
+}
+
 func TestManagerResumesBearMatroskaAtExactProductionTimestamp(t *testing.T) {
 	speculativeProbe := filepath.Join(t.TempDir(), "speculative-probe")
 	packagerArgs := filepath.Join(t.TempDir(), "packager-args")
@@ -1461,7 +1493,7 @@ while :; do sleep 1; done
 	}
 	defer manager.Close()
 
-	stream, err := manager.Start(t.Context(), "playback-1", 102.084867958, []string{"en"}, -1)
+	stream, err := manager.Start(t.Context(), "playback-1", 102.084867958, []string{"en"}, -1, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1518,7 +1550,7 @@ while :; do sleep 1; done
 	}
 	defer manager.Close()
 
-	stream, err := manager.Start(t.Context(), "playback-1", 43.7, nil, 5)
+	stream, err := manager.Start(t.Context(), "playback-1", 43.7, nil, 5, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1590,7 +1622,7 @@ while :; do sleep 1; done
 	}
 	defer manager.Close()
 
-	stream, err := manager.Start(t.Context(), "playback-1", 43.7, []string{"en"}, -1)
+	stream, err := manager.Start(t.Context(), "playback-1", 43.7, []string{"en"}, -1, -1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1653,7 +1685,7 @@ while :; do sleep 1; done
 
 	result := make(chan error, 1)
 	go func() {
-		_, startErr := manager.Start(t.Context(), "playback-1", 43.7, nil, -1)
+		_, startErr := manager.Start(t.Context(), "playback-1", 43.7, nil, -1, -1)
 		result <- startErr
 	}()
 	deadline := time.Now().Add(time.Second)
@@ -1709,7 +1741,7 @@ while :; do sleep 1; done
 	}
 	defer manager.Close()
 
-	_, err = manager.Start(t.Context(), "playback-1", 43.7, nil, -1)
+	_, err = manager.Start(t.Context(), "playback-1", 43.7, nil, -1, -1)
 	if err == nil || !strings.Contains(err.Error(), "verify packaged HLS source anchor") {
 		t.Fatalf("start error = %v, want source anchor verification failure", err)
 	}
@@ -1761,7 +1793,7 @@ while :; do sleep 1; done
 	}
 	defer manager.Close()
 
-	_, err = manager.Start(t.Context(), "playback-1", 43.7, nil, -1)
+	_, err = manager.Start(t.Context(), "playback-1", 43.7, nil, -1, -1)
 	if err == nil || !strings.Contains(err.Error(), "verify packaged HLS timeline") {
 		t.Fatalf("start error = %v, want packaged timeline verification failure", err)
 	}
@@ -1803,7 +1835,7 @@ while :; do sleep 1; done
 	}
 	defer manager.Close()
 
-	_, err = manager.Start(t.Context(), "playback-1", 1875.616, nil, -1)
+	_, err = manager.Start(t.Context(), "playback-1", 1875.616, nil, -1, -1)
 	if err == nil || !strings.Contains(err.Error(), "source video packet timestamp 2830.828000 follows packager seek 1875.616000") {
 		t.Fatalf("start error = %v, want future source packet rejection", err)
 	}

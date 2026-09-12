@@ -56,6 +56,8 @@ type Stream struct {
 	VideoCodec              string          `json:"video_codec"`
 	Subtitles               []SubtitleTrack `json:"subtitles"`
 	BurnedSubtitleIndex     *int            `json:"burned_subtitle_index,omitempty"`
+	AudioTracks             []AudioTrack    `json:"audio_tracks,omitempty"`
+	AudioStreamIndex        *int            `json:"audio_stream_index,omitempty"`
 }
 
 type SubtitleTrack struct {
@@ -66,6 +68,16 @@ type SubtitleTrack struct {
 	Forced   bool   `json:"forced,omitempty"`
 	Codec    string `json:"codec,omitempty"`
 	Kind     string `json:"kind,omitempty"`
+}
+
+// AudioTrack describes one source audio stream offered to clients. The
+// packaged HLS stream carries a single audio rendition chosen from this list.
+type AudioTrack struct {
+	Index    int    `json:"index"`
+	Language string `json:"language,omitempty"`
+	Title    string `json:"title,omitempty"`
+	Channels int    `json:"channels,omitempty"`
+	Default  bool   `json:"default,omitempty"`
 }
 
 type Manager struct {
@@ -131,6 +143,7 @@ type runningStream struct {
 	parkTimer           *time.Timer
 	languages           []string
 	bitmapSubtitleIndex int
+	audioStreamIndex    int
 
 	subtitleMu     sync.Mutex
 	subtitleIndex  int
@@ -241,6 +254,7 @@ type mediaStream struct {
 	Index        int    `json:"index"`
 	CodecName    string `json:"codec_name"`
 	CodecType    string `json:"codec_type"`
+	Channels     int    `json:"channels"`
 	SideDataList []struct {
 		SideDataType string `json:"side_data_type"`
 	} `json:"side_data_list"`
@@ -386,6 +400,7 @@ func (m *Manager) Start(
 	startSeconds float64,
 	preferredLanguages []string,
 	bitmapSubtitleIndex int,
+	audioStreamIndex int,
 ) (Stream, error) {
 	if !validPlaybackID(playbackID) {
 		return Stream{}, errors.New("invalid playback ID")
@@ -401,12 +416,12 @@ func (m *Manager) Start(
 	startupContext, startupCancel := context.WithTimeout(ctx, m.startupTimeout)
 	defer startupCancel()
 	if stream, matched, err := m.resumePreparedStream(
-		startupContext, playbackID, startSeconds, preferredLanguages, bitmapSubtitleIndex, lifetime,
+		startupContext, playbackID, startSeconds, preferredLanguages, bitmapSubtitleIndex, audioStreamIndex, lifetime,
 	); matched {
 		return stream, err
 	}
 	coveredStream, covered, err := m.resumeCoveredStream(
-		startupContext, playbackID, startSeconds, preferredLanguages, bitmapSubtitleIndex, lifetime,
+		startupContext, playbackID, startSeconds, preferredLanguages, bitmapSubtitleIndex, audioStreamIndex, lifetime,
 	)
 	if err != nil {
 		if startupContext.Err() == nil {
@@ -431,9 +446,22 @@ func (m *Manager) Start(
 	}
 	audioIndex := -1
 	audioLanguage := ""
-	if audio, found := preferredAudioStream(probe, preferredLanguages); found {
+	if audioStreamIndex >= 0 {
+		if !hasAudioStream(probe, audioStreamIndex) {
+			return Stream{}, fmt.Errorf("audio track %d is unavailable", audioStreamIndex)
+		}
+		audioIndex = audioStreamIndex
+	} else if audio, found := preferredAudioStream(probe, preferredLanguages); found {
 		audioIndex = audio.Index
 		audioLanguage = canonicalLanguage(audio.Tags.Language)
+	}
+	if audioIndex >= 0 {
+		for _, stream := range probe.Streams {
+			if stream.Index == audioIndex {
+				audioLanguage = canonicalLanguage(stream.Tags.Language)
+				break
+			}
+		}
 	}
 	subtitles := supportedSubtitles(probe)
 	if bitmapSubtitleIndex >= 0 && !hasBitmapSubtitle(subtitles, bitmapSubtitleIndex) {
@@ -477,6 +505,8 @@ func (m *Manager) Start(
 			PlayerTimeOffsetSeconds: timeline.playerTimeOffsetSeconds,
 			DurationSeconds:         duration, VideoCodec: outputCodec, Subtitles: subtitles,
 			BurnedSubtitleIndex: optionalIndex(bitmapSubtitleIndex),
+			AudioTracks:         supportedAudioTracks(probe),
+			AudioStreamIndex:    optionalIndex(audioIndex),
 		},
 		dir:                 dir,
 		sourceURL:           sourceURL,
@@ -487,6 +517,7 @@ func (m *Manager) Start(
 		command:             command,
 		languages:           append([]string(nil), preferredLanguages...),
 		bitmapSubtitleIndex: bitmapSubtitleIndex,
+		audioStreamIndex:    audioIndex,
 		subtitleIndex:       -1,
 	}
 	go func() {
@@ -600,6 +631,7 @@ func (m *Manager) resumePreparedStream(
 	startSeconds float64,
 	preferredLanguages []string,
 	bitmapSubtitleIndex int,
+	audioStreamIndex int,
 	lifetime *playbackLifetime,
 ) (Stream, bool, error) {
 	m.mu.RLock()
@@ -607,7 +639,8 @@ func (m *Manager) resumePreparedStream(
 	m.mu.RUnlock()
 	if stream == nil || stream.lifetime != lifetime || math.Abs(stream.timeline.requestedSeconds-startSeconds) > 0.5 ||
 		!equalStrings(stream.languages, preferredLanguages) ||
-		stream.bitmapSubtitleIndex != bitmapSubtitleIndex {
+		stream.bitmapSubtitleIndex != bitmapSubtitleIndex ||
+		stream.audioStreamIndex != audioStreamIndex {
 		return Stream{}, false, nil
 	}
 
@@ -683,6 +716,7 @@ func (m *Manager) Prepared(
 	startSeconds float64,
 	preferredLanguages []string,
 	bitmapSubtitleIndex int,
+	audioStreamIndex int,
 	minimumSeconds int,
 ) bool {
 	m.mu.RLock()
@@ -690,7 +724,8 @@ func (m *Manager) Prepared(
 	m.mu.RUnlock()
 	if stream == nil || math.Abs(stream.timeline.requestedSeconds-startSeconds) > 0.5 ||
 		!equalStrings(stream.languages, preferredLanguages) ||
-		stream.bitmapSubtitleIndex != bitmapSubtitleIndex {
+		stream.bitmapSubtitleIndex != bitmapSubtitleIndex ||
+		stream.audioStreamIndex != audioStreamIndex {
 		return false
 	}
 	if minimumSeconds <= 0 {
@@ -711,13 +746,15 @@ func (m *Manager) resumeCoveredStream(
 	startSeconds float64,
 	preferredLanguages []string,
 	bitmapSubtitleIndex int,
+	audioStreamIndex int,
 	lifetime *playbackLifetime,
 ) (Stream, bool, error) {
 	m.mu.RLock()
 	stream := m.streams[playbackID]
 	m.mu.RUnlock()
 	if stream == nil || stream.lifetime != lifetime || !equalStrings(stream.languages, preferredLanguages) ||
-		stream.bitmapSubtitleIndex != bitmapSubtitleIndex {
+		stream.bitmapSubtitleIndex != bitmapSubtitleIndex ||
+		stream.audioStreamIndex != audioStreamIndex {
 		return Stream{}, false, nil
 	}
 	stream.processMu.Lock()
@@ -1203,7 +1240,7 @@ func (m *Manager) probe(parent context.Context, sourceURL string) (mediaProbe, e
 	defer cancel()
 	command := exec.CommandContext(ctx, m.ffprobePath,
 		"-v", "error",
-		"-show_entries", "stream=index,codec_name,codec_type:stream_tags=language,title:stream_disposition=default,forced:stream_side_data=side_data_type:format=start_time,duration",
+		"-show_entries", "stream=index,codec_name,codec_type,channels:stream_tags=language,title:stream_disposition=default,forced:stream_side_data=side_data_type:format=start_time,duration",
 		"-of", "json",
 		sourceURL,
 	)
@@ -1406,6 +1443,31 @@ func compatibleVideo(probe mediaProbe) (string, float64, error) {
 	return "", 0, errors.New("playback has no video stream")
 }
 
+// isCommentaryAudioTrack reports whether the stream looks like a commentary
+// or descriptive narration track rather than the feature dialogue audio.
+func isCommentaryAudioTrack(stream mediaStream) bool {
+	title := strings.ToLower(stream.Tags.Title)
+	return strings.Contains(title, "comment") || strings.Contains(title, "descri") ||
+		strings.Contains(title, "narrat")
+}
+
+// bestAudioStream prefers the default-flagged track, then the track with the
+// most channels. Feature dialogue is usually 5.1 while commentary tracks are
+// stereo, so channel count is a useful tiebreaker when tags are missing.
+func bestAudioStream(streams []mediaStream) mediaStream {
+	best := streams[0]
+	for _, stream := range streams[1:] {
+		switch {
+		case stream.Disposition.Default != 0 && best.Disposition.Default == 0:
+			best = stream
+		case (stream.Disposition.Default != 0) == (best.Disposition.Default != 0) &&
+			stream.Channels > best.Channels:
+			best = stream
+		}
+	}
+	return best
+}
+
 func preferredAudioStream(probe mediaProbe, preferredLanguages []string) (mediaStream, bool) {
 	var audioStreams []mediaStream
 	for _, stream := range probe.Streams {
@@ -1413,23 +1475,61 @@ func preferredAudioStream(probe mediaProbe, preferredLanguages []string) (mediaS
 			audioStreams = append(audioStreams, stream)
 		}
 	}
+	if len(audioStreams) == 0 {
+		return mediaStream{}, false
+	}
+	// Commentary and descriptive tracks are rarely the feature audio; only
+	// consider them when the release carries nothing else. Language tags are
+	// frequently missing or wrong on rips, so an English-tagged commentary
+	// track must not win over an untagged main track.
+	mainStreams := make([]mediaStream, 0, len(audioStreams))
+	for _, stream := range audioStreams {
+		if !isCommentaryAudioTrack(stream) {
+			mainStreams = append(mainStreams, stream)
+		}
+	}
+	if len(mainStreams) == 0 {
+		mainStreams = audioStreams
+	}
 	for _, preferred := range preferredLanguages {
 		preferred = canonicalLanguage(preferred)
-		for _, stream := range audioStreams {
+		var matches []mediaStream
+		for _, stream := range mainStreams {
 			if canonicalLanguage(stream.Tags.Language) == preferred || canonicalLanguage(stream.Tags.Title) == preferred {
-				return stream, true
+				matches = append(matches, stream)
 			}
 		}
-	}
-	for _, stream := range audioStreams {
-		if stream.Disposition.Default != 0 {
-			return stream, true
+		if len(matches) > 0 {
+			return bestAudioStream(matches), true
 		}
 	}
-	if len(audioStreams) > 0 {
-		return audioStreams[0], true
+	return bestAudioStream(mainStreams), true
+}
+
+func supportedAudioTracks(probe mediaProbe) []AudioTrack {
+	var tracks []AudioTrack
+	for _, stream := range probe.Streams {
+		if stream.CodecType != "audio" {
+			continue
+		}
+		tracks = append(tracks, AudioTrack{
+			Index:    stream.Index,
+			Language: canonicalLanguage(stream.Tags.Language),
+			Title:    strings.TrimSpace(stream.Tags.Title),
+			Channels: stream.Channels,
+			Default:  stream.Disposition.Default != 0,
+		})
 	}
-	return mediaStream{}, false
+	return tracks
+}
+
+func hasAudioStream(probe mediaProbe, index int) bool {
+	for _, stream := range probe.Streams {
+		if stream.CodecType == "audio" && stream.Index == index {
+			return true
+		}
+	}
+	return false
 }
 
 func supportedSubtitles(probe mediaProbe) []SubtitleTrack {

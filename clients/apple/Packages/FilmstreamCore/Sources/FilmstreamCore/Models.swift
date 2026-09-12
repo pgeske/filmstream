@@ -587,6 +587,15 @@ public struct HLSSubtitleTrack: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
+public struct HLSAudioTrack: Codable, Hashable, Identifiable, Sendable {
+    public var id: Int { index }
+    public let index: Int
+    public let language: String?
+    public let title: String?
+    public let channels: Int?
+    public let isDefault: Bool?
+}
+
 public struct HLSPlayback: Codable, Hashable, Identifiable, Sendable {
     public var id: String { playbackID }
     public var timeline: HLSPlaybackTimeline {
@@ -606,6 +615,8 @@ public struct HLSPlayback: Codable, Hashable, Identifiable, Sendable {
     public let videoCodec: String
     public let subtitles: [HLSSubtitleTrack]?
     public let burnedSubtitleIndex: Int?
+    public let audioTracks: [HLSAudioTrack]?
+    public let audioStreamIndex: Int?
 
     private enum CodingKeys: String, CodingKey {
         case playbackID = "playback_id"
@@ -617,6 +628,8 @@ public struct HLSPlayback: Codable, Hashable, Identifiable, Sendable {
         case videoCodec = "video_codec"
         case subtitles
         case burnedSubtitleIndex = "burned_subtitle_index"
+        case audioTracks = "audio_tracks"
+        case audioStreamIndex = "audio_stream_index"
     }
 }
 

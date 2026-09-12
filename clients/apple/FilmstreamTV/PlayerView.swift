@@ -22,6 +22,7 @@ struct PlayerView: View {
     @State private var didSaveEndProgress = false
     @State private var isPlaybackChromeVisible = true
     @State private var isSubtitlePickerPresented = false
+    @State private var isAudioPickerPresented = false
     @State private var isStartingNextEpisode = false
     @State private var nextEpisodeError: String?
     @State private var chromeAutoHideTask: Task<Void, Never>?
@@ -129,8 +130,24 @@ struct PlayerView: View {
                 )
                 .transition(.opacity.combined(with: .move(edge: .trailing)))
             }
+
+            if isAudioPickerPresented {
+                AudioPicker(
+                    tracks: controller.audioOptions,
+                    selected: controller.selectedAudio,
+                    onSelect: { track in
+                        controller.selectAudio(track)
+                        Task { @MainActor in
+                            try? await Task.sleep(for: .milliseconds(100))
+                            closeAudioPicker()
+                        }
+                    },
+                    onDismiss: closeAudioPicker
+                )
+                .transition(.opacity.combined(with: .move(edge: .trailing)))
+            }
         }
-        .focusable(!isSubtitlePickerPresented)
+        .focusable(!isSubtitlePickerPresented && !isAudioPickerPresented)
         .focused($receivesRemoteCommands)
         .onAppear {
             receivesRemoteCommands = true
@@ -159,12 +176,12 @@ struct PlayerView: View {
             revealPlaybackChrome()
         }
         .onPlayPauseCommand {
-            guard !isSubtitlePickerPresented else { return }
+            guard !isSubtitlePickerPresented, !isAudioPickerPresented else { return }
             controller.togglePlayback()
             revealPlaybackChrome()
         }
         .onMoveCommand { direction in
-            guard !isSubtitlePickerPresented else { return }
+            guard !isSubtitlePickerPresented, !isAudioPickerPresented else { return }
             switch direction {
             case .left:
                 revealPlaybackChrome(autoHide: false)
@@ -183,7 +200,15 @@ struct PlayerView: View {
                     isSubtitlePickerPresented = true
                 }
             case .down:
-                revealPlaybackChrome()
+                guard !controller.audioOptions.isEmpty else {
+                    revealPlaybackChrome()
+                    return
+                }
+                revealPlaybackChrome(autoHide: false)
+                receivesRemoteCommands = false
+                withAnimation(.easeOut(duration: 0.2)) {
+                    isAudioPickerPresented = true
+                }
             default:
                 break
             }
@@ -205,6 +230,8 @@ struct PlayerView: View {
         .onExitCommand {
             if isSubtitlePickerPresented {
                 closeSubtitlePicker()
+            } else if isAudioPickerPresented {
+                closeAudioPicker()
             } else {
                 closePlayback()
                 dismiss()
@@ -225,7 +252,7 @@ struct PlayerView: View {
     }
 
     private var isPlaybackChromePresented: Bool {
-        isPlaybackChromeVisible || isSubtitlePickerPresented
+        isPlaybackChromeVisible || isSubtitlePickerPresented || isAudioPickerPresented
     }
 
     private var controls: some View {
@@ -280,6 +307,7 @@ struct PlayerView: View {
         chromeAutoHideTask = nil
         guard isPlaybackChromeVisible,
               !isSubtitlePickerPresented,
+              !isAudioPickerPresented,
               !isStartingNextEpisode,
               controller.isPlaying,
               !controller.isWaiting,
@@ -344,6 +372,16 @@ struct PlayerView: View {
     private func closeSubtitlePicker() {
         withAnimation(.easeOut(duration: 0.18)) {
             isSubtitlePickerPresented = false
+        }
+        Task { @MainActor in
+            receivesRemoteCommands = true
+            schedulePlaybackChromeAutoHide()
+        }
+    }
+
+    private func closeAudioPicker() {
+        withAnimation(.easeOut(duration: 0.18)) {
+            isAudioPickerPresented = false
         }
         Task { @MainActor in
             receivesRemoteCommands = true
@@ -434,6 +472,133 @@ private struct SubtitleOptionButtonStyle: ButtonStyle {
             .opacity(configuration.isPressed ? 0.82 : 1)
             .scaleEffect(configuration.isPressed ? 0.985 : 1)
             .animation(.easeOut(duration: 0.1), value: configuration.isPressed)
+    }
+}
+
+private struct AudioPicker: View {
+    let tracks: [HLSAudioTrack]
+    let selected: HLSAudioTrack?
+    let onSelect: (HLSAudioTrack) -> Void
+    let onDismiss: () -> Void
+
+    @FocusState private var focusedOption: Int?
+
+    private var listHeight: CGFloat {
+        min(CGFloat(tracks.count) * 76, 520)
+    }
+
+    var body: some View {
+        ZStack(alignment: .trailing) {
+            Color.black.opacity(0.34)
+                .ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: 20) {
+                HStack(spacing: 14) {
+                    Image(systemName: "speaker.wave.2.fill")
+                        .foregroundStyle(Color.teaAccentLight)
+                    Text("Audio")
+                        .font(.system(size: 34, weight: .bold, design: .rounded))
+                }
+
+                Text("Choose a track")
+                    .font(.headline)
+                    .foregroundStyle(.white.opacity(0.55))
+
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                        ForEach(tracks) { track in
+                            optionRow(
+                                id: track.index,
+                                title: displayName(for: track),
+                                isSelected: selected?.index == track.index
+                            ) {
+                                onSelect(track)
+                            }
+                        }
+                    }
+                }
+                .frame(height: listHeight)
+                .scrollIndicators(.hidden)
+            }
+            .padding(34)
+            .frame(width: 570)
+            .background(
+                LinearGradient(
+                    colors: [Color.teaPanelElevated, Color.teaBackground.opacity(0.98)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
+                in: RoundedRectangle(cornerRadius: 26, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 26, style: .continuous)
+                    .stroke(Color.teaAccent.opacity(0.2), lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.6), radius: 38, x: -12)
+            .padding(.trailing, 68)
+        }
+        .onExitCommand(perform: onDismiss)
+        .task {
+            focusedOption = selected?.index ?? tracks.first?.index
+        }
+    }
+
+    private func displayName(for track: HLSAudioTrack) -> String {
+        var parts: [String] = []
+        if let language = track.language, !language.isEmpty {
+            parts.append(language.capitalized)
+        }
+        if let title = track.title, !title.isEmpty, title.lowercased() != track.language {
+            parts.append(title)
+        }
+        if let channels = track.channels, channels > 0 {
+            parts.append("\(channels > 6 ? "7.1" : channels == 6 ? "5.1" : channels == 2 ? "Stereo" : "Mono")")
+        }
+        if parts.isEmpty {
+            parts.append("Track \(track.index)")
+        }
+        let matching = tracks.filter { displayName(for: $0) == parts.joined(separator: " — ") }
+        var name = parts.joined(separator: " — ")
+        if matching.count > 1,
+           let position = matching.firstIndex(where: { $0.index == track.index }),
+           position > 0 {
+            name += " \(position + 1)"
+        }
+        return name
+    }
+
+    private func optionRow(
+        id: Int,
+        title: String,
+        isSelected: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 16) {
+                Capsule()
+                    .fill(focusedOption == id ? Color.teaAccent : .clear)
+                    .frame(width: 4, height: 32)
+                Text(title)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(Color.teaCream)
+                    .lineLimit(1)
+                Spacer()
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.headline.weight(.bold))
+                        .foregroundStyle(Color.teaAccentLight)
+                }
+            }
+            .padding(.horizontal, 18)
+            .frame(height: 60)
+            .background(
+                focusedOption == id ? Color.white.opacity(0.08) : .clear,
+                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+            )
+        }
+        .buttonStyle(SubtitleOptionButtonStyle())
+        .focusEffectDisabled()
+        .focused($focusedOption, equals: id)
     }
 }
 
@@ -640,6 +805,8 @@ private final class NativePlaybackController: ObservableObject {
     @Published private(set) var subtitleOptions: [HLSSubtitleTrack]
     @Published private(set) var selectedSubtitle: HLSSubtitleTrack?
     @Published private(set) var activeSubtitleText: String?
+    @Published private(set) var audioOptions: [HLSAudioTrack]
+    @Published private(set) var selectedAudio: HLSAudioTrack?
 
     private let api: FilmstreamAPI
     private let movie: Movie
@@ -654,6 +821,8 @@ private final class NativePlaybackController: ObservableObject {
     private var seekTask: Task<Void, Never>?
     private var subtitleTask: Task<Void, Never>?
     private var subtitleSwitchTask: Task<Void, Never>?
+    private var audioSwitchTask: Task<Void, Never>?
+    private var packagedAudioStreamIndex: Int?
     private var recoveryTask: Task<Void, Never>?
     private var playbackFailureTask: Task<Void, Never>?
     private var liveness: PlaybackLiveness?
@@ -683,7 +852,12 @@ private final class NativePlaybackController: ObservableObject {
         durationSeconds = max(0, prepared.hls.durationSeconds ?? 0)
         seekOriginSeconds = timeline.requestedSeconds
         subtitleOptions = prepared.hls.subtitles ?? []
+        let audioTracks = prepared.hls.audioTracks ?? []
+        let packagedAudioIndex = prepared.hls.audioStreamIndex
+        audioOptions = audioTracks
+        packagedAudioStreamIndex = packagedAudioIndex
         selectedSubtitle = Self.preferredSubtitle(in: subtitleOptions)
+        selectedAudio = audioTracks.first { $0.index == packagedAudioIndex }
         burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
 
         player.automaticallyWaitsToMinimizeStalling = true
@@ -992,6 +1166,8 @@ private final class NativePlaybackController: ObservableObject {
             timeline = refreshed.hls.timeline
             burnedSubtitleIndex = refreshed.hls.burnedSubtitleIndex
             updateSubtitleOptions(refreshed.hls.subtitles ?? [])
+            packagedAudioStreamIndex = refreshed.hls.audioStreamIndex
+            updateAudioOptions(refreshed.hls.audioTracks ?? [])
             if let duration = refreshed.hls.durationSeconds, duration > 0 {
                 durationSeconds = duration
             }
@@ -1166,6 +1342,98 @@ private final class NativePlaybackController: ObservableObject {
         let target = CMTime(seconds: seconds, preferredTimescale: 600)
         return item.seekableTimeRanges.contains { value in
             CMTimeRangeContainsTime(value.timeRangeValue, time: target)
+        }
+    }
+
+    private func updateAudioOptions(_ tracks: [HLSAudioTrack]) {
+        let previous = selectedAudio
+        audioOptions = tracks
+        if let previous {
+            selectedAudio = tracks.first { $0.index == previous.index }
+        } else if let packagedAudioStreamIndex {
+            selectedAudio = tracks.first { $0.index == packagedAudioStreamIndex }
+        }
+    }
+
+    func selectAudio(_ track: HLSAudioTrack) {
+        guard track.index != selectedAudio?.index, track.index != packagedAudioStreamIndex else { return }
+        selectedAudio = track
+        switchAudioStreamIfNeeded()
+    }
+
+    // Switching audio swaps the packaged rendition, which requires a fresh
+    // stream at the current position. Mirrors the subtitle bitmap switch.
+    private func switchAudioStreamIfNeeded() {
+        guard let desiredAudioIndex = selectedAudio?.index,
+              desiredAudioIndex != packagedAudioStreamIndex,
+              audioSwitchTask == nil else {
+            return
+        }
+
+        let generation = beginItemOperation()
+        cancelPlaybackFailure()
+        subtitleTask?.cancel()
+        subtitleTask = nil
+        subtitleCues = []
+        activeSubtitleText = nil
+        let resumePosition = max(0, positionSeconds)
+        player.pause()
+        isWaiting = true
+        stateLabel = "Changing Audio…"
+        errorMessage = nil
+
+        audioSwitchTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let prepared = try await self.api.prepareNativePlayback(
+                    self.playback,
+                    startSeconds: resumePosition,
+                    audioStreamIndex: desiredAudioIndex,
+                    useSavedSubtitlePreference: true
+                )
+                guard !Task.isCancelled, generation == self.seekGeneration, !self.stopped else { return }
+                self.timeline = prepared.hls.timeline
+                self.burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
+                self.updateSubtitleOptions(prepared.hls.subtitles ?? [])
+                self.packagedAudioStreamIndex = prepared.hls.audioStreamIndex
+                self.updateAudioOptions(prepared.hls.audioTracks ?? [])
+                self.installItem(url: self.cacheBusted(prepared.hls.playlistURL))
+                let playerPosition = self.timeline.playerSeconds(
+                    forMediaSeconds: resumePosition
+                )
+                self.player.seek(
+                    to: CMTime(seconds: playerPosition, preferredTimescale: 600),
+                    toleranceBefore: .zero,
+                    toleranceAfter: .zero
+                ) { [weak self] finished in
+                    Task { @MainActor in
+                        guard let self, generation == self.seekGeneration, !self.stopped else { return }
+                        self.audioSwitchTask = nil
+                        self.isWaiting = self.wantsToPlay
+                        guard finished else {
+                            self.pause()
+                            self.isWaiting = false
+                            self.stateLabel = "Unable to Change Audio"
+                            self.errorMessage = "The player could not resume after changing audio."
+                            return
+                        }
+                        if self.wantsToPlay {
+                            self.play()
+                        } else {
+                            self.stateLabel = "Paused"
+                        }
+                    }
+                }
+            } catch {
+                guard !Task.isCancelled, generation == self.seekGeneration, !self.stopped else { return }
+                self.audioSwitchTask = nil
+                self.cancelPlaybackFailure()
+                self.isWaiting = false
+                self.wantsToPlay = false
+                self.isPlaying = false
+                self.stateLabel = "Unable to Change Audio"
+                self.errorMessage = error.localizedDescription
+            }
         }
     }
 

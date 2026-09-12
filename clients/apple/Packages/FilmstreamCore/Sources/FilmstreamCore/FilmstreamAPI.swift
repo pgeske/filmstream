@@ -301,6 +301,7 @@ public struct FilmstreamAPI: Sendable {
         _ playback: Playback,
         startSeconds: Double,
         bitmapSubtitleIndex: Int? = nil,
+        audioStreamIndex: Int? = nil,
         useSavedSubtitlePreference: Bool = true
     ) async throws -> PreparedPlayback {
         var selectedBitmapIndex = bitmapSubtitleIndex
@@ -314,7 +315,8 @@ public struct FilmstreamAPI: Sendable {
             method: "POST",
             body: HLSRequest(
                 startSeconds: max(0, startSeconds),
-                bitmapSubtitleIndex: selectedBitmapIndex
+                bitmapSubtitleIndex: selectedBitmapIndex,
+                audioStreamIndex: audioStreamIndex
             )
         )
         return PreparedPlayback(playback: playback, hls: hls)
@@ -615,10 +617,12 @@ private struct PlaybackPreferences: Encodable {
 private struct HLSRequest: Encodable {
     let startSeconds: Double
     let bitmapSubtitleIndex: Int?
+    let audioStreamIndex: Int?
 
     private enum CodingKeys: String, CodingKey {
         case startSeconds = "start_seconds"
         case bitmapSubtitleIndex = "bitmap_subtitle_index"
+        case audioStreamIndex = "audio_stream_index"
     }
 }
 
