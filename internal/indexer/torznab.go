@@ -12,12 +12,18 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	"github.com/pgeske/filmstream/internal/catalog"
 )
 
-const maxTorznabResponseBytes = 16 << 20
+const (
+	maxTorznabResponseBytes = 16 << 20
+	// A failed capabilities lookup is remembered this long so a down indexer
+	// fails searches immediately instead of costing a request timeout each time.
+	torznabCapabilitiesRetry = time.Minute
+)
 
 type Capabilities struct {
 	SearchAvailable      bool
@@ -33,8 +39,10 @@ type Torznab struct {
 	apiKey   string
 	client   *http.Client
 
-	capabilitiesMu sync.Mutex
-	capabilities   *Capabilities
+	capabilitiesMu      sync.Mutex
+	capabilities        *Capabilities
+	capabilitiesErr     error
+	capabilitiesRetryAt time.Time
 }
 
 func NewTorznab(name, endpoint, apiKey string, client *http.Client) (*Torznab, error) {
@@ -65,7 +73,24 @@ func (t *Torznab) Capabilities(ctx context.Context) (Capabilities, error) {
 	if t.capabilities != nil {
 		return *t.capabilities, nil
 	}
+	if t.capabilitiesErr != nil && time.Now().Before(t.capabilitiesRetryAt) {
+		return Capabilities{}, t.capabilitiesErr
+	}
+	capabilities, err := t.fetchCapabilities(ctx)
+	if err != nil {
+		// The caller giving up says nothing about the indexer.
+		if ctx.Err() == nil {
+			t.capabilitiesErr = err
+			t.capabilitiesRetryAt = time.Now().Add(torznabCapabilitiesRetry)
+		}
+		return Capabilities{}, err
+	}
+	t.capabilities = &capabilities
+	t.capabilitiesErr = nil
+	return capabilities, nil
+}
 
+func (t *Torznab) fetchCapabilities(ctx context.Context) (Capabilities, error) {
 	requestURL := t.requestURL(map[string]string{"t": "caps"})
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
@@ -116,7 +141,6 @@ func (t *Torznab) Capabilities(ctx context.Context) (Capabilities, error) {
 	if !capabilities.SearchAvailable && !capabilities.MovieSearchAvailable && !capabilities.TVSearchAvailable {
 		return Capabilities{}, fmt.Errorf("%s supports no compatible searches", t.name)
 	}
-	t.capabilities = &capabilities
 	return capabilities, nil
 }
 
@@ -126,77 +150,91 @@ func (t *Torznab) Search(ctx context.Context, request catalog.SearchRequest) ([]
 		return nil, err
 	}
 	if request.MediaType == "show" && request.SeasonNumber > 0 && request.EpisodeNumber > 0 {
-		seasonQuery := fmt.Sprintf("%s S%02d", torznabQuery(request.Query), request.SeasonNumber)
-		episodeQuery := fmt.Sprintf("%s S%02dE%02d", torznabQuery(request.Query), request.SeasonNumber, request.EpisodeNumber)
-		seasonParameters := map[string]string{"t": "search", "q": seasonQuery, "limit": "100"}
-		episodeParameters := map[string]string{"t": "search", "q": episodeQuery, "limit": "100"}
-
-		searches := []map[string]string{seasonParameters}
-		if capabilities.TVSearchAvailable {
-			tvParameters := map[string]string{"t": "tvsearch", "q": torznabQuery(request.Query), "limit": "100"}
-			if capabilities.TVSearchParams["season"] {
-				tvParameters["season"] = strconv.Itoa(request.SeasonNumber)
-			} else {
-				tvParameters["q"] = seasonQuery
-			}
-			searches = append(searches, tvParameters)
-		}
-
-		type searchResult struct {
-			candidates []catalog.Candidate
-			err        error
-		}
-		results := make(chan searchResult, len(searches))
-		for _, parameters := range searches {
-			go func(parameters map[string]string) {
-				candidates, err := t.search(ctx, parameters)
-				results <- searchResult{candidates: candidates, err: err}
-			}(parameters)
-		}
-		var candidates []catalog.Candidate
-		var failures []error
-		for range searches {
-			result := <-results
-			if result.err != nil {
-				failures = append(failures, result.err)
-			} else {
-				candidates = append(candidates, result.candidates...)
-			}
-		}
-		candidates = mergeCandidates(candidates)
-		if request.PreferSeasonPack {
-			for _, candidate := range candidates {
-				if catalog.IsSeasonPack(candidate.Name, request.SeasonNumber) {
-					return candidates, nil
-				}
-			}
-		}
-		episodeCandidates, episodeErr := t.search(ctx, episodeParameters)
-		if episodeErr != nil {
-			failures = append(failures, episodeErr)
-		} else {
-			candidates = mergeCandidates(candidates, episodeCandidates)
-		}
-		if len(candidates) == 0 && len(failures) > 0 {
-			return nil, errors.Join(failures...)
-		}
-		return candidates, nil
+		return t.searchEpisode(ctx, request, capabilities)
 	}
+	return t.searchMovie(ctx, request, capabilities)
+}
+
+func (t *Torznab) searchEpisode(
+	ctx context.Context,
+	request catalog.SearchRequest,
+	capabilities Capabilities,
+) ([]catalog.Candidate, error) {
+	title := torznabQuery(request.Query)
+	seasonQuery := fmt.Sprintf("%s S%02d", title, request.SeasonNumber)
+	// The episode query always runs: a dead or thin season pack must not hide
+	// healthy single-episode releases.
+	searches := []map[string]string{
+		{"t": "search", "q": seasonQuery, "limit": "100"},
+		{"t": "search", "q": fmt.Sprintf("%s S%02dE%02d", title, request.SeasonNumber, request.EpisodeNumber), "limit": "100"},
+	}
+	if capabilities.TVSearchAvailable {
+		parameters := map[string]string{"t": "tvsearch", "limit": "100"}
+		if !addIDParameters(parameters, capabilities.TVSearchParams, request) {
+			parameters["q"] = title
+		}
+		if capabilities.TVSearchParams["season"] {
+			parameters["season"] = strconv.Itoa(request.SeasonNumber)
+		} else if parameters["q"] != "" {
+			parameters["q"] = seasonQuery
+		}
+		searches = append(searches, parameters)
+	}
+
+	type searchResult struct {
+		index      int
+		candidates []catalog.Candidate
+		err        error
+	}
+	results := make(chan searchResult, len(searches))
+	for index, parameters := range searches {
+		go func(index int, parameters map[string]string) {
+			candidates, err := t.search(ctx, parameters)
+			results <- searchResult{index: index, candidates: candidates, err: err}
+		}(index, parameters)
+	}
+	// Merge in query order so duplicates resolve the same way on every search.
+	groups := make([][]catalog.Candidate, len(searches))
+	var failures []error
+	for range searches {
+		result := <-results
+		if result.err != nil {
+			failures = append(failures, result.err)
+		} else {
+			groups[result.index] = result.candidates
+		}
+	}
+	candidates := mergeCandidates(groups...)
+	if len(candidates) == 0 && len(failures) > 0 {
+		return nil, errors.Join(failures...)
+	}
+	return candidates, nil
+}
+
+func (t *Torznab) searchMovie(
+	ctx context.Context,
+	request catalog.SearchRequest,
+	capabilities Capabilities,
+) ([]catalog.Candidate, error) {
 	var candidates []catalog.Candidate
 	var failures []error
 	if capabilities.MovieSearchAvailable {
-		movieParameters := map[string]string{
-			"t": "movie", "q": torznabQuery(request.Query), "limit": "100",
+		parameters := map[string]string{"t": "movie", "limit": "100"}
+		byID := addIDParameters(parameters, capabilities.MovieSearchParams, request)
+		if !byID {
+			parameters["q"] = torznabQuery(request.Query)
+			if request.Year > 0 && capabilities.MovieSearchParams["year"] {
+				parameters["year"] = strconv.Itoa(request.Year)
+			}
 		}
-		if request.Year > 0 && capabilities.MovieSearchParams["year"] {
-			movieParameters["year"] = strconv.Itoa(request.Year)
-		}
-		movieCandidates, movieErr := t.search(ctx, movieParameters)
+		movieCandidates, movieErr := t.search(ctx, parameters)
 		if movieErr != nil {
 			failures = append(failures, movieErr)
 		} else {
 			candidates = mergeCandidates(candidates, movieCandidates)
-			if len(catalog.Rank(request, candidates)) > 0 {
+			// An ID search is exact even when release names use another title,
+			// so title-based fallbacks cannot improve on its results.
+			if byID && len(candidates) > 0 || len(catalog.Rank(request, candidates)) > 0 {
 				return candidates, nil
 			}
 		}
@@ -221,6 +259,21 @@ func (t *Torznab) Search(ctx context.Context, request catalog.SearchRequest) ([]
 		return nil, errors.Join(failures...)
 	}
 	return candidates, nil
+}
+
+// addIDParameters adds the IMDb and TMDB IDs that the indexer supports for a
+// search type and reports whether any was added.
+func addIDParameters(parameters map[string]string, supported map[string]bool, request catalog.SearchRequest) bool {
+	added := false
+	if request.IMDBID != "" && supported["imdbid"] {
+		parameters["imdbid"] = request.IMDBID
+		added = true
+	}
+	if request.TMDBID > 0 && supported["tmdbid"] {
+		parameters["tmdbid"] = strconv.Itoa(request.TMDBID)
+		added = true
+	}
+	return added
 }
 
 func (t *Torznab) search(ctx context.Context, parameters map[string]string) ([]catalog.Candidate, error) {
@@ -356,11 +409,15 @@ func (t *Torznab) candidate(item torznabItem) (catalog.Candidate, bool) {
 	}
 	if strings.HasPrefix(download, "magnet:") {
 		candidate.MagnetURI = download
+		candidate.InfoHash = magnetInfoHash(download)
 	} else if strings.Contains(strings.ToLower(item.Enclosure.Type), "nzb") || strings.EqualFold(attributes["protocol"], catalog.ProtocolUsenet) {
 		candidate.Protocol = catalog.ProtocolUsenet
 		candidate.NZBURL = download
 	} else {
 		candidate.TorrentURL = download
+	}
+	if candidate.Protocol == catalog.ProtocolTorrent && candidate.InfoHash == "" {
+		candidate.InfoHash = normalizeInfoHash(attributes["infohash"])
 	}
 	if value, ok := parseOptionalInt(attributes["seeders"]); ok {
 		candidate.Seeders = &value

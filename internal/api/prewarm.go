@@ -23,7 +23,14 @@ const (
 	prewarmBufferSeconds = 30
 	prewarmMaxAge        = 20 * time.Minute
 	prewarmHintTTL       = 30 * time.Minute
+	// prewarmClaimWait bounds how long a click waits for an in-flight prewarm
+	// to select its release before selecting one itself.
+	prewarmClaimWait = 10 * time.Second
 )
+
+// errPrewarmSkipped marks a prewarm that playback creation declined on
+// purpose, such as a release that would create a new private-tracker obligation.
+var errPrewarmSkipped = errors.New("prewarm skipped")
 
 type playbackPrewarmTarget struct {
 	request           CreatePlaybackRequest
@@ -112,10 +119,25 @@ func (s *Server) claimPrewarmedPlayback(ctx context.Context, request CreatePlayb
 	ready := state.playbackReady
 	s.prewarmMu.Unlock()
 
+	wait := time.NewTimer(prewarmClaimWait)
+	defer wait.Stop()
 	select {
 	case <-ctx.Done():
 		return CreatePlaybackResponse{}, false
 	case <-ready:
+	case <-wait.C:
+		// The prewarm is still selecting a release. Cancel it so its candidate
+		// sessions are dropped instead of competing with the click's own
+		// selection, which reuses its search and quarantine results.
+		s.prewarmMu.Lock()
+		if s.prewarmStates[key] == state && !state.claimed {
+			delete(s.prewarmStates, key)
+			state.cancel()
+		}
+		s.prewarmMu.Unlock()
+		s.logger.Info("prewarm still selecting a release; playback request takes over",
+			"media_id", request.MediaID, "waited", prewarmClaimWait)
+		return CreatePlaybackResponse{}, false
 	}
 
 	s.prewarmMu.Lock()
@@ -368,7 +390,10 @@ func (s *Server) finishPlaybackPrewarm(
 		state.cancel()
 	}
 	s.prewarmMu.Unlock()
-	if err != nil && !errors.Is(err, context.Canceled) {
+	switch {
+	case errors.Is(err, errPrewarmSkipped):
+		s.logger.Info("prewarm playback skipped", "media_id", state.target.request.MediaID, "reason", err)
+	case err != nil && !errors.Is(err, context.Canceled):
 		s.logger.Warn("prewarm playback", "media_id", state.target.request.MediaID, "error", err)
 	}
 	return err == nil
@@ -560,6 +585,9 @@ func (s *Server) prewarmJSON(
 			Error string `json:"error"`
 		}
 		_ = json.Unmarshal(contents, &payload)
+		if internal && response.StatusCode == http.StatusConflict {
+			return fmt.Errorf("%w: %s", errPrewarmSkipped, payload.Error)
+		}
 		if payload.Error != "" {
 			return errors.New(payload.Error)
 		}

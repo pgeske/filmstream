@@ -19,8 +19,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/anacrolix/torrent/bencode"
-	"github.com/anacrolix/torrent/metainfo"
 	"github.com/pgeske/filmstream/internal/catalog"
 	"github.com/pgeske/filmstream/internal/config"
 	"github.com/pgeske/filmstream/internal/history"
@@ -30,6 +28,7 @@ import (
 	"github.com/pgeske/filmstream/internal/playbackcache"
 	"github.com/pgeske/filmstream/internal/resolver"
 	"github.com/pgeske/filmstream/internal/torrentstream"
+	"github.com/pgeske/filmstream/internal/torrentstream/torrentstreamtest"
 	"github.com/pgeske/filmstream/internal/usenetstream"
 )
 
@@ -65,18 +64,39 @@ type fakeTorrentPlaybackEngine struct {
 	sessions          map[string]*torrentstream.Session
 	statuses          map[string]torrentstream.Status
 	sourceUnavailable map[string]error
+	// Keyed by magnet: createErrors fails Create, stalledMetadata blocks it
+	// until canceled, and sourceStatuses reports the mounted swarm. A mounted
+	// torrent without an explicit status has a peer serving data.
+	createErrors    map[string]error
+	stalledMetadata map[string]bool
+	sourceStatuses  map[string]torrentstream.Status
+	sources         map[string]string
 }
 
-func (f *fakeTorrentPlaybackEngine) Create(_ context.Context, source torrentstream.Source) (*torrentstream.Session, error) {
+func (f *fakeTorrentPlaybackEngine) Create(ctx context.Context, source torrentstream.Source) (*torrentstream.Session, error) {
+	f.mu.Lock()
+	f.created = append(f.created, source)
+	id := fmt.Sprintf("playback-%d", len(f.created))
+	createErr, stalled := f.createErrors[source.MagnetURI], f.stalledMetadata[source.MagnetURI]
+	f.mu.Unlock()
+	if stalled {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if createErr != nil {
+		return nil, createErr
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	id := fmt.Sprintf("playback-%d", len(f.created)+1)
 	session := &torrentstream.Session{ID: id, Name: id, FileName: "episode.mkv"}
-	f.created = append(f.created, source)
 	if f.sessions == nil {
 		f.sessions = make(map[string]*torrentstream.Session)
 	}
+	if f.sources == nil {
+		f.sources = make(map[string]string)
+	}
 	f.sessions[id] = session
+	f.sources[id] = source.MagnetURI
 	return session, nil
 }
 
@@ -102,8 +122,16 @@ func (f *fakeTorrentPlaybackEngine) Drop(id string) error {
 func (f *fakeTorrentPlaybackEngine) Status(id string) (torrentstream.Status, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	status, ok := f.statuses[id]
-	return status, ok
+	if status, ok := f.statuses[id]; ok {
+		return status, true
+	}
+	if _, ok := f.sessions[id]; !ok {
+		return torrentstream.Status{}, false
+	}
+	if status, ok := f.sourceStatuses[f.sources[id]]; ok {
+		return status, true
+	}
+	return torrentstream.Status{ID: id, ActivePeers: 1, DownloadRate: 1 << 20}, true
 }
 
 func (f *fakeTorrentPlaybackEngine) SourceUnavailable(id string) error {
@@ -211,8 +239,11 @@ func (f *fakeHLSManager) StartSubtitle(_ context.Context, playbackID string, ind
 	return nil
 }
 
-func (f *fakeHLSManager) AssetPath(_, name string) (string, error) {
-	return filepath.Join(f.dir, name), nil
+func (f *fakeHLSManager) Asset(_, name string) (hls.Asset, error) {
+	contentTypes := map[string]string{
+		".m3u8": "application/vnd.apple.mpegurl", ".m4s": "video/iso.segment", ".vtt": "text/vtt; charset=utf-8",
+	}
+	return hls.Asset{Path: filepath.Join(f.dir, name), ContentType: contentTypes[filepath.Ext(name)]}, nil
 }
 
 func (f *fakeHLSManager) Prepared(string, float64, []string, int, int, int) bool {
@@ -401,13 +432,7 @@ func TestCreatePlaybackPrefersUsenetCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	torrentEngine, err := torrentstream.New(torrentstream.Config{
-		DataDir: t.TempDir(), MetadataTimeout: time.Second, CleanOnClose: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer torrentEngine.Close()
+	torrentEngine, _ := newAPITestTorrentEngine(t)
 	server := New(registry, torrentEngine, catalog.Preferences{
 		Codecs: []string{"h264", "h265"}, MaxSizeBytes: 60 << 30,
 	}, slog.Default())
@@ -446,8 +471,8 @@ func TestCreatePlaybackPrefersUsenetCandidate(t *testing.T) {
 }
 
 func TestCreateEpisodePlaybackUsesTorrentSeasonPack(t *testing.T) {
-	dataDir := t.TempDir()
-	torrentContents := createAPITestTorrentForFile(t, dataDir, "Original.Show.S01E02.mp4")
+	torrentEngine, torrentPlugin := newAPITestTorrentEngine(t)
+	torrentContents := registerAPITestTorrent(torrentPlugin, "Original.Show.S01E02.mp4")
 	var tvSearchQuery string
 	indexerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/download/season" {
@@ -478,13 +503,6 @@ func TestCreateEpisodePlaybackUsesTorrentSeasonPack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	torrentEngine, err := torrentstream.New(torrentstream.Config{
-		DataDir: dataDir, MetadataTimeout: time.Second, CleanOnClose: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer torrentEngine.Close()
 	server := New(registry, torrentEngine, catalog.Preferences{Codecs: []string{"h264"}}, slog.Default())
 	fakeUsenet := &fakeUsenetPlaybackEngine{session: &usenetstream.Session{ID: "should-not-be-used"}}
 	server.usenetEngine = fakeUsenet
@@ -574,13 +592,7 @@ func TestCreatePlaybackReusesCachedUsenetReleaseWithoutSearching(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	torrentEngine, err := torrentstream.New(torrentstream.Config{
-		DataDir: t.TempDir(), MetadataTimeout: time.Second, CleanOnClose: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer torrentEngine.Close()
+	torrentEngine, _ := newAPITestTorrentEngine(t)
 	server := New(registry, torrentEngine, catalog.Preferences{}, slog.Default())
 	fakeUsenet := &fakeUsenetPlaybackEngine{
 		session: &usenetstream.Session{ID: "usenet-playback", Name: "Sintel", FileName: "Sintel.mkv", FileSize: 607836000},
@@ -640,8 +652,8 @@ func TestCreatePlaybackReusesCachedUsenetReleaseWithoutSearching(t *testing.T) {
 // mounted swarm has not connected any peers yet; otherwise slow tracker or DHT
 // startup would evict a known-good release and force a full search on every replay.
 func TestCreatePlaybackReusesCachedTorrentReleaseWithoutSearchingOrLoadingMetadata(t *testing.T) {
-	dataDir := t.TempDir()
-	torrentContents := createAPITestTorrentForFile(t, dataDir, "Original.Show.S01E02.mp4")
+	torrentEngine, torrentPlugin := newAPITestTorrentEngine(t)
+	torrentContents := registerAPITestTorrent(torrentPlugin, "Original.Show.S01E02.mp4")
 	var searches atomic.Int32
 	var indexerServer *httptest.Server
 	indexerServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -667,13 +679,6 @@ func TestCreatePlaybackReusesCachedTorrentReleaseWithoutSearchingOrLoadingMetada
 	if err != nil {
 		t.Fatal(err)
 	}
-	torrentEngine, err := torrentstream.New(torrentstream.Config{
-		DataDir: dataDir, MetadataTimeout: time.Second, CleanOnClose: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer torrentEngine.Close()
 	server := New(registry, torrentEngine, catalog.Preferences{Codecs: []string{"h264"}}, slog.Default())
 	server.playbackSourceMode = config.PlaybackSourceTorrentOnly
 	server.hlsManager = &fakeHLSManager{}
@@ -798,13 +803,7 @@ func TestCreatePlaybackJoinsInProgressPrewarm(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	torrentEngine, err := torrentstream.New(torrentstream.Config{
-		DataDir: t.TempDir(), MetadataTimeout: time.Second, CleanOnClose: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer torrentEngine.Close()
+	torrentEngine, _ := newAPITestTorrentEngine(t)
 	server := New(registry, torrentEngine, catalog.Preferences{}, slog.Default())
 	server.usenetEngine = &fakeUsenetPlaybackEngine{
 		session: &usenetstream.Session{ID: "warm-playback", Name: "The Movie", FileName: "movie.mkv"},
@@ -911,13 +910,7 @@ func TestAutoplayClaimWaitsForCanceledPrewarmParkBeforeOldPlaybackCloses(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	torrentEngine, err := torrentstream.New(torrentstream.Config{
-		DataDir: t.TempDir(), MetadataTimeout: time.Second, CleanOnClose: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer torrentEngine.Close()
+	torrentEngine, _ := newAPITestTorrentEngine(t)
 	server := New(registry, torrentEngine, catalog.Preferences{}, slog.Default())
 	server.usenetEngine = &fakeUsenetPlaybackEngine{
 		session: &usenetstream.Session{ID: "warm-playback", Name: "The Movie", FileName: "movie.mkv"},
@@ -1205,13 +1198,7 @@ func TestPlaybackPrewarmStartsMatchedBitmapSubtitle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	torrentEngine, err := torrentstream.New(torrentstream.Config{
-		DataDir: t.TempDir(), MetadataTimeout: time.Second, CleanOnClose: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer torrentEngine.Close()
+	torrentEngine, _ := newAPITestTorrentEngine(t)
 	server := New(registry, torrentEngine, catalog.Preferences{}, slog.Default())
 	server.usenetEngine = &fakeUsenetPlaybackEngine{
 		session: &usenetstream.Session{ID: "warm-playback", Name: "The Show", FileName: "episode.mkv"},
@@ -1443,8 +1430,8 @@ func TestHLSFailureInvalidatesAndSkipsUsenetRelease(t *testing.T) {
 }
 
 func TestCreatePlaybackFallsBackToTorrent(t *testing.T) {
-	dataDir := t.TempDir()
-	torrentContents := createAPITestTorrent(t, dataDir)
+	torrentEngine, torrentPlugin := newAPITestTorrentEngine(t)
+	torrentContents := registerAPITestTorrent(torrentPlugin, "Sintel.mp4")
 	indexerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/download/2" {
 			w.Header().Set("Content-Type", "application/x-bittorrent")
@@ -1470,13 +1457,6 @@ func TestCreatePlaybackFallsBackToTorrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	torrentEngine, err := torrentstream.New(torrentstream.Config{
-		DataDir: dataDir, MetadataTimeout: 5 * time.Second, CleanOnClose: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer torrentEngine.Close()
 	server := New(registry, torrentEngine, catalog.Preferences{MaxSizeBytes: 1 << 30}, slog.Default())
 	server.usenetEngine = &fakeUsenetPlaybackEngine{createErr: errors.New("articles unavailable")}
 
@@ -1509,37 +1489,29 @@ func TestCreatePlaybackFallsBackToTorrent(t *testing.T) {
 	}
 }
 
-func createAPITestTorrent(t *testing.T, dataDir string) []byte {
+func newAPITestTorrentEngine(t *testing.T) (*torrentstream.Engine, *torrentstreamtest.Plugin) {
 	t.Helper()
-	return createAPITestTorrentForFile(t, dataDir, "Sintel.mp4")
-}
-
-func createAPITestTorrentForFile(t *testing.T, dataDir, fileName string) []byte {
-	t.Helper()
-	torrentDataDir := filepath.Join(dataDir, "torrents")
-	if err := os.MkdirAll(torrentDataDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	videoPath := filepath.Join(torrentDataDir, fileName)
-	if err := os.WriteFile(videoPath, bytes.Repeat([]byte("filmstream-test"), 4096), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	meta := metainfo.MetaInfo{}
-	meta.SetDefaults()
-	info := metainfo.Info{PieceLength: 16 << 10}
-	if err := info.BuildFromFilePath(videoPath); err != nil {
-		t.Fatal(err)
-	}
-	var err error
-	meta.InfoBytes, err = bencode.Marshal(info)
+	plugin := torrentstreamtest.NewPlugin(t)
+	plugin.SetAutoComplete(true)
+	engine, err := torrentstream.New(torrentstream.Config{
+		DataDir: t.TempDir(), PluginURL: plugin.URL, PluginTokenFile: plugin.TokenFile,
+		DownloadsDir: plugin.DownloadsDir, MetadataTimeout: time.Second,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var output bytes.Buffer
-	if err := meta.Write(&output); err != nil {
-		t.Fatal(err)
-	}
-	return output.Bytes()
+	t.Cleanup(func() { engine.Close() })
+	return engine, plugin
+}
+
+// registerAPITestTorrent makes a single-file torrent addable through the fake
+// Deluge plugin and returns its .torrent contents.
+func registerAPITestTorrent(plugin *torrentstreamtest.Plugin, fileName string) []byte {
+	torrent := torrentstreamtest.Torrent{Name: fileName, PieceLength: 16 << 10, Files: []torrentstreamtest.File{
+		{Path: fileName, Data: bytes.Repeat([]byte("filmstream-test"), 4096)},
+	}}
+	plugin.Register(torrent)
+	return torrent.Metainfo()
 }
 
 func TestResolveMovie(t *testing.T) {
@@ -1934,51 +1906,151 @@ func TestUsenetCandidateFailuresAreTemporarilySkipped(t *testing.T) {
 	}
 }
 
-func TestRankedPlaybackSelectsTopMetadataCandidateWithoutLiveWait(t *testing.T) {
-	var logs bytes.Buffer
-	server, engine := newRankedPlaybackTestServer(t, &logs)
+func TestRankedPlaybackKeepsBestFlowingCandidateAndDropsLosersWithoutQuarantine(t *testing.T) {
+	server, engine := newRankedPlaybackTestServer(t, io.Discard)
+	candidates := rankedTorrentCandidates(3)
 
-	started := time.Now()
-	session, selected, err := server.createRankedPlayback(
-		t.Context(), rankedTorrentCandidates(3),
-		"tmdb-tv:1:s1:e1", "S01E01",
-	)
+	session, selected, _, err := server.createRankedPlayback(t.Context(), candidates, "tmdb-tv:1:s1:e1", "S01E01", 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if session.ID != "playback-1" || selected.Candidate.ID != "release-1" {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if selected.Candidate.ID != "release-1" || engine.sources[session.ID] != candidates[0].Candidate.MagnetURI {
 		t.Fatalf("session = %+v, selected = %+v", session, selected)
 	}
-	if len(engine.created) != 1 || len(engine.dropped) != 0 {
-		t.Fatalf("created = %d, dropped = %v; selection should mount only the winner", len(engine.created), engine.dropped)
+	if len(engine.dropped) != len(engine.created)-1 || slices.Contains(engine.dropped, session.ID) {
+		t.Fatalf("created = %d, dropped = %v; every losing mount must be dropped", len(engine.created), engine.dropped)
 	}
-	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
-		t.Fatalf("metadata-ranked selection waited for swarm health: %s", elapsed)
+	for _, source := range engine.created {
+		if source.Indexer != "torrent" {
+			t.Fatalf("source indexer = %q, want the candidate's indexer for its seed rule", source.Indexer)
+		}
 	}
-	if output := logs.String(); !strings.Contains(output, "release selection stages") ||
-		!strings.Contains(output, "live_swarm_validation_duration=0s") ||
-		!strings.Contains(output, "subtitle_probe_duration=0s") {
-		t.Fatalf("selection timing log = %q", output)
+	for _, candidate := range candidates[1:] {
+		if server.torrentCandidateRecentlyFailed("tmdb-tv:1:s1:e1", candidate.Candidate) {
+			t.Fatalf("losing candidate %s was quarantined although its race was only abandoned", candidate.Candidate.ID)
+		}
 	}
 }
 
-func TestRankedPlaybackSkipsQuarantinedCandidateWithoutAnotherHealthWait(t *testing.T) {
+func TestRankedPlaybackQuarantinesFailedCandidatesAndUsesLowerRankedFlowingSwarm(t *testing.T) {
 	server, engine := newRankedPlaybackTestServer(t, io.Discard)
-	candidates := rankedTorrentCandidates(3)
-	server.markTorrentCandidateFailed("tmdb-tv:1:s1:e1", candidates[0].Candidate)
+	candidates := rankedTorrentCandidates(4)
+	engine.stalledMetadata = map[string]bool{candidates[0].Candidate.MagnetURI: true}
+	engine.sourceStatuses = map[string]torrentstream.Status{
+		// Tracker peers are known, but none connects.
+		candidates[1].Candidate.MagnetURI: {TotalPeers: 40, PendingPeers: 40},
+	}
+	engine.createErrors = map[string]error{candidates[2].Candidate.MagnetURI: errors.New("tracker rejected torrent")}
+	server.torrentSelection.winnerGrace = time.Minute
 
-	session, selected, err := server.createRankedPlayback(
-		t.Context(), candidates,
-		"tmdb-tv:1:s1:e1", "S01E01",
-	)
+	session, selected, _, err := server.createRankedPlayback(t.Context(), candidates, "tmdb-tv:1:s1:e1", "S01E01", 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if session.ID != "playback-1" || selected.Candidate.ID != "release-2" {
-		t.Fatalf("session = %+v, selected = %+v", session, selected)
+	if selected.Candidate.ID != "release-4" {
+		t.Fatalf("selected = %+v, want the only serving swarm", selected)
 	}
-	if len(engine.created) != 1 {
-		t.Fatalf("mounted torrents = %d, want only the next ranked candidate", len(engine.created))
+	for _, candidate := range candidates[:3] {
+		if !server.torrentCandidateRecentlyFailed("tmdb-tv:1:s1:e1", candidate.Candidate) {
+			t.Fatalf("failed candidate %s was not quarantined", candidate.Candidate.ID)
+		}
+	}
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if _, ok := engine.sessions[session.ID]; !ok || len(engine.sessions) != 1 {
+		t.Fatalf("mounted sessions = %v, want only the winner", engine.sessions)
+	}
+}
+
+func TestTorrentQuarantineFollowsInfoHashAcrossIndexers(t *testing.T) {
+	server := &Server{}
+	failed := catalog.Candidate{ID: "tl-1", Indexer: "torrentleech", InfoHash: "abc", Protocol: catalog.ProtocolTorrent}
+	server.markTorrentCandidateFailed("tmdb:1", failed)
+	sameTorrent := catalog.RankedCandidate{Candidate: catalog.Candidate{
+		ID: "nyaa-9", Indexer: "nyaa", InfoHash: "ABC", Protocol: catalog.ProtocolTorrent,
+	}}
+	other := catalog.RankedCandidate{Candidate: catalog.Candidate{
+		ID: "nyaa-10", Indexer: "nyaa", InfoHash: "def", Protocol: catalog.ProtocolTorrent,
+	}}
+	available := server.availableTorrentCandidates("tmdb:1", []catalog.RankedCandidate{sameTorrent, other})
+	if len(available) != 1 || available[0].Candidate.ID != "nyaa-10" {
+		t.Fatalf("available = %+v, want the same torrent skipped on every indexer", available)
+	}
+	if len(server.availableTorrentCandidates("tmdb:2", []catalog.RankedCandidate{sameTorrent})) != 1 {
+		t.Fatal("quarantine leaked into another title")
+	}
+}
+
+func TestPrewarmNeverMountsNewPrivateReleaseButReusesOneAlreadyPlaying(t *testing.T) {
+	registry, err := indexer.NewRegistry([]config.Indexer{
+		{Name: "torrentleech", Type: "torznab", Endpoint: "https://tl.example/api"},
+		{Name: "nyaa", Type: "torznab", Endpoint: "https://nyaa.example/api"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	private := catalog.RankedCandidate{Score: 900, Candidate: catalog.Candidate{
+		ID: "tl-pack", Indexer: "torrentleech", Private: true, Protocol: catalog.ProtocolTorrent,
+		Name:      "The.Show.S01.1080p.WEB.H264-TL",
+		InfoHash:  "00000000000000000000000000000000000000aa",
+		MagnetURI: "magnet:?xt=urn:btih:00000000000000000000000000000000000000aa",
+	}}
+	public := catalog.RankedCandidate{Score: 500, Candidate: catalog.Candidate{
+		ID: "nyaa-pack", Indexer: "nyaa", Protocol: catalog.ProtocolTorrent,
+		Name:      "The.Show.S01.1080p.WEB.H264-NYAA",
+		InfoHash:  "00000000000000000000000000000000000000bb",
+		MagnetURI: "magnet:?xt=urn:btih:00000000000000000000000000000000000000bb",
+	}}
+	engine := &fakeTorrentPlaybackEngine{}
+	server := &Server{
+		indexers: registry, engine: engine,
+		playbackSourceMode: config.PlaybackSourceTorrentOnly,
+		defaults:           catalog.Preferences{Codecs: []string{"h264"}},
+		logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		selected:           make(map[string]catalog.RankedCandidate),
+		playbackCacheKeys:  make(map[string]playbackCacheKey),
+		playbackLanguages:  make(map[string][]string),
+		playbackRequests:   make(map[string]CreatePlaybackRequest),
+		playbackResponses:  make(map[string]CreatePlaybackResponse),
+		releaseSearches:    make(map[string]*releaseSearchState),
+	}
+	request := CreatePlaybackRequest{
+		MediaID: "tmdb-tv:3:s1:e3", MediaType: "show", Query: "The Show", Year: 2020,
+		SeriesID: "tmdb-tv:3", SeriesTitle: "The Show", SeasonNumber: 1, EpisodeNumber: 3,
+		Preferences: catalog.Preferences{Codecs: []string{"h264"}},
+	}
+	ready := make(chan struct{})
+	close(ready)
+	server.releaseSearches[releaseSearchKey(request)] = &releaseSearchState{
+		ready: ready, ranked: []catalog.RankedCandidate{private, public}, expiresAt: time.Now().Add(time.Minute),
+	}
+	prewarm := func() *httptest.ResponseRecorder {
+		body := `{"media_id":"tmdb-tv:3:s1:e3","media_type":"show","query":"The Show","year":2020,"series_id":"tmdb-tv:3","series_title":"The Show","season_number":1,"episode_number":3,"preferences":{"codecs":["h264"]}}`
+		httpRequest := httptest.NewRequest(http.MethodPost, "/v1/playbacks", strings.NewReader(body))
+		httpRequest.Header.Set(prewarmRequestHeader, "1")
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, httpRequest)
+		return response
+	}
+
+	// Neither the private release nor a public substitute for the user's real
+	// choice may be mounted in the background.
+	if response := prewarm(); response.Code != http.StatusConflict || len(engine.created) != 0 {
+		t.Fatalf("new private prewarm status = %d, mounts = %d, body = %s", response.Code, len(engine.created), response.Body.String())
+	}
+
+	// The current episode already streams from the pack, so the next episode
+	// adds no new seeding obligation.
+	engine.sessions = map[string]*torrentstream.Session{"current": {ID: "current"}}
+	server.selected["current"] = publicRankedCandidate(private)
+	if response := prewarm(); response.Code != http.StatusCreated {
+		t.Fatalf("in-use private prewarm status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if len(engine.created) != 1 || engine.created[0].MagnetURI != private.Candidate.MagnetURI ||
+		engine.created[0].Indexer != "torrentleech" {
+		t.Fatalf("prewarm mounts = %+v", engine.created)
 	}
 }
 
@@ -1998,6 +2070,10 @@ func newRankedPlaybackTestServer(
 		indexers: registry,
 		engine:   engine,
 		logger:   slog.New(slog.NewTextHandler(logOutput, nil)),
+		torrentSelection: torrentSelectionPolicy{
+			metadataWait: 200 * time.Millisecond, livenessWait: 200 * time.Millisecond,
+			winnerGrace: 50 * time.Millisecond, poll: 10 * time.Millisecond,
+		},
 	}
 	return server, engine
 }
@@ -2012,21 +2088,6 @@ func rankedTorrentCandidates(count int) []catalog.RankedCandidate {
 		}})
 	}
 	return candidates
-}
-
-func TestSwarmLooksLive(t *testing.T) {
-	if swarmLooksLive(torrentstream.Status{}) {
-		t.Fatal("zero-value status must not look live")
-	}
-	if !swarmLooksLive(torrentstream.Status{TotalPeers: 3}) {
-		t.Fatal("known peers should look live")
-	}
-	if !swarmLooksLive(torrentstream.Status{CachedPercent: 10}) {
-		t.Fatal("cached data should look live")
-	}
-	if !swarmLooksLive(torrentstream.Status{OutboundDialObserved: true}) {
-		t.Fatal("observed outbound dial should look live")
-	}
 }
 
 func TestExhaustedTorrentRecoveryForcesFreshSearchThenCooldown(t *testing.T) {
@@ -2069,10 +2130,7 @@ func TestExhaustedTorrentRecoveryForcesFreshSearchThenCooldown(t *testing.T) {
 		Resolution: "1080p", Codec: "h264", SizeBytes: 1_000_000,
 		MagnetURI: "magnet:?xt=urn:btih:0000000000000000000000000000000000000002",
 	}, Reasons: []string{"season pack"}}
-	engine := &fakeTorrentPlaybackEngine{statuses: map[string]torrentstream.Status{
-		"playback-1": {CachedPercent: 14},
-		"playback-2": {},
-	}}
+	engine := &fakeTorrentPlaybackEngine{}
 	manager := &fakeHLSManager{startErrors: map[string]error{
 		"playback-1": fmt.Errorf("%w: tracker returned no peers", torrentstream.ErrSourceUnavailable),
 		"playback-2": fmt.Errorf("%w: tracker returned no peers", torrentstream.ErrSourceUnavailable),
@@ -2150,10 +2208,11 @@ func TestExhaustedTorrentRecoveryForcesFreshSearchThenCooldown(t *testing.T) {
 		t.Fatalf("second HLS status = %d, body = %s", response.Code, response.Body.String())
 	}
 
-	// Recovery is exhausted: the next request must force one fresh external
-	// search instead of failing fast with the dead retained ranking.
+	// Every retained release failed: the next request must force one fresh
+	// external search instead of failing fast with the dead retained ranking.
 	third, response := create()
-	if third != nil || response.Code != http.StatusBadGateway {
+	if third != nil || response.Code != http.StatusBadGateway ||
+		!strings.Contains(response.Body.String(), "matching releases failed recently") {
 		t.Fatalf("forced-fresh playback = %+v, status = %d, body = %s", third, response.Code, response.Body.String())
 	}
 	if searches.Load() != 1 {
@@ -2166,7 +2225,7 @@ func TestExhaustedTorrentRecoveryForcesFreshSearchThenCooldown(t *testing.T) {
 	// While the cooldown is active, repeated requests fail fast again.
 	fourth, response := create()
 	if fourth != nil || response.Code != http.StatusBadGateway ||
-		!strings.Contains(response.Body.String(), "unavailable after 2 release attempts") {
+		!strings.Contains(response.Body.String(), "known releases failed recently") {
 		t.Fatalf("cooldown playback = %+v, status = %d, body = %s", fourth, response.Code, response.Body.String())
 	}
 	if searches.Load() != 1 {
@@ -2174,7 +2233,7 @@ func TestExhaustedTorrentRecoveryForcesFreshSearchThenCooldown(t *testing.T) {
 	}
 }
 
-func TestUnavailableTorrentRecoveryReusesRankingAndStopsAfterTwoCandidates(t *testing.T) {
+func TestTorrentRecoveryReusesRankingAndStopsWhenEveryCandidateFailed(t *testing.T) {
 	var searches atomic.Int32
 	var indexerServer *httptest.Server
 	indexerServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2216,13 +2275,11 @@ func TestUnavailableTorrentRecoveryReusesRankingAndStopsAfterTwoCandidates(t *te
 		t.Fatal(err)
 	}
 	unavailable := fmt.Errorf("%w: tracker returned no peers", torrentstream.ErrSourceUnavailable)
-	engine := &fakeTorrentPlaybackEngine{statuses: map[string]torrentstream.Status{
-		"playback-1": {CachedPercent: 14},
-		"playback-2": {},
-	}}
+	engine := &fakeTorrentPlaybackEngine{}
 	manager := &fakeHLSManager{startErrors: map[string]error{
 		"playback-1": unavailable,
-		"playback-2": unavailable,
+		// A compatibility failure blames the release just like a dead swarm.
+		"playback-2": errors.New("unsupported video codec av1"),
 	}}
 	server := &Server{
 		indexers: registry, engine: engine, hlsManager: manager,
@@ -2301,7 +2358,7 @@ func TestUnavailableTorrentRecoveryReusesRankingAndStopsAfterTwoCandidates(t *te
 
 	third, response := create()
 	if third != nil || response.Code != http.StatusBadGateway ||
-		!strings.Contains(response.Body.String(), "unavailable after 2 release attempts") {
+		!strings.Contains(response.Body.String(), "all 2 known releases failed recently") {
 		t.Fatalf("terminal playback = %+v, status = %d, body = %s", third, response.Code, response.Body.String())
 	}
 	if searches.Load() != 0 || len(engine.created) != 2 {
@@ -2439,7 +2496,8 @@ func TestHLSAssetsAndCleanup(t *testing.T) {
 	response = httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusCreated || manager.bitmapSubtitle != 6 ||
-		!strings.Contains(response.Body.String(), `"burned_subtitle_index":6`) {
+		!strings.Contains(response.Body.String(), `"burned_subtitle_index":6`) ||
+		!strings.Contains(response.Body.String(), `"master_url":"http://example.com/v1/playbacks/abc/hls/master.m3u8"`) {
 		t.Fatalf("HLS start status = %d, bitmap = %d, body = %s", response.Code, manager.bitmapSubtitle, response.Body.String())
 	}
 
@@ -2458,9 +2516,6 @@ func TestHLSAssetsAndCleanup(t *testing.T) {
 	}
 	if response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("playlist cache control = %q", response.Header().Get("Cache-Control"))
-	}
-	if !strings.Contains(response.Body.String(), "#EXT-X-START:TIME-OFFSET=0,PRECISE=YES") {
-		t.Fatalf("playlist = %q", response.Body.String())
 	}
 
 	request = httptest.NewRequest(http.MethodGet, "/v1/playbacks/abc/hls/segment-000000.m4s", nil)

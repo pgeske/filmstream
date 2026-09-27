@@ -26,7 +26,9 @@ import Testing
     let prepared = try await api.prepareNativePlaybackWithRetry(
         playback,
         for: movie,
-        startSeconds: 612.5
+        startSeconds: 612.5,
+        audioStreamIndex: 2,
+        bitmapSubtitleIndex: nil
     )
     let bitmapSubtitle = HLSSubtitleTrack(
         index: 6,
@@ -35,7 +37,8 @@ import Testing
         isDefault: false,
         isForced: false,
         codec: "hdmv_pgs_subtitle",
-        kind: "bitmap"
+        kind: "bitmap",
+        renditionName: nil
     )
     _ = try await api.updateProgress(
         for: movie,
@@ -49,19 +52,19 @@ import Testing
     #expect(recorder.paths == [
         "/v1/playbacks/prewarm",
         "/v1/playbacks",
-        "/v1/playbacks/playback-1/hls/subtitles",
+        "/v1/playbacks/playback-1/hls",
         "/v1/playbacks",
-        "/v1/playbacks/playback-2/hls/subtitles",
         "/v1/playbacks/playback-2/hls",
         "/v1/watch-history",
     ])
-    #expect(recorder.startSeconds == [612.5, 612.5, -1, 612.5, -1, 612.5, -1])
+    #expect(recorder.startSeconds == [612.5, 612.5, 612.5, 612.5, 612.5, -1])
+    // The replacement plays the same file, so it keeps the viewer's audio track.
+    #expect(recorder.audioStreamIndexes == [nil, nil, 2, nil, 2, nil])
     #expect(recorder.languages == [
         ["ja", "en", "english"],
         ["ja", "en", "english"],
         [],
         ["ja", "en", "english"],
-        [],
         [],
         [],
     ])
@@ -138,8 +141,8 @@ import Testing
 // The retry tests share a static URLProtocol handler, so they must not run concurrently.
 @Suite(.serialized)
 private struct FilmstreamAPIRetryTests {
-    @Test(arguments: [400, 401, 403, 409, 503], [true, false])
-    func nativePreparationDoesNotReplaceSessionForNonrecoverableErrors(status: Int, probeSubtitles: Bool) async throws {
+    @Test(arguments: [400, 401, 403, 409, 503])
+    func nativePreparationDoesNotReplaceSessionForNonrecoverableErrors(status: Int) async throws {
         let attempts = AttemptCounter()
         RetryTestURLProtocol.handler = { _ in
             _ = attempts.increment()
@@ -156,7 +159,7 @@ private struct FilmstreamAPIRetryTests {
         await #expect(throws: FilmstreamError.server(status: status, message: "fixture failure")) {
             try await api.prepareNativePlaybackWithRetry(
                 playback, for: Movie(id: "episode", title: "Episode"), startSeconds: 60,
-                useSavedSubtitlePreference: probeSubtitles
+                audioStreamIndex: nil, bitmapSubtitleIndex: nil
             )
         }
         #expect(attempts.current == 1)
@@ -195,7 +198,7 @@ private struct FilmstreamAPIRetryTests {
         do {
             let prepared = try await api.prepareNativePlaybackWithRetry(
                 playback, for: Movie(id: "fixture", title: "Fixture"), startSeconds: 60,
-                useSavedSubtitlePreference: false
+                audioStreamIndex: nil, bitmapSubtitleIndex: nil
             )
             #expect(replacementSucceeds)
             #expect(prepared.playback.id == "replacement")
@@ -227,7 +230,8 @@ private struct FilmstreamAPIRetryTests {
             // Cancel deterministically before entering the API, not by racing a sleep.
             withUnsafeCurrentTask { $0?.cancel() }
             return try await api.prepareNativePlaybackWithRetry(
-                playback, for: Movie(id: "episode", title: "Episode"), startSeconds: 60
+                playback, for: Movie(id: "episode", title: "Episode"), startSeconds: 60,
+                audioStreamIndex: nil, bitmapSubtitleIndex: nil
             )
         }
         await #expect(throws: CancellationError.self) { try await task.value }
@@ -311,6 +315,7 @@ private final class APIRequestRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var recordedPaths: [String] = []
     private var recordedStartSeconds: [Double] = []
+    private var recordedAudioStreamIndexes: [Int?] = []
     private var recordedLanguages: [[String]] = []
     private var recordedSubtitleMode: String?
     private var recordedSubtitleIndex: Int?
@@ -324,6 +329,10 @@ private final class APIRequestRecorder: @unchecked Sendable {
 
     var startSeconds: [Double] {
         lock.withLock { recordedStartSeconds }
+    }
+
+    var audioStreamIndexes: [Int?] {
+        lock.withLock { recordedAudioStreamIndexes }
     }
 
     var languages: [[String]] {
@@ -353,6 +362,7 @@ private final class APIRequestRecorder: @unchecked Sendable {
         let currentPlaybackCount = lock.withLock {
             recordedPaths.append(path)
             recordedStartSeconds.append(body?["start_seconds"] as? Double ?? -1)
+            recordedAudioStreamIndexes.append(body?["audio_stream_index"] as? Int)
             let preferences = body?["preferences"] as? [String: Any]
             recordedLanguages.append(preferences?["languages"] as? [String] ?? [])
             if let subtitle = body?["subtitle_selection"] as? [String: Any] {
@@ -372,10 +382,8 @@ private final class APIRequestRecorder: @unchecked Sendable {
         case "/v1/playbacks":
             let response = #"{"id":"playback-\#(currentPlaybackCount)","name":"The Movie","file_name":"movie.mkv","file_size":1000,"stream_url":"https://filmstream.test/v1/playbacks/playback-\#(currentPlaybackCount)/stream"}"#
             return (201, Data(response.utf8))
-        case "/v1/playbacks/playback-1/hls/subtitles":
+        case "/v1/playbacks/playback-1/hls":
             return (404, Data(#"{"error":"playback not found"}"#.utf8))
-        case let path where path.hasSuffix("/hls/subtitles"):
-            return (200, Data("[]".utf8))
         case "/v1/watch-history":
             let response = #"{"id":"history-1","title":"The Movie","position_seconds":120,"duration_seconds":360,"completed":false,"updated_at":"2026-01-01T00:00:00Z"}"#
             return (200, Data(response.utf8))

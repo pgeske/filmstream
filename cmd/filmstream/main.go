@@ -77,9 +77,12 @@ func run(args []string) error {
 func runServer(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	configPath := flags.String("config", os.Getenv("FILMSTREAM_CONFIG"), "path to config file")
-	torrentListenPort := flags.Int("torrent-listen-port", 0, "BitTorrent peer listen port (0 chooses an available port)")
+	torrentListenPort := flags.Int("torrent-listen-port", 0, "fixed BitTorrent peer port pushed to Deluge (0 keeps Deluge's)")
+	torrentPortFile := flags.String("torrent-port-file", "",
+		"file holding the BitTorrent peer port, such as a VPN's forwarded port; watched for changes and preferred over --torrent-listen-port")
 	bitmapSubtitleEncoder := flags.String(
-		"bitmap-subtitle-encoder", "libx264", "H.264 encoder used to burn bitmap subtitles",
+		"bitmap-subtitle-encoder", "libx264",
+		"H.264 encoder used to burn bitmap subtitles: libx264 or h264_nvenc (falls back to libx264 when NVENC is unusable)",
 	)
 	ffmpegPath := flags.String("ffmpeg-path", "", "override the configured FFmpeg executable")
 	ffprobePath := flags.String("ffprobe-path", "", "override the configured FFprobe executable")
@@ -116,15 +119,19 @@ func runServer(args []string) error {
 	}
 	engine, err := torrentstream.New(torrentstream.Config{
 		DataDir:         cfg.DataDir,
+		PluginURL:       cfg.Deluge.PluginURL,
+		PluginTokenFile: cfg.Deluge.TokenFile,
+		DownloadsDir:    cfg.Deluge.DownloadsDir,
 		ListenPort:      *torrentListenPort,
+		ListenPortFile:  *torrentPortFile,
 		MaxTorrentBytes: cfg.MaxCandidateBytes(),
-		ReadaheadBytes:  cfg.ReadaheadBytes(),
 		MetadataTimeout: time.Duration(cfg.MetadataTimeoutSecs) * time.Second,
 		SeedRatioTarget: cfg.SeedRatioTarget,
+		SeedMaxAge:      time.Duration(cfg.SeedMaxHours) * time.Hour,
 		CacheLimitBytes: cfg.CacheLimitBytes(),
 		MaxSeedSessions: cfg.MaxSeedSessions,
 		IdleGrace:       time.Duration(cfg.IdleGraceSeconds) * time.Second,
-		SeedMaxAge:      time.Duration(cfg.SeedMaxHours) * time.Hour,
+		Indexers:        cfg.Indexers,
 		Logger:          logger,
 	})
 	if err != nil {
@@ -158,12 +165,10 @@ func runServer(args []string) error {
 		SourceBaseURL:         sourceBaseURL,
 		StartupTimeout:        time.Duration(cfg.HLSStartupSeconds) * time.Second,
 		BufferSeconds:         cfg.HLSBufferSeconds,
-		ReadRate:              cfg.HLSReadRate,
 		SegmentSeconds:        cfg.HLSSegmentSeconds,
 		BitmapSubtitleEncoder: *bitmapSubtitleEncoder,
 		LocalSourcePath:       engine.LocalFilePath,
 		SourceUnavailable:     engine.SourceUnavailable,
-		SourceStalled:         engine.MarkSourceUnavailable,
 		Logger:                logger,
 	})
 	if hlsErr != nil {
@@ -248,7 +253,11 @@ func runServer(args []string) error {
 		if err != nil {
 			return err
 		}
-		return registry.Replace(updated.Indexers)
+		if err := registry.Replace(updated.Indexers); err != nil {
+			return err
+		}
+		engine.SetIndexers(updated.Indexers)
+		return nil
 	})
 	server := &http.Server{
 		Addr:              cfg.Listen,

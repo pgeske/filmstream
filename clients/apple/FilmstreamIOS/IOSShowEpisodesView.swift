@@ -9,7 +9,7 @@ struct IOSShowEpisodesView: View {
     @State private var loadedSeason: ShowSeason?
     @State private var activePlayback: IOSEpisodeBrowserPlaybackSession?
     @State private var isLoading = false
-    @State private var preparingEpisodeID: String?
+    @State private var preparingEpisode: Episode?
     @State private var preparation = PlaybackPreparation()
     private var preparationStage: PlaybackPreparationStage? { preparation.stage }
     @State private var errorMessage: String?
@@ -34,6 +34,13 @@ struct IOSShowEpisodesView: View {
                     compactLayout
                 }
             }
+        }
+        .overlay {
+            IOSPlaybackPreparationPanel(
+                preparation: preparation,
+                title: details.show.title,
+                subtitle: preparingEpisode.map { "\($0.label) · \($0.title)" }
+            )
         }
         .navigationTitle("Episodes & More")
         .navigationBarTitleDisplayMode(.inline)
@@ -137,7 +144,7 @@ struct IOSShowEpisodesView: View {
 
     @ViewBuilder
     private var errorBanner: some View {
-        if let errorMessage = preparation.errorMessage ?? errorMessage {
+        if let errorMessage {
             Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(Color.mobileTeaAmber)
@@ -337,7 +344,7 @@ struct IOSShowEpisodesView: View {
         MobileEpisodeStillImage(episode: episode)
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             .overlay {
-                if preparation.isPreparing && preparingEpisodeID == episode.id {
+                if preparation.isPreparing && preparingEpisode?.id == episode.id {
                     ZStack {
                         Color.black.opacity(0.52)
                         ProgressView()
@@ -437,7 +444,7 @@ struct IOSShowEpisodesView: View {
     }
 
     private func preparePlayback(for episode: Episode) {
-        preparingEpisodeID = episode.id
+        preparingEpisode = episode
         errorMessage = nil
         let movie = episode.playbackMovie(in: details.show)
         let startSeconds = history(for: episode).flatMap {
@@ -458,11 +465,7 @@ struct IOSShowEpisodesView: View {
     private func advancePlayback(to episode: Episode) async throws {
         let movie = episode.playbackMovie(in: details.show)
         async let next = try? await model.api.nextEpisode(after: episode, in: details)
-        let prepared = try await model.preparePlayback(
-            for: movie,
-            startSeconds: 0,
-            onStage: { _ in }
-        )
+        let prepared = try await model.api.preparePlayback(for: movie, startSeconds: 0)
         let nextEpisode = await next
         guard !Task.isCancelled else {
             Task { try? await model.api.stopNativePlayback(prepared.playback.id) }

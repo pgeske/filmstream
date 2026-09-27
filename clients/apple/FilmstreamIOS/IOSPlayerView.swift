@@ -3,7 +3,6 @@ import AVKit
 import Combine
 import FilmstreamCore
 import Foundation
-import MediaPlayer
 import SwiftUI
 import UIKit
 
@@ -18,7 +17,7 @@ struct IOSPlayerView: View {
     let nextEpisode: Episode?
     let onPlayNext: (@MainActor (Episode) async throws -> Void)?
 
-    @StateObject private var controller: IOSPlaybackController
+    @StateObject private var controller: NativePlaybackController
     @StateObject private var pictureInPicture = IOSPictureInPictureController()
     @State private var didClose = false
     @State private var nextEpisodeTask: Task<Void, Never>?
@@ -42,7 +41,7 @@ struct IOSPlayerView: View {
         self.nextEpisode = nextEpisode
         self.onPlayNext = onPlayNext
         _controller = StateObject(
-            wrappedValue: IOSPlaybackController(movie: movie, prepared: prepared, api: api)
+            wrappedValue: NativePlaybackController(movie: movie, prepared: prepared, api: api)
         )
     }
 
@@ -97,24 +96,48 @@ struct IOSPlayerView: View {
                 .accessibilityHidden(!isChromeVisible)
 
             if let errorMessage = nextEpisodeError ?? controller.errorMessage {
-                VStack(spacing: 12) {
+                VStack(spacing: 14) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.largeTitle)
                         .foregroundStyle(Color.mobileTeaAmber)
+                        .accessibilityHidden(true)
                     Text(nextEpisodeError == nil ? "Unable to Play" : "Unable to Start Next Episode")
-                        .font(.headline)
-                    Text(errorMessage)
-                        .font(.footnote)
-                        .foregroundStyle(Color.mobileTeaMuted)
+                        .font(.title2.weight(.bold))
+                        .foregroundStyle(Color.mobileTeaCream)
                         .multilineTextAlignment(.center)
+                    Text(errorMessage)
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(Color.mobileTeaCream)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(5)
+                    Button {
+                        if nextEpisodeError != nil {
+                            startNextEpisode()
+                        } else {
+                            controller.retry()
+                        }
+                    } label: {
+                        Label("Try Again", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(MobileDetailButtonStyle(kind: .prominent))
+                    .keyboardShortcut(.defaultAction)
+                    .padding(.top, 4)
+                    Button {
+                        closePlayback()
+                        dismiss()
+                    } label: {
+                        Label("Close Player", systemImage: "xmark")
+                    }
+                    .buttonStyle(MobileDetailButtonStyle(kind: .standard))
                 }
                 .padding(24)
-                .frame(maxWidth: 330)
-                .background(.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 18))
+                .frame(maxWidth: 420)
+                .background(.black.opacity(0.86), in: RoundedRectangle(cornerRadius: 18))
                 .overlay {
                     RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(Color.mobileTeaCream.opacity(0.12), lineWidth: 1)
+                        .stroke(Color.mobileTeaCream.opacity(0.18), lineWidth: 1)
                 }
+                .padding(.horizontal, 20)
             } else if isStartingNextEpisode {
                 VStack(spacing: 12) {
                     IOSPlaybackLoadingIndicator(size: 46)
@@ -124,10 +147,27 @@ struct IOSPlayerView: View {
                 .padding(24)
                 .background(.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 18))
             } else if controller.isWaiting {
-                IOSPlaybackLoadingIndicator(size: 54)
-                    .padding(20)
-                    .background(.black.opacity(0.58), in: Circle())
-                    .allowsHitTesting(false)
+                VStack(spacing: 14) {
+                    IOSPlaybackLoadingIndicator(size: 54)
+                        .padding(20)
+                        .background(.black.opacity(0.58), in: Circle())
+                    if let waitingDetail = controller.waitingDetail {
+                        Text(waitingDetail)
+                            .font(.headline)
+                            .foregroundStyle(Color.mobileTeaCream)
+                            .multilineTextAlignment(.center)
+                            .lineLimit(2)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                            .background(
+                                .black.opacity(0.72),
+                                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            )
+                            .frame(maxWidth: 440)
+                    }
+                }
+                .padding(.horizontal, 24)
+                .allowsHitTesting(false)
             }
         }
         .statusBarHidden(true)
@@ -236,6 +276,33 @@ struct IOSPlayerView: View {
                 pictureInPicture.isActive ? "Exit Picture in Picture" : "Picture in Picture"
             )
 
+            if controller.audioOptions.count > 1 {
+                Menu {
+                    ForEach(controller.audioOptions) { track in
+                        Button {
+                            controller.selectAudio(track)
+                            revealChrome()
+                        } label: {
+                            trackLabel(
+                                track.displayName,
+                                selected: controller.selectedAudio?.index == track.index
+                            )
+                        }
+                    }
+                } label: {
+                    Image(systemName: "waveform")
+                        .font(.headline)
+                        .frame(width: 44, height: 44)
+                        .background(.black.opacity(0.58), in: Circle())
+                        .overlay {
+                            Circle()
+                                .stroke(Color.white.opacity(0.14), lineWidth: 1)
+                        }
+                }
+                .buttonStyle(MobileCardButtonStyle())
+                .accessibilityLabel("Audio")
+            }
+
             Menu {
                 if controller.subtitleOptions.isEmpty {
                     Button("No compatible text subtitles in this release") {}
@@ -245,7 +312,7 @@ struct IOSPlayerView: View {
                         controller.selectSubtitle(nil)
                         revealChrome()
                     } label: {
-                        subtitleLabel("Off", selected: controller.selectedSubtitle == nil)
+                        trackLabel("Off", selected: controller.selectedSubtitle == nil)
                     }
                     Divider()
                     ForEach(controller.subtitleOptions) { track in
@@ -253,7 +320,7 @@ struct IOSPlayerView: View {
                             controller.selectSubtitle(track)
                             revealChrome()
                         } label: {
-                            subtitleLabel(
+                            trackLabel(
                                 track.mobileDisplayName,
                                 selected: controller.selectedSubtitle?.index == track.index
                             )
@@ -386,7 +453,7 @@ struct IOSPlayerView: View {
         .accessibilityLabel(label)
     }
 
-    private func subtitleLabel(_ title: String, selected: Bool) -> some View {
+    private func trackLabel(_ title: String, selected: Bool) -> some View {
         HStack {
             Text(title)
             if selected {
@@ -489,6 +556,8 @@ struct IOSPlayerView: View {
         didClose = true
         nextEpisodeTask?.cancel()
         nextEpisodeTask = nil
+        // Recovery may have replaced the original playback with a new server session.
+        let playbackID = controller.playbackID
         let position = controller.positionSeconds
         let duration = controller.durationSeconds
         let activeSubtitle = controller.selectedSubtitle
@@ -504,7 +573,7 @@ struct IOSPlayerView: View {
                     activeSubtitle: activeSubtitle
                 )
             }
-            try? await api.stopNativePlayback(prepared.playback.id)
+            try? await api.stopNativePlayback(playbackID)
         }
     }
 
@@ -567,7 +636,7 @@ private struct IOSPlaybackLoadingIndicator: View {
 }
 
 private struct IOSPlayerSurface: UIViewRepresentable {
-    let controller: IOSPlaybackController
+    let controller: NativePlaybackController
     private var player: AVPlayer { controller.player }
     let pictureInPicture: IOSPictureInPictureController
 
@@ -731,656 +800,5 @@ private extension HLSSubtitleTrack {
             return "\(languageName) (Forced)"
         }
         return languageName
-    }
-}
-
-@MainActor
-private final class IOSPlaybackController: ObservableObject {
-    let player = AVPlayer()
-
-    @Published private(set) var positionSeconds: Double
-    @Published private(set) var durationSeconds: Double
-    @Published private(set) var isPlaying = false
-    @Published private(set) var isSeeking = false
-    @Published private(set) var isWaiting = true
-    @Published private(set) var didReachEnd = false
-    @Published private(set) var stateLabel = "Preparing Stream…"
-    @Published private(set) var errorMessage: String?
-    @Published private(set) var subtitleOptions: [HLSSubtitleTrack]
-    @Published private(set) var selectedSubtitle: HLSSubtitleTrack?
-    @Published private(set) var activeSubtitleText: String?
-
-    private let api: FilmstreamAPI
-    private let movie: Movie
-    private let playback: Playback
-    private var timeline: HLSPlaybackTimeline
-    private var burnedSubtitleIndex: Int?
-    private var timeObserver: Any?
-    private var statusObservation: NSKeyValueObservation?
-    private var playbackObservation: NSKeyValueObservation?
-    private var itemEndObserver: NSObjectProtocol?
-    private var remoteCommandTargets: [(MPRemoteCommand, Any)] = []
-    private var seekTask: Task<Void, Never>?
-    private var subtitleTask: Task<Void, Never>?
-    private var subtitleSwitchTask: Task<Void, Never>?
-    private var playbackFailureTask: Task<Void, Never>?
-    private var liveness: PlaybackLiveness?
-    private weak var videoLayer: AVPlayerLayer?
-    private var subtitleCues: [SubtitleCue] = []
-    private var seekGeneration = 0
-    private var seekOriginSeconds: Double
-    private var pendingSeekSeconds: Double?
-    private var resumeAfterSeek = true
-    private var wantsToPlay = false
-    private var stopped = false
-    private var mediaSessionIsActive = false
-    private var mediaSessionID: String?
-    private var lastNowPlayingSecond = -1
-
-    private static var activeMediaSessionID: String?
-
-    init(movie: Movie, prepared: PreparedPlayback, api: FilmstreamAPI) {
-        self.api = api
-        self.movie = movie
-        playback = prepared.playback
-        timeline = prepared.hls.timeline
-        positionSeconds = timeline.requestedSeconds
-        durationSeconds = max(0, prepared.hls.durationSeconds ?? 0)
-        seekOriginSeconds = timeline.requestedSeconds
-        subtitleOptions = prepared.hls.subtitles ?? []
-        selectedSubtitle = Self.preferredSubtitle(in: subtitleOptions)
-        burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
-
-        player.automaticallyWaitsToMinimizeStalling = true
-        player.actionAtItemEnd = .pause
-        installItem(url: prepared.hls.playlistURL)
-        let initialPlayerSeconds = timeline.playerSeconds(
-            forMediaSeconds: timeline.requestedSeconds
-        )
-        if initialPlayerSeconds > 0 {
-            player.seek(
-                to: CMTime(seconds: initialPlayerSeconds, preferredTimescale: 600),
-                toleranceBefore: .zero,
-                toleranceAfter: .zero
-            )
-        }
-
-        timeObserver = player.addPeriodicTimeObserver(
-            forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
-            queue: .main
-        ) { [weak self] time in
-            Task { @MainActor in
-                guard let self, !self.stopped, !self.isSeeking else { return }
-                let current = self.player.currentTime().seconds
-                if current.isFinite, current >= 0 {
-                    self.positionSeconds = min(
-                        self.timeline.mediaSeconds(forPlayerSeconds: current),
-                        self.durationSeconds > 0 ? self.durationSeconds : .greatestFiniteMagnitude
-                    )
-                    self.updateActiveSubtitle()
-                    let elapsedSecond = Int(self.positionSeconds)
-                    if elapsedSecond / 5 != self.lastNowPlayingSecond / 5 {
-                        self.lastNowPlayingSecond = elapsedSecond
-                        self.publishNowPlayingInfo()
-                    }
-                }
-            }
-        }
-
-        restartSubtitleUpdates()
-
-        playbackObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] player, _ in
-            Task { @MainActor in
-                guard let self, !self.stopped, !self.isSeeking,
-                      self.subtitleSwitchTask == nil, self.errorMessage == nil else { return }
-                switch player.timeControlStatus {
-                case .playing:
-                    self.wantsToPlay = true
-                    self.isPlaying = true
-                    self.isWaiting = self.videoLayer?.isReadyForDisplay != true
-                    self.stateLabel = self.isWaiting ? "Buffering…" : "Playing"
-                    self.schedulePlaybackFailure()
-                case .waitingToPlayAtSpecifiedRate:
-                    self.isPlaying = self.wantsToPlay
-                    self.isWaiting = true
-                    self.stateLabel = "Buffering…"
-                    self.schedulePlaybackFailure()
-                case .paused:
-                    // PiP may pause AVPlayer directly after playback has started.
-                    if self.liveness?.hasRenderedPlayback == true {
-                        self.wantsToPlay = false
-                        self.cancelPlaybackFailure()
-                    }
-                    self.isPlaying = false
-                    self.isWaiting = self.wantsToPlay
-                    self.stateLabel = self.wantsToPlay ? "Buffering…" : "Paused"
-                @unknown default:
-                    self.isWaiting = true
-                    self.stateLabel = "Preparing Stream…"
-                }
-                self.publishNowPlayingInfo()
-            }
-        }
-    }
-
-    func play() {
-        guard !stopped, errorMessage == nil else { return }
-        wantsToPlay = true
-        isPlaying = true
-        didReachEnd = false
-        player.play()
-        schedulePlaybackFailure()
-        publishNowPlayingInfo()
-    }
-
-    func pause() {
-        guard !stopped else { return }
-        wantsToPlay = false
-        resumeAfterSeek = false
-        isPlaying = false
-        cancelPlaybackFailure()
-        player.pause()
-        publishNowPlayingInfo()
-    }
-
-    func activateMediaSession() {
-        guard !mediaSessionIsActive else { return }
-        let audioSession = AVAudioSession.sharedInstance()
-        try? audioSession.setCategory(.playback, mode: .moviePlayback)
-        try? audioSession.setActive(true)
-
-        let commands = MPRemoteCommandCenter.shared()
-        commands.playCommand.isEnabled = true
-        commands.pauseCommand.isEnabled = true
-        commands.togglePlayPauseCommand.isEnabled = true
-        let playTarget = commands.playCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.play() }
-            return .success
-        }
-        let pauseTarget = commands.pauseCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.pause() }
-            return .success
-        }
-        let toggleTarget = commands.togglePlayPauseCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.togglePlayback() }
-            return .success
-        }
-        remoteCommandTargets = [
-            (commands.playCommand, playTarget),
-            (commands.pauseCommand, pauseTarget),
-            (commands.togglePlayPauseCommand, toggleTarget),
-        ]
-        let sessionID = UUID().uuidString
-        mediaSessionID = sessionID
-        Self.activeMediaSessionID = sessionID
-        mediaSessionIsActive = true
-        publishNowPlayingInfo()
-    }
-
-    func togglePlayback() {
-        guard !stopped else { return }
-        if isSeeking {
-            resumeAfterSeek.toggle()
-            wantsToPlay = resumeAfterSeek
-            isPlaying = resumeAfterSeek
-            return
-        }
-        if player.timeControlStatus == .playing || (wantsToPlay && player.timeControlStatus != .paused) {
-            pause()
-        } else {
-            play()
-        }
-    }
-
-    private func publishNowPlayingInfo() {
-        guard mediaSessionIsActive else { return }
-        var info: [String: Any] = [
-            MPMediaItemPropertyTitle: movie.episodeTitle ?? movie.title,
-            MPNowPlayingInfoPropertyExternalContentIdentifier: mediaSessionID ?? playback.id,
-            MPNowPlayingInfoPropertyElapsedPlaybackTime: positionSeconds,
-            MPNowPlayingInfoPropertyPlaybackRate: wantsToPlay ? 1.0 : 0.0,
-        ]
-        if let seriesTitle = movie.seriesTitle {
-            info[MPMediaItemPropertyAlbumTitle] = seriesTitle
-        }
-        if let episodeLabel = movie.episodeLabel {
-            info[MPMediaItemPropertyArtist] = episodeLabel
-        }
-        if durationSeconds > 0 {
-            info[MPMediaItemPropertyPlaybackDuration] = durationSeconds
-        }
-        let center = MPNowPlayingInfoCenter.default()
-        center.nowPlayingInfo = info
-        center.playbackState = wantsToPlay ? .playing : .paused
-    }
-
-    private func deactivateMediaSession() {
-        guard mediaSessionIsActive else { return }
-        for (command, target) in remoteCommandTargets {
-            command.removeTarget(target)
-        }
-        remoteCommandTargets.removeAll()
-        mediaSessionIsActive = false
-        let sessionID = mediaSessionID
-        mediaSessionID = nil
-        guard Self.activeMediaSessionID == sessionID else { return }
-        Self.activeMediaSessionID = nil
-        let commands = MPRemoteCommandCenter.shared()
-        commands.playCommand.isEnabled = false
-        commands.pauseCommand.isEnabled = false
-        commands.togglePlayPauseCommand.isEnabled = false
-        let center = MPNowPlayingInfoCenter.default()
-        center.nowPlayingInfo = nil
-        center.playbackState = .stopped
-        try? AVAudioSession.sharedInstance().setActive(
-            false,
-            options: .notifyOthersOnDeactivation
-        )
-    }
-
-    func jump(by seconds: Double) {
-        guard !stopped, durationSeconds > 0 else { return }
-        let origin = pendingSeekSeconds ?? positionSeconds
-        seek(to: origin + seconds)
-    }
-
-    func seek(to requestedSeconds: Double) {
-        guard !stopped, durationSeconds > 0 else { return }
-        let target = min(max(0, requestedSeconds), max(0, durationSeconds - 1))
-        if !isSeeking {
-            seekOriginSeconds = positionSeconds
-            resumeAfterSeek = wantsToPlay
-        }
-        let generation = beginItemOperation()
-        cancelPlaybackFailure()
-        pendingSeekSeconds = target
-        positionSeconds = target
-        isSeeking = true
-        isWaiting = true
-        stateLabel = "Seeking…"
-        errorMessage = nil
-        player.pause()
-
-        seekTask = Task { [weak self] in
-            do {
-                try await Task.sleep(for: .milliseconds(450))
-                guard !Task.isCancelled else { return }
-                await self?.performSeek(to: target, generation: generation)
-            } catch {
-                return
-            }
-        }
-    }
-
-    func selectSubtitle(_ track: HLSSubtitleTrack?) {
-        selectedSubtitle = track
-        HLSSubtitleTrack.savePreference(track)
-        switchSubtitleStreamIfNeeded()
-    }
-
-    func attachVideoLayer(_ layer: AVPlayerLayer) {
-        videoLayer = layer
-    }
-
-    private func schedulePlaybackFailure() {
-        guard playbackFailureTask == nil, wantsToPlay, !stopped else { return }
-        liveness = PlaybackLiveness(now: ProcessInfo.processInfo.systemUptime, playerSeconds: player.currentTime().seconds)
-        playbackFailureTask = Task { @MainActor [weak self] in
-            while !Task.isCancelled {
-                do {
-                    try await Task.sleep(for: .seconds(1))
-                } catch {
-                    return
-                }
-                guard !Task.isCancelled, let self else { return }
-                guard !self.stopped, self.wantsToPlay else {
-                    self.playbackFailureTask = nil
-                    return
-                }
-                let playing = self.player.timeControlStatus == .playing
-                    && !self.isSeeking && self.subtitleSwitchTask == nil
-                let ready = self.videoLayer?.isReadyForDisplay == true
-                if playing, ready {
-                    self.isWaiting = false
-                    self.stateLabel = "Playing"
-                }
-                if self.liveness?.observe(
-                    now: ProcessInfo.processInfo.systemUptime,
-                    playerSeconds: self.player.currentTime().seconds,
-                    isPlaying: playing,
-                    isReadyForDisplay: ready,
-                    canRecover: false
-                ) == .fail {
-                    _ = self.beginItemOperation()
-                    self.wantsToPlay = false
-                    self.isPlaying = false
-                    self.isWaiting = false
-                    self.stateLabel = "Unable to Play Stream"
-                    self.errorMessage = self.liveness?.hasRenderedPlayback == true
-                        ? "Playback stalled and could not resume. Close the player and try this episode again."
-                        : "The stream did not begin playing. Close the player and try this episode again."
-                    self.player.pause()
-                    self.playbackFailureTask = nil
-                    return
-                }
-            }
-        }
-    }
-
-    private func cancelPlaybackFailure() {
-        playbackFailureTask?.cancel()
-        playbackFailureTask = nil
-    }
-
-    func stop() {
-        guard !stopped else { return }
-        stopped = true
-        _ = beginItemOperation()
-        subtitleTask?.cancel()
-        subtitleTask = nil
-        cancelPlaybackFailure()
-        deactivateMediaSession()
-        if let itemEndObserver {
-            NotificationCenter.default.removeObserver(itemEndObserver)
-            self.itemEndObserver = nil
-        }
-        player.pause()
-        player.replaceCurrentItem(with: nil)
-        if let timeObserver {
-            player.removeTimeObserver(timeObserver)
-            self.timeObserver = nil
-        }
-        statusObservation?.invalidate()
-        statusObservation = nil
-        playbackObservation?.invalidate()
-        playbackObservation = nil
-    }
-
-    private func performSeek(to target: Double, generation: Int) async {
-        guard generation == seekGeneration, !stopped else { return }
-        let playerTarget = timeline.playerSeconds(forMediaSeconds: target)
-        if canSeekLocally(to: playerTarget) {
-            schedulePlaybackFailure()
-            let time = CMTime(seconds: playerTarget, preferredTimescale: 600)
-            player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
-                Task { @MainActor in
-                    self?.finishSeek(generation: generation, finished: finished)
-                }
-            }
-            return
-        }
-
-        do {
-            let prepared = try await api.prepareNativePlayback(playback, startSeconds: target)
-            guard !Task.isCancelled, generation == seekGeneration, !stopped else { return }
-            timeline = prepared.hls.timeline
-            burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
-            updateSubtitleOptions(prepared.hls.subtitles ?? [])
-            if let duration = prepared.hls.durationSeconds, duration > 0 {
-                durationSeconds = duration
-            }
-            positionSeconds = target
-            installItem(url: cacheBusted(prepared.hls.playlistURL))
-            let playerPosition = timeline.playerSeconds(forMediaSeconds: target)
-            player.seek(
-                to: CMTime(seconds: playerPosition, preferredTimescale: 600),
-                toleranceBefore: .zero,
-                toleranceAfter: .zero
-            ) { [weak self] finished in
-                Task { @MainActor in
-                    self?.finishSeek(generation: generation, finished: finished)
-                }
-            }
-        } catch {
-            guard !Task.isCancelled, generation == seekGeneration, !stopped else { return }
-            cancelPlaybackFailure()
-            pendingSeekSeconds = nil
-            positionSeconds = seekOriginSeconds
-            isSeeking = false
-            isWaiting = false
-            isPlaying = false
-            wantsToPlay = false
-            stateLabel = "Seek Failed"
-            errorMessage = error.localizedDescription
-            seekTask = nil
-        }
-    }
-
-    private func finishSeek(generation: Int, finished: Bool) {
-        guard generation == seekGeneration, !stopped else { return }
-        pendingSeekSeconds = nil
-        isSeeking = false
-        seekTask = nil
-        if !finished {
-            pause()
-            isWaiting = false
-            stateLabel = "Seek Failed"
-            errorMessage = "The player could not seek to the requested position."
-            return
-        }
-        if resumeAfterSeek {
-            play()
-        } else {
-            wantsToPlay = false
-            isPlaying = false
-            isWaiting = false
-            stateLabel = "Paused"
-        }
-    }
-
-    private func canSeekLocally(to seconds: Double) -> Bool {
-        guard seconds >= 0, let item = player.currentItem else { return false }
-        let target = CMTime(seconds: seconds, preferredTimescale: 600)
-        return item.seekableTimeRanges.contains { value in
-            CMTimeRangeContainsTime(value.timeRangeValue, time: target)
-        }
-    }
-
-    private func updateSubtitleOptions(_ tracks: [HLSSubtitleTrack]) {
-        let previous = selectedSubtitle
-        subtitleOptions = tracks
-        if let previous {
-            selectedSubtitle = tracks.first(where: { $0.index == previous.index })
-                ?? tracks.first(where: {
-                    $0.language == previous.language && $0.title == previous.title
-                })
-        }
-        restartSubtitleUpdates()
-    }
-
-    private func switchSubtitleStreamIfNeeded() {
-        let desiredBitmapIndex = selectedSubtitle?.isBitmap == true ? selectedSubtitle?.index : nil
-        guard desiredBitmapIndex != burnedSubtitleIndex || subtitleSwitchTask != nil else {
-            restartSubtitleUpdates()
-            return
-        }
-
-        let generation = beginItemOperation()
-        cancelPlaybackFailure()
-        subtitleTask?.cancel()
-        subtitleTask = nil
-        subtitleCues = []
-        activeSubtitleText = nil
-        let resumePosition = max(0, positionSeconds)
-        player.pause()
-        isWaiting = true
-        stateLabel = "Changing Subtitles…"
-        errorMessage = nil
-
-        subtitleSwitchTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                let prepared = try await self.api.prepareNativePlayback(
-                    self.playback,
-                    startSeconds: resumePosition,
-                    bitmapSubtitleIndex: desiredBitmapIndex,
-                    useSavedSubtitlePreference: false
-                )
-                guard !Task.isCancelled, generation == self.seekGeneration, !self.stopped else { return }
-                self.timeline = prepared.hls.timeline
-                self.burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
-                self.updateSubtitleOptions(prepared.hls.subtitles ?? [])
-                self.installItem(url: self.cacheBusted(prepared.hls.playlistURL))
-                let playerPosition = self.timeline.playerSeconds(
-                    forMediaSeconds: resumePosition
-                )
-                self.player.seek(
-                    to: CMTime(seconds: playerPosition, preferredTimescale: 600),
-                    toleranceBefore: .zero,
-                    toleranceAfter: .zero
-                ) { [weak self] finished in
-                    Task { @MainActor in
-                        guard let self, generation == self.seekGeneration, !self.stopped else { return }
-                        self.subtitleSwitchTask = nil
-                        self.isWaiting = self.wantsToPlay
-                        guard finished else {
-                            self.pause()
-                            self.isWaiting = false
-                            self.stateLabel = "Unable to Change Subtitles"
-                            self.errorMessage = "The player could not resume after changing subtitles."
-                            return
-                        }
-                        if self.wantsToPlay {
-                            self.play()
-                        } else {
-                            self.stateLabel = "Paused"
-                        }
-                    }
-                }
-            } catch {
-                guard !Task.isCancelled, generation == self.seekGeneration, !self.stopped else { return }
-                self.subtitleSwitchTask = nil
-                self.cancelPlaybackFailure()
-                self.isWaiting = false
-                self.wantsToPlay = false
-                self.isPlaying = false
-                self.stateLabel = "Unable to Change Subtitles"
-                self.errorMessage = error.localizedDescription
-            }
-        }
-    }
-
-    private func restartSubtitleUpdates() {
-        subtitleTask?.cancel()
-        subtitleTask = nil
-        subtitleCues = []
-        activeSubtitleText = nil
-        guard let track = selectedSubtitle, !track.isBitmap, !stopped else { return }
-
-        let subtitleTimeline = timeline
-        subtitleTask = Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await self.api.startSubtitle(playbackID: self.playback.id, track: track)
-            } catch {
-                return
-            }
-            while !Task.isCancelled {
-                guard !self.stopped,
-                      self.selectedSubtitle?.index == track.index,
-                      self.timeline == subtitleTimeline else {
-                    return
-                }
-                do {
-                    if let cues = try await self.api.subtitleCues(
-                        playbackID: self.playback.id,
-                        track: track
-                    ) {
-                        guard !Task.isCancelled,
-                              self.selectedSubtitle?.index == track.index,
-                              self.timeline == subtitleTimeline else {
-                            return
-                        }
-                        self.subtitleCues = cues
-                        self.updateActiveSubtitle()
-                    }
-                } catch {
-                    // Subtitle polling is best-effort while the WebVTT file grows.
-                }
-                do {
-                    try await Task.sleep(for: .seconds(2))
-                } catch {
-                    return
-                }
-            }
-        }
-    }
-
-    private func updateActiveSubtitle() {
-        let active = subtitleCues.filter {
-            positionSeconds >= $0.startSeconds && positionSeconds <= $0.endSeconds
-        }
-        activeSubtitleText = active.isEmpty ? nil : active.map(\.text).joined(separator: "\n")
-    }
-
-    private static func preferredSubtitle(in tracks: [HLSSubtitleTrack]) -> HLSSubtitleTrack? {
-        HLSSubtitleTrack.savedPreference(in: tracks)
-    }
-
-    private func beginItemOperation() -> Int {
-        seekGeneration += 1
-        seekTask?.cancel()
-        seekTask = nil
-        subtitleSwitchTask?.cancel()
-        subtitleSwitchTask = nil
-        player.currentItem?.cancelPendingSeeks()
-        pendingSeekSeconds = nil
-        isSeeking = false
-        return seekGeneration
-    }
-
-    private func installItem(url: URL) {
-        statusObservation?.invalidate()
-        if let itemEndObserver {
-            NotificationCenter.default.removeObserver(itemEndObserver)
-            self.itemEndObserver = nil
-        }
-        didReachEnd = false
-        let item = AVPlayerItem(url: url)
-        NativePlaybackConfiguration.configure(item)
-        statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
-            Task { @MainActor in
-                guard let self, !self.stopped, self.player.currentItem === item else { return }
-                if item.status == .failed {
-                    _ = self.beginItemOperation()
-                    self.cancelPlaybackFailure()
-                    self.isWaiting = false
-                    self.isPlaying = false
-                    self.wantsToPlay = false
-                    self.stateLabel = "Unable to Play Stream"
-                    self.errorMessage = item.error?.localizedDescription ?? "The HLS stream could not be opened."
-                }
-            }
-        }
-        itemEndObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
-            object: item,
-            queue: .main
-        ) { [weak self, weak item] _ in
-            Task { @MainActor in
-                guard let self, !self.stopped, self.player.currentItem === item else { return }
-                _ = self.beginItemOperation()
-                self.cancelPlaybackFailure()
-                self.positionSeconds = max(self.positionSeconds, self.durationSeconds)
-                self.wantsToPlay = false
-                self.isPlaying = false
-                self.isWaiting = false
-                self.didReachEnd = true
-                self.stateLabel = "Episode Finished"
-                self.publishNowPlayingInfo()
-            }
-        }
-        player.replaceCurrentItem(with: item)
-        schedulePlaybackFailure()
-    }
-
-    private func cacheBusted(_ url: URL) -> URL {
-        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
-            return url
-        }
-        var items = components.queryItems ?? []
-        items.append(URLQueryItem(name: "seek", value: UUID().uuidString))
-        components.queryItems = items
-        return components.url ?? url
     }
 }

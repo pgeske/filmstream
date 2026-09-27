@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pgeske/filmstream/internal/catalog"
@@ -12,7 +14,16 @@ import (
 )
 
 const (
-	releaseSearchTimeout     = 45 * time.Second
+	// releaseSearchDeadline caps one release search across every indexer and
+	// title fallback; releaseSearchSettle is how long it keeps waiting for
+	// slower indexers once a playable release was found, so a slow private
+	// tracker can still beat a fast public one without holding up the click.
+	releaseSearchDeadline = 12 * time.Second
+	releaseSearchSettle   = 4 * time.Second
+	// releaseMetadataWait bounds the (cached) TMDB lookups that refine a search.
+	releaseMetadataWait = 3 * time.Second
+	// releaseSearchTimeout bounds a background prefetch: metadata plus search.
+	releaseSearchTimeout     = releaseMetadataWait + releaseSearchDeadline + time.Second
 	releaseSearchTTL         = 10 * time.Minute
 	releaseSearchNegativeTTL = 15 * time.Second
 )
@@ -112,14 +123,110 @@ func (s *Server) searchReleases(
 	ctx context.Context,
 	request CreatePlaybackRequest,
 ) ([]catalog.RankedCandidate, error) {
-	preferSeasonPack := request.MediaType == string(metadata.MediaTypeShow) &&
-		s.shouldPreferSeasonPack(ctx, request)
-	return s.searchAndRank(ctx, catalog.SearchRequest{
+	return s.searchAndRank(ctx, s.releaseSearchRequest(ctx, request), request.OriginalTitle, catalog.ProtocolTorrent)
+}
+
+// releaseSearchRequest builds the torrent search for a playback request: the
+// IMDb/TMDB IDs of the movie or series for indexers that search by ID, the
+// runtime that ranking turns into a bitrate estimate, and whether an episode
+// prefers a season pack. Metadata that is not known within
+// releaseMetadataWait is left out rather than delaying the search.
+func (s *Server) releaseSearchRequest(ctx context.Context, request CreatePlaybackRequest) catalog.SearchRequest {
+	search := catalog.SearchRequest{
 		Query: request.Query, Year: request.Year, MediaType: request.MediaType,
 		SeasonNumber: request.SeasonNumber, EpisodeNumber: request.EpisodeNumber,
-		PreferSeasonPack: preferSeasonPack,
-		Preferences:      request.Preferences,
-	}, request.OriginalTitle, catalog.ProtocolTorrent)
+		Preferences: request.Preferences,
+	}
+	isShow := request.MediaType == string(metadata.MediaTypeShow)
+	titleID := request.MediaID
+	if isShow {
+		titleID = request.SeriesID
+	}
+	search.TMDBID = tmdbNumericID(titleID)
+
+	s.metadataMu.RLock()
+	provider := s.metadataProvider
+	s.metadataMu.RUnlock()
+	lookupContext, cancel := context.WithTimeout(ctx, releaseMetadataWait)
+	defer cancel()
+	var lookups sync.WaitGroup
+	if isShow {
+		lookups.Add(1)
+		go func() {
+			defer lookups.Done()
+			search.PreferSeasonPack = s.shouldPreferSeasonPack(lookupContext, request)
+		}()
+	}
+	imdbID := ""
+	if provider, ok := provider.(metadata.IMDbIDProvider); ok && titleID != "" {
+		lookups.Add(1)
+		go func() {
+			defer lookups.Done()
+			if id, err := provider.IMDbID(lookupContext, titleID); err == nil {
+				imdbID = id
+			}
+		}()
+	}
+	runtime, seasonRuntime := 0, 0
+	if provider, ok := provider.(metadata.ShowProvider); ok && isShow && request.SeriesID != "" && request.SeasonNumber > 0 {
+		lookups.Add(1)
+		go func() {
+			defer lookups.Done()
+			if season, err := provider.Season(lookupContext, request.SeriesID, request.SeasonNumber); err == nil {
+				runtime, seasonRuntime = episodeRuntimes(season, request.EpisodeNumber)
+			}
+		}()
+	}
+	if provider, ok := provider.(metadata.MovieRuntimeProvider); ok && !isShow && request.MediaID != "" {
+		lookups.Add(1)
+		go func() {
+			defer lookups.Done()
+			if minutes, err := provider.MovieRuntime(lookupContext, request.MediaID); err == nil {
+				runtime = minutes
+			}
+		}()
+	}
+	lookups.Wait()
+	search.IMDBID = imdbID
+	search.RuntimeMinutes, search.SeasonRuntimeMinutes = runtime, seasonRuntime
+	return search
+}
+
+// episodeRuntimes returns the runtime of one episode and of the whole season in
+// minutes; episodes without a runtime count as the season's average.
+func episodeRuntimes(season metadata.Season, episodeNumber int) (int, int) {
+	known, total, episode := 0, 0, 0
+	for _, candidate := range season.Episodes {
+		if candidate.Runtime > 0 {
+			known++
+			total += candidate.Runtime
+		}
+		if candidate.EpisodeNumber == episodeNumber {
+			episode = candidate.Runtime
+		}
+	}
+	if known == 0 {
+		return 0, 0
+	}
+	average := total / known
+	if episode == 0 {
+		episode = average
+	}
+	return episode, total + average*(len(season.Episodes)-known)
+}
+
+// tmdbNumericID extracts the numeric TMDB ID from a "tmdb:<id>" movie or
+// "tmdb-tv:<id>" series ID; zero when the ID has another form.
+func tmdbNumericID(mediaID string) int {
+	for _, prefix := range []string{"tmdb-tv:", "tmdb:"} {
+		if value, found := strings.CutPrefix(strings.TrimSpace(mediaID), prefix); found {
+			if id, err := strconv.Atoi(value); err == nil && id > 0 {
+				return id
+			}
+			return 0
+		}
+	}
+	return 0
 }
 
 func (s *Server) shouldPreferSeasonPack(ctx context.Context, request CreatePlaybackRequest) bool {

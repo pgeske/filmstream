@@ -3,6 +3,7 @@ package catalog
 import (
 	"maps"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -137,43 +138,89 @@ func TestRankStreamingOptimizedPrioritizesPreferredQualityBeforeSeeders(t *testi
 	}
 }
 
-func TestRankStreamingOptimizedPrioritizesPopularityOverSize(t *testing.T) {
+func TestRankStreamingOptimizedPenalizesBitrateOnlyWhenRuntimeIsKnown(t *testing.T) {
 	popularSeeders, smallerSeeders := 140, 40
-	ranked := Rank(SearchRequest{
-		Query: "The Matrix",
-		Year:  1999,
-		Preferences: Preferences{
-			Resolution:         "1080p",
-			Codecs:             []string{"h264", "h265"},
-			MaxSizeBytes:       50 << 30,
-			StreamingOptimized: true,
-		},
-	}, []Candidate{
+	candidates := []Candidate{
 		{Name: "The.Matrix.1999.1080p.BluRay.x264-LARGE", SizeBytes: 30 << 30, Seeders: &popularSeeders},
 		{Name: "The.Matrix.1999.1080p.WEBRip.x264-SMALL", SizeBytes: 6 << 30, Seeders: &smallerSeeders},
-	})
-	if got := ranked[0].Candidate.Name; got != "The.Matrix.1999.1080p.BluRay.x264-LARGE" {
-		t.Fatalf("top candidate = %q, want more popular release", got)
+		{Name: "The.Matrix.1999.2160p.WEB-DL.x265-UHD", SizeBytes: 25 << 30, Seeders: &popularSeeders},
+	}
+	request := SearchRequest{
+		Query: "The Matrix", Year: 1999,
+		Preferences: Preferences{
+			Resolution: "1080p", Codecs: []string{"h264", "h265"},
+			MaxSizeBytes: 50 << 30, StreamingOptimized: true,
+		},
+	}
+	if got := Rank(request, candidates)[0].Candidate.Name; got != "The.Matrix.1999.1080p.BluRay.x264-LARGE" {
+		t.Fatalf("top candidate without runtime = %q, want the better seeded release", got)
+	}
+
+	request.RuntimeMinutes = 136
+	ranked := Rank(request, candidates)
+	if got := ranked[0].Candidate.Name; got != "The.Matrix.1999.1080p.WEBRip.x264-SMALL" {
+		t.Fatalf("top candidate with runtime = %q, want the streamable bitrate", got)
+	}
+	for _, candidate := range ranked {
+		penalized := slices.ContainsFunc(candidate.Reasons, func(reason string) bool {
+			return strings.HasPrefix(reason, "high bitrate")
+		})
+		// 30 GiB over 136 minutes is ~32 Mbps (a 1080p remux rate); 25 GiB of 4K
+		// is ~26 Mbps, within the 2160p budget.
+		if want := strings.HasSuffix(candidate.Candidate.Name, "LARGE"); penalized != want {
+			t.Fatalf("%s bitrate penalty = %t, reasons = %v", candidate.Candidate.Name, penalized, candidate.Reasons)
+		}
 	}
 }
 
-func TestRankStreamingOptimizedIgnoresFreeleechAsHealthSignal(t *testing.T) {
-	moreSeeders, fewerSeeders := 80, 60
-	freeleech, normal := 0.0, 1.0
+func TestRankSeasonPackBitrateUsesWholeSeasonRuntime(t *testing.T) {
+	seeders := 50
 	ranked := Rank(SearchRequest{
-		Query: "The Matrix",
-		Year:  1999,
-		Preferences: Preferences{
-			Resolution:         "1080p",
-			Codecs:             []string{"h264"},
-			StreamingOptimized: true,
-		},
-	}, []Candidate{
-		{Name: "The.Matrix.1999.1080p.BluRay.x264-POPULAR", SizeBytes: 10 << 30, Seeders: &moreSeeders, DownloadVolumeFactor: &normal},
-		{Name: "The.Matrix.1999.1080p.WEBRip.x264-FREE", SizeBytes: 10 << 30, Seeders: &fewerSeeders, DownloadVolumeFactor: &freeleech},
+		Query: "The Show", MediaType: "show", SeasonNumber: 1, EpisodeNumber: 1,
+		RuntimeMinutes: 50, SeasonRuntimeMinutes: 500,
+		Preferences: Preferences{Resolution: "1080p", Codecs: []string{"h264"}, StreamingOptimized: true},
+	}, []Candidate{{Name: "The.Show.S01.1080p.WEB-DL.H264", SizeBytes: 30 << 30, Seeders: &seeders}})
+	if len(ranked) != 1 || slices.ContainsFunc(ranked[0].Reasons, func(reason string) bool {
+		return strings.HasPrefix(reason, "high bitrate")
+	}) {
+		t.Fatalf("a 30 GiB ten-episode pack (~9 Mbps) was treated as high bitrate: %+v", ranked)
+	}
+}
+
+func TestRankPrefersPrivateAndFreeleechReleases(t *testing.T) {
+	seeders := 20
+	freeleech, normal := 0.0, 1.0
+	request := SearchRequest{
+		Query: "The Matrix", Year: 1999,
+		Preferences: Preferences{Resolution: "1080p", Codecs: []string{"h264"}, StreamingOptimized: true},
+	}
+	ranked := Rank(request, []Candidate{
+		{Name: "The.Matrix.1999.1080p.BluRay.x264-PUBLIC", Seeders: &seeders},
+		{Name: "The.Matrix.1999.1080p.BluRay.x264-PRIVATE", Seeders: &seeders, Private: true},
 	})
-	if got := ranked[0].Candidate.Name; got != "The.Matrix.1999.1080p.BluRay.x264-POPULAR" {
-		t.Fatalf("top candidate = %q, want more popular release", got)
+	if got := ranked[0].Candidate.Name; got != "The.Matrix.1999.1080p.BluRay.x264-PRIVATE" {
+		t.Fatalf("top candidate = %q, want private tracker release", got)
+	}
+	ranked = Rank(request, []Candidate{
+		{Name: "The.Matrix.1999.1080p.BluRay.x264-NORMAL", Seeders: &seeders, DownloadVolumeFactor: &normal},
+		{Name: "The.Matrix.1999.1080p.BluRay.x264-FREE", Seeders: &seeders, DownloadVolumeFactor: &freeleech},
+	})
+	if got := ranked[0].Candidate.Name; got != "The.Matrix.1999.1080p.BluRay.x264-FREE" {
+		t.Fatalf("top candidate = %q, want freeleech release", got)
+	}
+}
+
+func TestRankPrefersHealthyAlternateResolutionOverThinPreferredSwarm(t *testing.T) {
+	thin, healthy := 2, 40
+	ranked := Rank(SearchRequest{
+		Query: "The Matrix", Year: 1999,
+		Preferences: Preferences{Resolution: "1080p", Codecs: []string{"h264"}, StreamingOptimized: true},
+	}, []Candidate{
+		{Name: "The.Matrix.1999.1080p.BluRay.x264-THIN", Seeders: &thin},
+		{Name: "The.Matrix.1999.720p.BluRay.x264-HEALTHY", Seeders: &healthy},
+	})
+	if len(ranked) != 2 || ranked[0].Candidate.Name != "The.Matrix.1999.720p.BluRay.x264-HEALTHY" {
+		t.Fatalf("ranked = %+v", ranked)
 	}
 }
 
@@ -259,18 +306,19 @@ func TestRankDiagnosticsExplainFastFixtureMovieRejections(t *testing.T) {
 	}
 }
 
-func TestRankDiagnosticsKeepZeroSeederMovieEligible(t *testing.T) {
+func TestRankRejectsZeroSeederTorrentsButNotUsenet(t *testing.T) {
 	seeders := 0
 	ranked, diagnostics := RankWithDiagnostics(SearchRequest{
 		Query: "Dune: Part Two", Year: 2024, MediaType: "movie",
 		Preferences: Preferences{
 			Resolution: "1080p", Codecs: []string{"h264"}, StreamingOptimized: true,
 		},
-	}, []Candidate{{
-		Name: "Dune Part Two 2024 1080p WEB-DL H264-GROUP", Seeders: &seeders,
-		Categories: []int{2000, 2030},
-	}})
-	if len(ranked) != 1 || diagnostics.Accepted != 1 || diagnostics.Rejected != 0 {
+	}, []Candidate{
+		{Name: "Dune Part Two 2024 1080p WEB-DL H264-TORRENT", Protocol: ProtocolTorrent, Seeders: &seeders},
+		{Name: "Dune Part Two 2024 1080p WEB-DL H264-USENET", Protocol: ProtocolUsenet, Seeders: &seeders},
+	})
+	if len(ranked) != 1 || ranked[0].Candidate.Protocol != ProtocolUsenet ||
+		diagnostics.RejectionReasons[rejectionNoSeeders] != 1 {
 		t.Fatalf("ranked = %+v, diagnostics = %+v", ranked, diagnostics)
 	}
 }
@@ -282,8 +330,10 @@ func TestRankDiagnosticsCountEveryHardPolicyReason(t *testing.T) {
 			Codecs: []string{"h264", "h265"}, MaxSizeBytes: 60 << 30, StreamingOptimized: true,
 		},
 	}
+	noSeeders := 0
 	_, diagnostics := RankWithDiagnostics(request, []Candidate{
 		{Name: "The Movie 2001 1080p x264", SizeBytes: 61 << 30},
+		{Name: "The Movie 2001 1080p x264 DEAD", Seeders: &noSeeders},
 		{Name: "The Movie 2001 2160p DV x265"},
 		{Name: "The Movie 2001 1080p AI Upscaled x265"},
 		{Name: "The Movie 2001 2160p REMUX x265"},
@@ -293,11 +343,11 @@ func TestRankDiagnosticsCountEveryHardPolicyReason(t *testing.T) {
 		{Name: "Another Movie 2001 1080p x264"},
 	})
 	want := map[string]int{
-		rejectionMaxSize: 1, rejectionDolbyVision: 1, rejectionAIUpscale: 1,
+		rejectionMaxSize: 1, rejectionNoSeeders: 1, rejectionDolbyVision: 1, rejectionAIUpscale: 1,
 		rejection2160pRemux: 1, rejectionUnknownCodec: 1,
 		rejectionUnsupportedCodec: 1, rejectionYearMismatch: 1, rejectionTitleMismatch: 1,
 	}
-	if !maps.Equal(diagnostics.RejectionReasons, want) || diagnostics.Rejected != 8 || diagnostics.Accepted != 0 {
+	if !maps.Equal(diagnostics.RejectionReasons, want) || diagnostics.Rejected != 9 || diagnostics.Accepted != 0 {
 		t.Fatalf("diagnostics = %+v, want reasons = %v", diagnostics, want)
 	}
 }
@@ -390,6 +440,29 @@ func TestRankFallsBackToIndividualEpisodeWithoutSeasonPack(t *testing.T) {
 	})
 	if len(ranked) != 1 || ranked[0].Candidate.Name != "Top.Rated.Show.S01E02.1080p.WEB.H264" {
 		t.Fatalf("ranked = %+v", ranked)
+	}
+}
+
+func TestRankKeepsHealthyEpisodesWhenOnlyThinSeasonPacksExist(t *testing.T) {
+	thin, healthy := 1, 50
+	request := SearchRequest{
+		Query: "Top Rated Show", MediaType: "show", SeasonNumber: 1, EpisodeNumber: 2,
+		PreferSeasonPack: true,
+	}
+	ranked := Rank(request, []Candidate{
+		{Name: "Top.Rated.Show.S01.Complete.1080p.WEB.H264", Seeders: &thin},
+		{Name: "Top.Rated.Show.S01E02.1080p.WEB.H264", Seeders: &healthy},
+	})
+	if len(ranked) != 2 || ranked[0].Candidate.Name != "Top.Rated.Show.S01E02.1080p.WEB.H264" {
+		t.Fatalf("ranked = %+v, want healthy episode ahead of the thin pack", ranked)
+	}
+
+	ranked = Rank(request, []Candidate{
+		{Name: "Top.Rated.Show.S01.Complete.1080p.WEB.H264", Seeders: &healthy},
+		{Name: "Top.Rated.Show.S01E02.1080p.WEB.H264", Seeders: &healthy},
+	})
+	if len(ranked) != 1 || ranked[0].Candidate.Name != "Top.Rated.Show.S01.Complete.1080p.WEB.H264" {
+		t.Fatalf("ranked = %+v, want only the healthy season pack", ranked)
 	}
 }
 

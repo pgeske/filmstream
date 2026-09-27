@@ -43,6 +43,9 @@ struct IOSMovieDetailView: View {
                 compactLayout(width: geometry.size.width, layout: layout)
             }
         }
+        .overlay {
+            IOSPlaybackPreparationPanel(preparation: preparation, title: movie.title)
+        }
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.visible, for: .navigationBar)
@@ -168,7 +171,7 @@ struct IOSMovieDetailView: View {
                     .lineSpacing(3)
             }
 
-            if let errorMessage = preparation.errorMessage ?? errorMessage {
+            if let errorMessage {
                 Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                     .font(.footnote.weight(.semibold))
                     .foregroundStyle(Color.mobileTeaAmber)

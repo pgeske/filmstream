@@ -13,21 +13,46 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 const (
 	defaultStartupTimeout       = 90 * time.Second
-	defaultStartupBufferSeconds = 12
-	defaultReadRate             = 1.25
+	defaultStartupBufferSeconds = 8
 	defaultSegmentSeconds       = 4
 	defaultParkedTTL            = 2 * time.Hour
-	defaultParkedResumeTimeout  = 6 * time.Second
-	startupProgressInterval     = 5 * time.Second
-	timelineTimestampEpsilon    = 1e-6
-	sourceVideoAnchorFileName   = "source-video-anchor.framehash"
+	// A live packager that has produced no new segment for this long is
+	// reported as buffering. A stall alone never fails a playback.
+	defaultStallWindow = 45 * time.Second
+	// The packager pauses once it is this far ahead of the client's playhead
+	// and continues below the lower mark. This bounds disk use without pacing
+	// source reads, so a recovering torrent refills the client buffer at full speed.
+	maxLeadSeconds    = 600.0
+	resumeLeadSeconds = 540.0
+	// A resume request this far beyond the packaged edge waits for the running
+	// packager instead of restarting it at a new seek point.
+	joinReachSeconds          = 60.0
+	monitorInterval           = 500 * time.Millisecond
+	startupProgressInterval   = 5 * time.Second
+	timelineTimestampEpsilon  = 1e-6
+	sourceVideoAnchorFileName = "source-video-anchor.framehash"
+	// Torrent reads legitimately block while pieces arrive. A generous read
+	// timeout with reconnects surfaces a hung connection without failing slow
+	// pieces; FFmpeg gives up only after several consecutive timed-out reconnects.
+	sourceReadTimeout              = 60 * time.Second
+	sourceReconnectDelayMaxSeconds = 16
+	encoderProbeTimeout            = 30 * time.Second
 )
+
+// ErrBuffering reports that a live packager has not yet produced the requested
+// media within the startup timeout. The stream keeps running; retrying joins it.
+var ErrBuffering = errors.New("HLS stream is still buffering")
+
+// errSourceEndedEarly marks a packager that FFmpeg finished cleanly after its
+// source connection failed. FFmpeg then writes a final playlist for truncated media.
+var errSourceEndedEarly = errors.New("source read failed before the end of the media")
 
 type Config struct {
 	DataDir               string
@@ -36,15 +61,12 @@ type Config struct {
 	SourceBaseURL         string
 	StartupTimeout        time.Duration
 	BufferSeconds         int
-	ReadRate              float64
 	SegmentSeconds        int
 	ParkedTTL             time.Duration
-	ParkedResumeTimeout   time.Duration
 	Logger                *slog.Logger
 	BitmapSubtitleEncoder string
 	LocalSourcePath       func(string) (string, bool)
 	SourceUnavailable     func(string) error
-	SourceStalled         func(string, error) error
 }
 
 type Stream struct {
@@ -68,6 +90,9 @@ type SubtitleTrack struct {
 	Forced   bool   `json:"forced,omitempty"`
 	Codec    string `json:"codec,omitempty"`
 	Kind     string `json:"kind,omitempty"`
+	// RenditionName is the unique NAME of the track's subtitle rendition in
+	// master.m3u8. Bitmap tracks have no rendition.
+	RenditionName string `json:"rendition_name,omitempty"`
 }
 
 // AudioTrack describes one source audio stream offered to clients. The
@@ -80,6 +105,14 @@ type AudioTrack struct {
 	Default  bool   `json:"default,omitempty"`
 }
 
+// Asset is one servable HLS resource: a file written by the packager, or
+// generated playlist and subtitle segment bytes.
+type Asset struct {
+	Path        string
+	Content     []byte
+	ContentType string
+}
+
 type Manager struct {
 	dataDir               string
 	ffmpegPath            string
@@ -87,15 +120,13 @@ type Manager struct {
 	sourceBaseURL         string
 	startupTimeout        time.Duration
 	bufferSeconds         int
-	readRate              float64
 	segmentSeconds        int
 	parkedTTL             time.Duration
-	parkedResumeTimeout   time.Duration
+	stallWindow           time.Duration
 	logger                *slog.Logger
 	bitmapSubtitleEncoder string
 	localSourcePath       func(string) (string, bool)
 	sourceUnavailable     func(string) error
-	sourceStalled         func(string, error) error
 
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -125,30 +156,46 @@ type playbackProbe struct {
 	err      error
 }
 
+// runningStream is one packager process. It is registered as soon as FFmpeg
+// starts so status can report startup progress, but its assets stay private
+// until the packaged timeline has been verified and the stream is published.
 type runningStream struct {
-	lifetime            *playbackLifetime
-	info                Stream
-	dir                 string
-	sourceURL           string
-	timeline            playbackTimeline
-	ctx                 context.Context
-	cancel              context.CancelFunc
-	done                chan struct{}
-	errMu               sync.RWMutex
-	err                 error
-	command             *exec.Cmd
-	processMu           sync.Mutex
-	parked              bool
-	parkedAt            time.Time
-	parkTimer           *time.Timer
+	lifetime  *playbackLifetime
+	dir       string
+	ctx       context.Context
+	cancel    context.CancelFunc
+	done      chan struct{}
+	errMu     sync.RWMutex
+	err       error
+	command   *exec.Cmd
+	startedAt time.Time
+	stopOnce  sync.Once
+	published atomic.Bool
+
+	// Immutable after launch.
+	requestedSeconds    float64
 	languages           []string
 	bitmapSubtitleIndex int
 	audioStreamIndex    int
+	preferredAudioIndex int
+	bandwidth           int
 
-	subtitleMu     sync.Mutex
-	subtitleIndex  int
-	subtitleCancel context.CancelFunc
-	subtitleDone   chan struct{}
+	// Written by the Start that publishes the stream, read-only afterwards.
+	info     Stream
+	timeline playbackTimeline
+
+	processMu sync.Mutex
+	parked    bool
+	parkedAt  time.Time
+	parkTimer *time.Timer
+	throttled bool
+	stopped   bool
+
+	progressMu      sync.Mutex
+	segmentEnds     []float64
+	complete        bool
+	lastProgress    time.Time
+	playheadSeconds float64
 }
 
 type mediaProbe struct {
@@ -156,15 +203,19 @@ type mediaProbe struct {
 	Format  struct {
 		StartTime string `json:"start_time"`
 		Duration  string `json:"duration"`
+		BitRate   string `json:"bit_rate"`
 	} `json:"format"`
 }
 
+// playbackTimeline maps source media time, packaged HLS time, and player time.
+// Media time is the source clock after FFmpeg's start_at_zero shift; the text
+// subtitle outputs use the same clock.
 type playbackTimeline struct {
-	requestedSeconds        float64
-	seekSeconds             float64
+	requestedSeconds float64
+	seekSeconds      float64
+	// The first packaged video frame, in media time and in packaged time.
 	sourceVideoPTSSeconds   float64
-	sourceVideoPacketSize   int
-	sourceVideoPacketHash   string
+	packagedVideoPTSSeconds float64
 	originSeconds           float64
 	playerTimeOffsetSeconds float64
 }
@@ -182,44 +233,55 @@ func newPlaybackTimeline(requestedSeconds float64) playbackTimeline {
 	}
 }
 
-func (t *playbackTimeline) setSourceVideoAnchor(anchor sourceVideoAnchor) {
-	// FFmpeg must seek to the requested media time. Seeking to the preceding
-	// keyframe again can make the demuxer land one more keyframe back.
-	t.sourceVideoPTSSeconds = anchor.ptsSeconds
-	t.sourceVideoPacketSize = anchor.packetSize
-	t.sourceVideoPacketHash = anchor.packetHash
-}
-
+// alignToPackagedVideo derives the public timeline from the first packaged
+// video frame. The recorded source packet is only a cross-check: the MP4 muxer
+// rewrites Annex-B packets from MPEG-TS sources, and a demuxer without a seek
+// index can land after the requested time. Both are reported, never fatal.
 func (t *playbackTimeline) alignToPackagedVideo(
+	anchor sourceVideoAnchor,
+	anchorErr error,
 	packaged packagedTimelineStart,
 	streamCopiedVideo bool,
-) error {
-	if streamCopiedVideo && t.sourceVideoPacketSize > 0 {
-		if t.sourceVideoPacketHash == "" || packaged.videoPacketSize <= 0 ||
-			packaged.videoPacketHash == "" || packaged.videoPacketSize != t.sourceVideoPacketSize ||
-			packaged.videoPacketHash != t.sourceVideoPacketHash {
-			return errors.New("packaged HLS begins at a different source video keyframe")
+) []string {
+	var warnings []string
+	sourcePTS := anchor.ptsSeconds
+	if anchorErr != nil {
+		warnings = append(warnings, fmt.Sprintf(
+			"source video anchor unavailable (%v); assuming it matches the seek position", anchorErr))
+		sourcePTS = t.seekSeconds
+	} else {
+		if streamCopiedVideo && (anchor.packetSize != packaged.videoPacketSize ||
+			anchor.packetHash != packaged.videoPacketHash) {
+			warnings = append(warnings,
+				"packaged first video packet differs from the recorded source packet; using measured timestamps")
+		}
+		// FFmpeg receives the seek rounded to milliseconds.
+		if t.seekSeconds > 0 && sourcePTS > math.Round(t.seekSeconds*1000)/1000+timelineTimestampEpsilon {
+			warnings = append(warnings, fmt.Sprintf(
+				"source seek landed at %.6f after the requested %.6f", sourcePTS, t.seekSeconds))
 		}
 	}
+	t.sourceVideoPTSSeconds = sourcePTS
+	t.packagedVideoPTSSeconds = packaged.videoPTS
 	if t.requestedSeconds == 0 {
 		t.originSeconds = 0
 		t.playerTimeOffsetSeconds = 0
-		return nil
+		return warnings
 	}
-	origin := t.sourceVideoPTSSeconds - packaged.videoPTS
-	if origin < 0 && t.sourceVideoPTSSeconds <= timelineTimestampEpsilon {
+	origin := sourcePTS - packaged.videoPTS
+	if math.IsNaN(origin) || math.IsInf(origin, 0) {
+		origin = t.seekSeconds
+	}
+	if origin < 0 {
 		// B-frame decode timestamps can put HLS zero just before media time zero.
 		// The public full-media timeline is intentionally bounded at zero.
 		origin = 0
 	}
-	if math.IsNaN(origin) || math.IsInf(origin, 0) || origin < 0 || origin > t.requestedSeconds {
-		return fmt.Errorf("invalid HLS timeline origin %.6f", origin)
-	}
 	t.originSeconds = origin
 	// AVPlayer normalizes the first playlist presentation timestamp to player
 	// time zero. Adding this offset restores the packaged HLS packet clock.
-	t.playerTimeOffsetSeconds = t.sourceVideoPTSSeconds - origin
-	return nil
+	t.playerTimeOffsetSeconds = sourcePTS - origin
+	return warnings
 }
 
 func (t playbackTimeline) playerSecondsForMedia(mediaSeconds float64) float64 {
@@ -255,6 +317,7 @@ type mediaStream struct {
 	CodecName    string `json:"codec_name"`
 	CodecType    string `json:"codec_type"`
 	Channels     int    `json:"channels"`
+	AvgFrameRate string `json:"avg_frame_rate"`
 	SideDataList []struct {
 		SideDataType string `json:"side_data_type"`
 	} `json:"side_data_list"`
@@ -289,20 +352,11 @@ func New(cfg Config) (*Manager, error) {
 	if cfg.BufferSeconds <= 0 {
 		cfg.BufferSeconds = defaultStartupBufferSeconds
 	}
-	if cfg.ReadRate == 0 {
-		cfg.ReadRate = defaultReadRate
-	}
-	if cfg.ReadRate < 1 || cfg.ReadRate > 4 {
-		return nil, errors.New("HLS read rate must be between 1 and 4")
-	}
 	if cfg.SegmentSeconds <= 0 {
 		cfg.SegmentSeconds = defaultSegmentSeconds
 	}
 	if cfg.ParkedTTL <= 0 {
 		cfg.ParkedTTL = defaultParkedTTL
-	}
-	if cfg.ParkedResumeTimeout <= 0 {
-		cfg.ParkedResumeTimeout = defaultParkedResumeTimeout
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -312,6 +366,13 @@ func New(cfg Config) (*Manager, error) {
 	}
 	if cfg.BitmapSubtitleEncoder != "libx264" && cfg.BitmapSubtitleEncoder != "h264_nvenc" {
 		return nil, fmt.Errorf("unsupported bitmap subtitle encoder %q", cfg.BitmapSubtitleEncoder)
+	}
+	if cfg.BitmapSubtitleEncoder != "libx264" {
+		if err := probeVideoEncoder(ffmpegPath, cfg.BitmapSubtitleEncoder); err != nil {
+			cfg.Logger.Warn("bitmap subtitle encoder is unavailable; falling back to libx264",
+				"encoder", cfg.BitmapSubtitleEncoder, "error", err)
+			cfg.BitmapSubtitleEncoder = "libx264"
+		}
 	}
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create HLS data directory: %w", err)
@@ -327,21 +388,38 @@ func New(cfg Config) (*Manager, error) {
 		sourceBaseURL:         strings.TrimRight(cfg.SourceBaseURL, "/"),
 		startupTimeout:        cfg.StartupTimeout,
 		bufferSeconds:         cfg.BufferSeconds,
-		readRate:              cfg.ReadRate,
 		segmentSeconds:        cfg.SegmentSeconds,
 		parkedTTL:             cfg.ParkedTTL,
-		parkedResumeTimeout:   cfg.ParkedResumeTimeout,
+		stallWindow:           defaultStallWindow,
 		logger:                cfg.Logger,
 		bitmapSubtitleEncoder: cfg.BitmapSubtitleEncoder,
 		localSourcePath:       cfg.LocalSourcePath,
 		sourceUnavailable:     cfg.SourceUnavailable,
-		sourceStalled:         cfg.SourceStalled,
 		ctx:                   ctx,
 		cancel:                cancel,
 		streams:               make(map[string]*runningStream),
 		playbacks:             make(map[string]*playbackLifetime),
 		probes:                make(map[string]*playbackProbe),
 	}, nil
+}
+
+// probeVideoEncoder encodes one tiny frame, proving the encoder and any GPU it
+// needs are usable before a playback depends on them.
+func probeVideoEncoder(ffmpegPath, encoder string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), encoderProbeTimeout)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, ffmpegPath,
+		"-hide_banner", "-loglevel", "error", "-nostdin",
+		"-f", "lavfi", "-i", "color=c=black:s=256x144:r=24:d=0.2",
+		"-frames:v", "1", "-c:v", encoder, "-f", "null", "-",
+	).CombinedOutput()
+	if err != nil {
+		if details := strings.TrimSpace(string(output)); details != "" {
+			return fmt.Errorf("%w: %s", err, details)
+		}
+		return err
+	}
+	return nil
 }
 
 func (m *Manager) lifetimeForPlayback(playbackID string) *playbackLifetime {
@@ -376,13 +454,16 @@ func (m *Manager) ProbeSubtitles(ctx context.Context, playbackID string) ([]Subt
 		return nil, errors.New("invalid playback ID")
 	}
 	lifetime := m.lifetimeForPlayback(playbackID)
-	sourceURL := m.sourceBaseURL + "/v1/playbacks/" + playbackID + "/stream"
-	probeSource, _ := m.sourceForProbe(playbackID, sourceURL)
+	probeSource, _ := m.sourceForProbe(playbackID, m.sourceURL(playbackID))
 	probe, err := m.probePlayback(ctx, playbackID, probeSource, lifetime)
 	if err != nil {
 		return nil, m.preferSourceUnavailable(playbackID, err)
 	}
 	return supportedSubtitles(probe), nil
+}
+
+func (m *Manager) sourceURL(playbackID string) string {
+	return m.sourceBaseURL + "/v1/playbacks/" + playbackID + "/stream"
 }
 
 func (m *Manager) sourceForProbe(playbackID, sourceURL string) (string, bool) {
@@ -394,6 +475,11 @@ func (m *Manager) sourceForProbe(playbackID, sourceURL string) (string, bool) {
 	return sourceURL, false
 }
 
+// Start returns a playable stream at startSeconds. A running packager with the
+// same selections is joined when it covers or will soon reach the position;
+// otherwise a new packager starts there. Only hard failures (FFmpeg errors,
+// unsupported media, an unavailable source) are errors; a slow source returns
+// ErrBuffering and keeps packaging.
 func (m *Manager) Start(
 	ctx context.Context,
 	playbackID string,
@@ -415,179 +501,340 @@ func (m *Manager) Start(
 	}
 	startupContext, startupCancel := context.WithTimeout(ctx, m.startupTimeout)
 	defer startupCancel()
-	if stream, matched, err := m.resumePreparedStream(
-		startupContext, playbackID, startSeconds, preferredLanguages, bitmapSubtitleIndex, audioStreamIndex, lifetime,
-	); matched {
-		return stream, err
+
+	if stream := m.currentStream(playbackID, lifetime); stream != nil {
+		if m.joinable(playbackID, stream, startSeconds, preferredLanguages, bitmapSubtitleIndex, audioStreamIndex) {
+			return m.join(ctx, startupContext, playbackID, stream, startSeconds)
+		}
+		m.stopPlaybackStream(playbackID, lifetime)
 	}
-	coveredStream, covered, err := m.resumeCoveredStream(
-		startupContext, playbackID, startSeconds, preferredLanguages, bitmapSubtitleIndex, audioStreamIndex, lifetime,
+	stream, err := m.launch(
+		startupContext, playbackID, lifetime, startSeconds, preferredLanguages, bitmapSubtitleIndex, audioStreamIndex,
 	)
 	if err != nil {
-		if startupContext.Err() == nil {
-			m.stopPlaybackStream(playbackID, lifetime)
-		}
 		return Stream{}, err
 	}
-	if covered {
-		return coveredStream, nil
-	}
-	m.stopPlaybackStream(playbackID, lifetime)
+	return m.join(ctx, startupContext, playbackID, stream, startSeconds)
+}
 
-	sourceURL := m.sourceBaseURL + "/v1/playbacks/" + playbackID + "/stream"
+func (m *Manager) currentStream(playbackID string, lifetime *playbackLifetime) *runningStream {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	stream := m.streams[playbackID]
+	if stream == nil || stream.lifetime != lifetime {
+		return nil
+	}
+	return stream
+}
+
+// matches reports whether the stream packages the requested selections. An
+// audio index of -1 asks for the preferred track, which the stream may already carry.
+func (stream *runningStream) matches(languages []string, bitmapSubtitleIndex, audioStreamIndex int) bool {
+	if !equalStrings(stream.languages, languages) || stream.bitmapSubtitleIndex != bitmapSubtitleIndex {
+		return false
+	}
+	if audioStreamIndex < 0 {
+		return stream.audioStreamIndex == stream.preferredAudioIndex
+	}
+	return stream.audioStreamIndex == audioStreamIndex
+}
+
+func (m *Manager) joinable(
+	playbackID string,
+	stream *runningStream,
+	startSeconds float64,
+	preferredLanguages []string,
+	bitmapSubtitleIndex int,
+	audioStreamIndex int,
+) bool {
+	if !stream.matches(preferredLanguages, bitmapSubtitleIndex, audioStreamIndex) {
+		return false
+	}
+	if err := stream.producerError(); err != nil {
+		m.logger.Info("HLS packager stopped; rebuilding", "playback_id", playbackID,
+			"requested_start_seconds", startSeconds, "error", err)
+		return false
+	}
+	if math.Abs(stream.requestedSeconds-startSeconds) <= 0.5 {
+		return true
+	}
+	if !stream.published.Load() {
+		return false
+	}
+	// The event playlist retains every packaged segment, so a position inside
+	// the packaged range, or shortly past it, keeps the running packager and its
+	// buffer instead of re-probing and re-seeking the source.
+	position := stream.timeline.playerSecondsForMedia(startSeconds)
+	snapshot := stream.observe()
+	limit := snapshot.seconds() + joinReachSeconds
+	if snapshot.complete {
+		limit = snapshot.seconds()
+	}
+	if position < 0 || position > limit {
+		m.logger.Info("prepared HLS stream does not cover requested position; rebuilding",
+			"playback_id", playbackID, "requested_start_seconds", startSeconds,
+			"timeline_origin_seconds", stream.info.TimelineOriginSeconds,
+			"packaged_seconds", snapshot.seconds())
+		return false
+	}
+	return true
+}
+
+// join waits for a stream to cover startSeconds. An unpublished stream (only
+// joined for its own start position) needs its startup buffer; a published
+// stream needs the buffer past the requested position.
+func (m *Manager) join(
+	parent context.Context,
+	startupContext context.Context,
+	playbackID string,
+	stream *runningStream,
+	startSeconds float64,
+) (Stream, error) {
+	m.unpark(playbackID, stream)
+	if !stream.published.Load() {
+		if err := m.waitForMedia(startupContext, stream, float64(m.bufferSeconds), "startup"); err != nil {
+			return Stream{}, m.joinFailure(parent, playbackID, stream, err, false)
+		}
+		if err := m.publish(startupContext, playbackID, stream); err != nil {
+			return Stream{}, m.joinFailure(parent, playbackID, stream, err, false)
+		}
+		return stream.info, nil
+	}
+	position := max(0, stream.timeline.playerSecondsForMedia(startSeconds))
+	stream.setPlayhead(position)
+	m.applyThrottle(playbackID, stream)
+	if err := m.waitForMedia(startupContext, stream, position+float64(m.bufferSeconds), "resume"); err != nil {
+		packaged := stream.observe().seconds()
+		if errors.Is(err, context.DeadlineExceeded) && parent.Err() == nil && stream.producerError() == nil &&
+			packaged > position {
+			// The position is packaged; let the client play what exists while the
+			// source catches up rather than failing a working release.
+			m.logger.Warn("resuming HLS stream before its buffer refilled",
+				"playback_id", playbackID, "requested_start_seconds", startSeconds,
+				"packaged_seconds", packaged)
+			return stream.info, nil
+		}
+		return Stream{}, m.joinFailure(parent, playbackID, stream, err, true)
+	}
+	m.logger.Info("reused prepared HLS stream", "playback_id", playbackID,
+		"requested_start_seconds", startSeconds,
+		"timeline_origin_seconds", stream.info.TimelineOriginSeconds,
+		"packaged_seconds", stream.observe().seconds())
+	return stream.info, nil
+}
+
+// joinFailure classifies a failed wait. A waiter that goes away leaves the
+// shared packager alone; a slow source keeps packaging; only a stopped
+// packager is a failure.
+func (m *Manager) joinFailure(parent context.Context, playbackID string, stream *runningStream, err error, published bool) error {
+	if parentErr := parent.Err(); parentErr != nil {
+		return parentErr
+	}
+	if stream.lifetime.ctx.Err() != nil {
+		return context.Canceled
+	}
+	if producerErr := stream.producerError(); producerErr != nil {
+		m.stopPlaybackStream(playbackID, stream.lifetime)
+		m.forgetProbe(playbackID, stream.lifetime)
+		return m.preferSourceUnavailable(playbackID, producerErr)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		snapshot := stream.observe()
+		m.logger.Warn("HLS stream is still buffering", "playback_id", playbackID,
+			"published", published, "packaged_segments", len(snapshot.segmentEnds),
+			"packaged_seconds", snapshot.seconds(),
+			"seconds_since_progress", time.Since(snapshot.lastProgress).Seconds())
+		return fmt.Errorf("%w: %.1f seconds packaged", ErrBuffering, snapshot.seconds())
+	}
+	// The packaged output could not be verified; keeping it would serve a
+	// timeline the client cannot map.
+	m.stopPlaybackStream(playbackID, stream.lifetime)
+	m.forgetProbe(playbackID, stream.lifetime)
+	return err
+}
+
+// launch probes the source and starts a packager, registered but unpublished.
+func (m *Manager) launch(
+	ctx context.Context,
+	playbackID string,
+	lifetime *playbackLifetime,
+	startSeconds float64,
+	preferredLanguages []string,
+	bitmapSubtitleIndex int,
+	audioStreamIndex int,
+) (*runningStream, error) {
+	sourceURL := m.sourceURL(playbackID)
 	probeSource, _ := m.sourceForProbe(playbackID, sourceURL)
-	probe, err := m.probePlayback(startupContext, playbackID, probeSource, lifetime)
+	probe, err := m.probePlayback(ctx, playbackID, probeSource, lifetime)
 	if err != nil {
-		return Stream{}, m.preferSourceUnavailable(playbackID, err)
+		return nil, m.preferSourceUnavailable(playbackID, err)
 	}
-	codec, duration, err := compatibleVideo(probe)
+	video, err := compatibleVideo(probe)
 	if err != nil {
-		return Stream{}, err
+		return nil, err
 	}
-	audioIndex := -1
-	audioLanguage := ""
+	preferredAudioIndex := -1
+	if audio, found := preferredAudioStream(probe, preferredLanguages); found {
+		preferredAudioIndex = audio.Index
+	}
+	audioIndex := preferredAudioIndex
 	if audioStreamIndex >= 0 {
 		if !hasAudioStream(probe, audioStreamIndex) {
-			return Stream{}, fmt.Errorf("audio track %d is unavailable", audioStreamIndex)
+			return nil, fmt.Errorf("audio track %d is unavailable", audioStreamIndex)
 		}
 		audioIndex = audioStreamIndex
-	} else if audio, found := preferredAudioStream(probe, preferredLanguages); found {
-		audioIndex = audio.Index
-		audioLanguage = canonicalLanguage(audio.Tags.Language)
 	}
-	if audioIndex >= 0 {
-		for _, stream := range probe.Streams {
-			if stream.Index == audioIndex {
-				audioLanguage = canonicalLanguage(stream.Tags.Language)
-				break
-			}
+	audioLanguage := ""
+	for _, stream := range probe.Streams {
+		if stream.Index == audioIndex {
+			audioLanguage = canonicalLanguage(stream.Tags.Language)
 		}
 	}
 	subtitles := supportedSubtitles(probe)
 	if bitmapSubtitleIndex >= 0 && !hasBitmapSubtitle(subtitles, bitmapSubtitleIndex) {
-		return Stream{}, fmt.Errorf("bitmap subtitle track %d is unavailable", bitmapSubtitleIndex)
+		return nil, fmt.Errorf("bitmap subtitle track %d is unavailable", bitmapSubtitleIndex)
 	}
-	timeline := newPlaybackTimeline(startSeconds)
+	var textSubtitles []int
+	for _, track := range subtitles {
+		if track.Kind == "text" {
+			textSubtitles = append(textSubtitles, track.Index)
+		}
+	}
+	outputCodec := video.codec
+	if bitmapSubtitleIndex >= 0 {
+		outputCodec = "h264"
+	}
 
 	// A retired generation can still be reaping children while a replay starts.
 	// Never let its cleanup touch the replacement's assets.
 	dir, err := os.MkdirTemp(m.dataDir, playbackID+"-")
 	if err != nil {
-		return Stream{}, fmt.Errorf("create playback HLS directory: %w", err)
+		return nil, fmt.Errorf("create playback HLS directory: %w", err)
 	}
-	logFile, err := os.OpenFile(filepath.Join(dir, "ffmpeg.log"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	logPath := filepath.Join(dir, "ffmpeg.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		_ = os.RemoveAll(dir)
-		return Stream{}, fmt.Errorf("create FFmpeg log: %w", err)
+		return nil, fmt.Errorf("create FFmpeg log: %w", err)
 	}
 
 	streamContext, cancelSource := m.monitorSource(lifetime.ctx, playbackID)
-	cancel := func() { cancelSource(context.Canceled) }
-	args := m.ffmpegArgs(sourceURL, dir, codec, timeline, audioIndex, bitmapSubtitleIndex)
+	timeline := newPlaybackTimeline(startSeconds)
+	args := m.ffmpegArgs(sourceURL, dir, packagerPlan{
+		codec:               video.codec,
+		frameRate:           video.frameRate,
+		timeline:            timeline,
+		audioStreamIndex:    audioIndex,
+		bitmapSubtitleIndex: bitmapSubtitleIndex,
+		textSubtitles:       textSubtitles,
+	})
 	command := exec.CommandContext(streamContext, m.ffmpegPath, args...)
 	command.Stdout = logFile
 	command.Stderr = logFile
-	if err := command.Start(); err != nil {
-		cancel()
-		logFile.Close()
-		_ = os.RemoveAll(dir)
-		return Stream{}, fmt.Errorf("start FFmpeg: %w", err)
-	}
-	outputCodec := codec
-	if bitmapSubtitleIndex >= 0 {
-		outputCodec = "h264"
-	}
+	now := time.Now()
 	stream := &runningStream{
-		lifetime: lifetime,
+		lifetime:            lifetime,
+		dir:                 dir,
+		ctx:                 streamContext,
+		cancel:              func() { cancelSource(context.Canceled) },
+		done:                make(chan struct{}),
+		command:             command,
+		startedAt:           now,
+		requestedSeconds:    startSeconds,
+		languages:           append([]string(nil), preferredLanguages...),
+		bitmapSubtitleIndex: bitmapSubtitleIndex,
+		audioStreamIndex:    audioIndex,
+		preferredAudioIndex: preferredAudioIndex,
+		bandwidth:           estimatedBandwidth(probe),
+		timeline:            timeline,
+		lastProgress:        now,
 		info: Stream{
 			PlaybackID: playbackID, RequestedStartSeconds: startSeconds,
-			TimelineOriginSeconds:   timeline.originSeconds,
-			PlayerTimeOffsetSeconds: timeline.playerTimeOffsetSeconds,
-			DurationSeconds:         duration, VideoCodec: outputCodec, Subtitles: subtitles,
+			DurationSeconds: video.duration, VideoCodec: outputCodec, Subtitles: subtitles,
 			BurnedSubtitleIndex: optionalIndex(bitmapSubtitleIndex),
 			AudioTracks:         supportedAudioTracks(probe),
 			AudioStreamIndex:    optionalIndex(audioIndex),
 		},
-		dir:                 dir,
-		sourceURL:           sourceURL,
-		timeline:            timeline,
-		ctx:                 streamContext,
-		cancel:              cancel,
-		done:                make(chan struct{}),
-		command:             command,
-		languages:           append([]string(nil), preferredLanguages...),
-		bitmapSubtitleIndex: bitmapSubtitleIndex,
-		audioStreamIndex:    audioIndex,
-		subtitleIndex:       -1,
+	}
+	if err := command.Start(); err != nil {
+		stream.cancel()
+		logFile.Close()
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("start FFmpeg: %w", err)
 	}
 	go func() {
 		err := command.Wait()
 		_ = logFile.Close()
+		if err == nil && sourceEndedEarly(logPath) {
+			err = errSourceEndedEarly
+		}
 		stream.errMu.Lock()
 		stream.err = err
 		stream.errMu.Unlock()
 		close(stream.done)
 		if streamContext.Err() == nil {
-			segments, seconds, complete := playlistStatus(dir)
-			if err != nil || !complete {
+			snapshot := stream.observe()
+			if err != nil || !snapshot.complete {
 				m.logger.Warn("HLS packager stopped", "playback_id", playbackID, "error", err,
-					"packaged_segments", segments, "packaged_seconds", seconds, "complete", complete,
-					"details", tailFile(filepath.Join(dir, "ffmpeg.log"), 4096))
+					"packaged_segments", len(snapshot.segmentEnds), "packaged_seconds", snapshot.seconds(),
+					"complete", snapshot.complete, "details", tailFile(logPath, 4096))
 			}
 		}
 	}()
+	m.mu.Lock()
+	if m.playbacks[playbackID] != lifetime || lifetime.ctx.Err() != nil {
+		m.mu.Unlock()
+		stream.cancel()
+		<-stream.done
+		_ = os.RemoveAll(dir)
+		return nil, context.Canceled
+	}
+	m.streams[playbackID] = stream
+	m.mu.Unlock()
+	m.logger.Info("HLS packager started", "playback_id", playbackID, "codec", outputCodec,
+		"audio_stream_index", audioIndex, "audio_language", audioLanguage,
+		"text_subtitle_tracks", len(textSubtitles), "burned_subtitle_index", bitmapSubtitleIndex,
+		"requested_start_seconds", startSeconds)
+	go m.monitorStream(playbackID, stream)
+	return stream, nil
+}
 
-	stopStartingStream := func() {
-		m.stopStream(playbackID, stream)
-		m.forgetProbe(playbackID, lifetime)
-	}
-	if err := m.waitUntilReady(startupContext, stream); err != nil {
-		stopStartingStream()
-		return Stream{}, m.preferSourceUnavailable(playbackID, err)
-	}
-	if startSeconds > 0 {
-		anchor, err := readPackagerSourceAnchor(
-			filepath.Join(dir, sourceVideoAnchorFileName), startSeconds,
-		)
-		if err != nil {
-			stopStartingStream()
-			return Stream{}, fmt.Errorf("verify packaged HLS source anchor: %w", err)
-		}
-		timeline.setSourceVideoAnchor(anchor)
-	}
-	packagedStart, err := m.probePackagedTimelineStart(startupContext, dir)
+// publish verifies the packaged timeline and exposes the stream's assets.
+func (m *Manager) publish(ctx context.Context, playbackID string, stream *runningStream) error {
+	timeline := stream.timeline
+	anchor, anchorErr := readPackagerSourceAnchor(filepath.Join(stream.dir, sourceVideoAnchorFileName))
+	packagedStart, err := m.probePackagedTimelineStart(ctx, stream.dir)
 	if err != nil {
-		stopStartingStream()
-		return Stream{}, fmt.Errorf("verify packaged HLS timeline: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf("verify packaged HLS timeline: %w", err)
 	}
-	if err := timeline.alignToPackagedVideo(packagedStart, bitmapSubtitleIndex < 0); err != nil {
-		stopStartingStream()
-		return Stream{}, fmt.Errorf("verify packaged HLS timeline: %w", err)
+	for _, warning := range timeline.alignToPackagedVideo(anchor, anchorErr, packagedStart, stream.bitmapSubtitleIndex < 0) {
+		m.logger.Warn("HLS timeline check", "playback_id", playbackID, "warning", warning)
 	}
 	if err := stream.producerError(); err != nil {
-		stopStartingStream()
-		return Stream{}, m.preferSourceUnavailable(playbackID, err)
+		return err
 	}
 	stream.timeline = timeline
 	stream.info.TimelineOriginSeconds = timeline.originSeconds
 	stream.info.PlayerTimeOffsetSeconds = timeline.playerTimeOffsetSeconds
-	// Assets remain unreachable through AssetPath until both the source packet
-	// and packaged timeline have been verified.
 	m.mu.Lock()
-	if m.playbacks[playbackID] != lifetime || startupContext.Err() != nil || lifetime.ctx.Err() != nil {
+	if m.streams[playbackID] != stream || m.playbacks[playbackID] != stream.lifetime || stream.lifetime.ctx.Err() != nil {
 		m.mu.Unlock()
-		stopStartingStream()
-		if err := startupContext.Err(); err != nil {
-			return Stream{}, err
-		}
-		return Stream{}, context.Canceled
+		return context.Canceled
 	}
-	m.streams[playbackID] = stream
+	if err := ctx.Err(); err != nil {
+		m.mu.Unlock()
+		return err
+	}
+	stream.published.Store(true)
 	m.mu.Unlock()
-	m.logger.Info("HLS stream ready", "playback_id", playbackID, "codec", outputCodec,
-		"audio_stream_index", audioIndex, "audio_language", audioLanguage,
-		"subtitle_tracks", len(subtitles), "burned_subtitle_index", bitmapSubtitleIndex,
-		"requested_start_seconds", startSeconds,
+	snapshot := stream.observe()
+	m.logger.Info("HLS stream ready", "playback_id", playbackID, "codec", stream.info.VideoCodec,
+		"startup_seconds", time.Since(stream.startedAt).Seconds(),
+		"packaged_seconds", snapshot.seconds(),
+		"requested_start_seconds", timeline.requestedSeconds,
 		"source_seek_seconds", timeline.seekSeconds,
 		"source_video_pts_seconds", timeline.sourceVideoPTSSeconds,
 		"timeline_origin_seconds", timeline.originSeconds,
@@ -595,120 +842,7 @@ func (m *Manager) Start(
 		"hls_first_video_pts", packagedStart.videoPTS,
 		"hls_first_video_dts", packagedStart.videoDTS,
 		"hls_first_audio_pts", packagedStart.audioPTS)
-	return stream.info, nil
-}
-
-func (m *Manager) preparedStreamNeedsGrowth(
-	stream *runningStream,
-	wasParked bool,
-	complete bool,
-) bool {
-	if complete || wasParked {
-		return wasParked
-	}
-	playlistInfo, err := os.Stat(filepath.Join(stream.dir, "index.m3u8"))
-	return err != nil || time.Since(playlistInfo.ModTime()) > m.parkedResumeTimeout
-}
-
-func (m *Manager) sourceStallError(ctx context.Context, playbackID string, lifetime *playbackLifetime, cause error) error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if m.playbacks[playbackID] != lifetime || lifetime.ctx.Err() != nil {
-		return context.Canceled
-	}
-	if m.sourceStalled == nil {
-		return nil
-	}
-	return m.sourceStalled(playbackID, cause)
-}
-
-func (m *Manager) resumePreparedStream(
-	ctx context.Context,
-	playbackID string,
-	startSeconds float64,
-	preferredLanguages []string,
-	bitmapSubtitleIndex int,
-	audioStreamIndex int,
-	lifetime *playbackLifetime,
-) (Stream, bool, error) {
-	m.mu.RLock()
-	stream := m.streams[playbackID]
-	m.mu.RUnlock()
-	if stream == nil || stream.lifetime != lifetime || math.Abs(stream.timeline.requestedSeconds-startSeconds) > 0.5 ||
-		!equalStrings(stream.languages, preferredLanguages) ||
-		stream.bitmapSubtitleIndex != bitmapSubtitleIndex ||
-		stream.audioStreamIndex != audioStreamIndex {
-		return Stream{}, false, nil
-	}
-
-	stream.processMu.Lock()
-	if stream.producerError() != nil {
-		stream.processMu.Unlock()
-		return Stream{}, false, nil
-	}
-	m.mu.RLock()
-	isCurrent := m.streams[playbackID] == stream
-	m.mu.RUnlock()
-	if !isCurrent {
-		stream.processMu.Unlock()
-		return Stream{}, false, nil
-	}
-	wasParked := stream.parked
-	bufferedSegments, _, complete := playlistStatus(stream.dir)
-	needsGrowth := m.preparedStreamNeedsGrowth(stream, wasParked, complete)
-	if wasParked {
-		if err := stream.command.Process.Signal(syscall.SIGCONT); err != nil {
-			stream.processMu.Unlock()
-			m.logger.Warn("resume prepared HLS stream", "playback_id", playbackID, "error", err)
-			m.stopPlaybackStream(playbackID, lifetime)
-			return Stream{}, false, nil
-		}
-		stream.parked = false
-		stream.parkedAt = time.Time{}
-		if stream.parkTimer != nil {
-			stream.parkTimer.Stop()
-			stream.parkTimer = nil
-		}
-		m.logger.Info("resumed prepared HLS stream", "playback_id", playbackID,
-			"timeline_origin_seconds", stream.info.TimelineOriginSeconds)
-	}
-	stream.processMu.Unlock()
-
-	if needsGrowth {
-		if err := m.waitForPlaylistGrowth(ctx, stream, bufferedSegments); err != nil {
-			if ctx.Err() != nil {
-				return Stream{}, true, ctx.Err()
-			}
-			if lifetime.ctx.Err() != nil {
-				return Stream{}, true, lifetime.ctx.Err()
-			}
-			stalledErr := fmt.Errorf("prepared HLS stream did not advance: %w", err)
-			m.logger.Warn("prepared HLS stream did not advance",
-				"playback_id", playbackID, "requested_start_seconds", startSeconds,
-				"error", err)
-			m.stopPlaybackStream(playbackID, lifetime)
-			if !wasParked {
-				if sourceErr := m.sourceStallError(ctx, playbackID, lifetime, stalledErr); sourceErr != nil {
-					return Stream{}, true, sourceErr
-				}
-			}
-			return Stream{}, false, nil
-		}
-	}
-
-	startupContext, cancel := context.WithTimeout(ctx, m.startupTimeout)
-	defer cancel()
-	if err := m.waitUntilReady(startupContext, stream); err != nil {
-		if startupContext.Err() == nil {
-			m.stopPlaybackStream(playbackID, lifetime)
-			m.forgetProbe(playbackID, lifetime)
-		}
-		return Stream{}, true, err
-	}
-	return stream.info, true, nil
+	return nil
 }
 
 func (m *Manager) Prepared(
@@ -722,120 +856,14 @@ func (m *Manager) Prepared(
 	m.mu.RLock()
 	stream := m.streams[playbackID]
 	m.mu.RUnlock()
-	if stream == nil || math.Abs(stream.timeline.requestedSeconds-startSeconds) > 0.5 ||
-		!equalStrings(stream.languages, preferredLanguages) ||
-		stream.bitmapSubtitleIndex != bitmapSubtitleIndex ||
-		stream.audioStreamIndex != audioStreamIndex {
+	if stream == nil || !stream.published.Load() || math.Abs(stream.requestedSeconds-startSeconds) > 0.5 ||
+		!stream.matches(preferredLanguages, bitmapSubtitleIndex, audioStreamIndex) {
 		return false
 	}
 	if minimumSeconds <= 0 {
 		minimumSeconds = m.bufferSeconds
 	}
-	stream.processMu.Lock()
-	defer stream.processMu.Unlock()
-	_, _, complete := playlistStatus(stream.dir)
-	if stream.producerError() != nil || (!stream.parked && m.preparedStreamNeedsGrowth(stream, false, complete)) {
-		return false
-	}
-	return playlistReady(stream.dir, minimumSeconds)
-}
-
-func (m *Manager) resumeCoveredStream(
-	ctx context.Context,
-	playbackID string,
-	startSeconds float64,
-	preferredLanguages []string,
-	bitmapSubtitleIndex int,
-	audioStreamIndex int,
-	lifetime *playbackLifetime,
-) (Stream, bool, error) {
-	m.mu.RLock()
-	stream := m.streams[playbackID]
-	m.mu.RUnlock()
-	if stream == nil || stream.lifetime != lifetime || !equalStrings(stream.languages, preferredLanguages) ||
-		stream.bitmapSubtitleIndex != bitmapSubtitleIndex ||
-		stream.audioStreamIndex != audioStreamIndex {
-		return Stream{}, false, nil
-	}
-	stream.processMu.Lock()
-	if stream.producerError() != nil {
-		stream.processMu.Unlock()
-		return Stream{}, false, nil
-	}
-	m.mu.RLock()
-	isCurrent := m.streams[playbackID] == stream
-	m.mu.RUnlock()
-	if !isCurrent {
-		stream.processMu.Unlock()
-		return Stream{}, false, nil
-	}
-	bufferedSegments, packagedSeconds, complete := playlistStatus(stream.dir)
-	position := stream.timeline.playerSecondsForMedia(startSeconds)
-	// The event playlist retains every packaged segment, so a request inside
-	// the packaged range (with one segment of headroom) can seek within the
-	// existing stream instead of discarding it and re-downloading from scratch.
-	// Recovery requests land here after a client stall, where a rebuild would
-	// throw away the buffer and re-probe the source at the worst possible time.
-	headroom := float64(m.segmentSeconds)
-	if position < 0 || position > packagedSeconds-headroom {
-		stream.processMu.Unlock()
-		m.logger.Info("prepared HLS stream does not cover requested position; rebuilding",
-			"playback_id", playbackID, "requested_start_seconds", startSeconds,
-			"timeline_origin_seconds", stream.info.TimelineOriginSeconds,
-			"packaged_seconds", packagedSeconds)
-		return Stream{}, false, nil
-	}
-	wasParked := stream.parked
-	if wasParked {
-		if err := stream.command.Process.Signal(syscall.SIGCONT); err != nil {
-			stream.processMu.Unlock()
-			m.logger.Warn("resume covered HLS stream", "playback_id", playbackID, "error", err)
-			return Stream{}, false, nil
-		}
-		stream.parked = false
-		stream.parkedAt = time.Time{}
-		if stream.parkTimer != nil {
-			stream.parkTimer.Stop()
-			stream.parkTimer = nil
-		}
-	}
-	needsGrowth := m.preparedStreamNeedsGrowth(stream, wasParked, complete)
-	stream.processMu.Unlock()
-
-	// A retained event playlist can still cover the requested position after
-	// its source has stopped delivering pieces. Reusing that stale range lets
-	// the client play its last few buffered segments and enter the same recovery
-	// loop again. Confirm that an old or resumed playlist can still advance;
-	// healthy, actively growing streams keep the fast in-range reuse path.
-	if needsGrowth {
-		if err := m.waitForPlaylistGrowth(ctx, stream, bufferedSegments); err != nil {
-			if ctx.Err() != nil {
-				return Stream{}, false, ctx.Err()
-			}
-			if lifetime.ctx.Err() != nil {
-				return Stream{}, false, lifetime.ctx.Err()
-			}
-			stalledErr := fmt.Errorf("covered HLS stream did not advance: %w", err)
-			m.logger.Warn("covered HLS stream did not advance",
-				"playback_id", playbackID, "requested_start_seconds", startSeconds,
-				"packaged_seconds", packagedSeconds, "error", err)
-			if !wasParked {
-				if sourceErr := m.sourceStallError(ctx, playbackID, lifetime, stalledErr); sourceErr != nil {
-					return Stream{}, false, sourceErr
-				}
-			}
-			return Stream{}, false, nil
-		}
-		_, packagedSeconds, _ = playlistStatus(stream.dir)
-	}
-	if !playlistReady(stream.dir, m.bufferSeconds) {
-		return Stream{}, false, nil
-	}
-	m.logger.Info("reused prepared HLS stream for in-range position",
-		"playback_id", playbackID, "requested_start_seconds", startSeconds,
-		"timeline_origin_seconds", stream.info.TimelineOriginSeconds,
-		"packaged_seconds", packagedSeconds)
-	return stream.info, true, nil
+	return stream.producerError() == nil && playlistReady(stream.dir, float64(minimumSeconds))
 }
 
 func (m *Manager) Park(ctx context.Context, playbackID string, minimumSeconds int) error {
@@ -844,17 +872,15 @@ func (m *Manager) Park(ctx context.Context, playbackID string, minimumSeconds in
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	m.mu.RLock()
-	stream := m.streams[playbackID]
-	m.mu.RUnlock()
-	if stream == nil || stream.lifetime != lifetime {
+	stream := m.currentStream(playbackID, lifetime)
+	if stream == nil || !stream.published.Load() {
 		return os.ErrNotExist
 	}
 	if minimumSeconds <= 0 {
 		minimumSeconds = m.bufferSeconds
 	}
 	startTime := time.Now()
-	if err := m.waitUntilBuffered(ctx, stream, minimumSeconds); err != nil {
+	if err := m.waitForMedia(ctx, stream, float64(minimumSeconds), "prewarm"); err != nil {
 		return err
 	}
 	bufferWait := time.Since(startTime)
@@ -864,10 +890,7 @@ func (m *Manager) Park(ctx context.Context, playbackID string, minimumSeconds in
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	m.mu.RLock()
-	isCurrent := m.streams[playbackID] == stream
-	m.mu.RUnlock()
-	if !isCurrent {
+	if m.currentStream(playbackID, lifetime) != stream {
 		return os.ErrNotExist
 	}
 	select {
@@ -880,10 +903,11 @@ func (m *Manager) Park(ctx context.Context, playbackID string, minimumSeconds in
 	}
 	// Keep the same FFmpeg process and source connection so resuming preserves
 	// A/V timestamps while avoiding any additional download or packaging work.
-	if err := stream.command.Process.Signal(syscall.SIGSTOP); err != nil {
+	stream.parked = true
+	if err := stream.applyProcessStateLocked(); err != nil {
+		stream.parked = false
 		return fmt.Errorf("park HLS packager: %w", err)
 	}
-	stream.parked = true
 	stream.parkedAt = time.Now()
 	parkedAt := stream.parkedAt
 	stream.parkTimer = time.AfterFunc(m.parkedTTL, func() {
@@ -892,6 +916,49 @@ func (m *Manager) Park(ctx context.Context, playbackID string, minimumSeconds in
 	m.logger.Info("parked prepared HLS stream", "playback_id", playbackID,
 		"buffer_seconds", minimumSeconds, "buffer_wait_seconds", bufferWait.Seconds(),
 		"expires_in", m.parkedTTL)
+	return nil
+}
+
+func (m *Manager) unpark(playbackID string, stream *runningStream) {
+	stream.processMu.Lock()
+	defer stream.processMu.Unlock()
+	if !stream.parked {
+		return
+	}
+	stream.parked = false
+	stream.parkedAt = time.Time{}
+	if stream.parkTimer != nil {
+		stream.parkTimer.Stop()
+		stream.parkTimer = nil
+	}
+	if err := stream.applyProcessStateLocked(); err != nil {
+		m.logger.Warn("resume prepared HLS stream", "playback_id", playbackID, "error", err)
+		return
+	}
+	m.logger.Info("resumed prepared HLS stream", "playback_id", playbackID)
+}
+
+// applyProcessStateLocked stops FFmpeg while it is parked or throttled and
+// continues it otherwise. The caller holds processMu.
+func (stream *runningStream) applyProcessStateLocked() error {
+	want := stream.parked || stream.throttled
+	if want == stream.stopped {
+		return nil
+	}
+	select {
+	case <-stream.done:
+		stream.stopped = false
+		return nil
+	default:
+	}
+	signal := syscall.SIGCONT
+	if want {
+		signal = syscall.SIGSTOP
+	}
+	if err := stream.command.Process.Signal(signal); err != nil {
+		return err
+	}
+	stream.stopped = want
 	return nil
 }
 
@@ -918,6 +985,118 @@ func (m *Manager) expireParkedStream(playbackID string, stream *runningStream, p
 	m.stopStream(playbackID, stream)
 }
 
+// monitorStream samples packaging progress and pauses FFmpeg while it is far
+// ahead of the client, until the packager exits or is stopped.
+func (m *Manager) monitorStream(playbackID string, stream *runningStream) {
+	ticker := time.NewTicker(monitorInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stream.ctx.Done():
+			return
+		case <-stream.done:
+			return
+		case <-ticker.C:
+		}
+		before := stream.segmentCount()
+		snapshot := stream.observe()
+		if before == 0 && len(snapshot.segmentEnds) > 0 {
+			m.logger.Info("HLS first segment packaged", "playback_id", playbackID,
+				"seconds_since_start", time.Since(stream.startedAt).Seconds())
+		}
+		m.applyThrottle(playbackID, stream)
+	}
+}
+
+func (m *Manager) applyThrottle(playbackID string, stream *runningStream) {
+	snapshot := stream.observe()
+	lead := snapshot.seconds() - snapshot.playheadSeconds
+	stream.processMu.Lock()
+	defer stream.processMu.Unlock()
+	throttle := stream.throttled
+	switch {
+	case snapshot.complete:
+		throttle = false
+	case !throttle && lead > maxLeadSeconds:
+		throttle = true
+	case throttle && lead < resumeLeadSeconds:
+		throttle = false
+	}
+	if throttle == stream.throttled {
+		return
+	}
+	stream.throttled = throttle
+	if err := stream.applyProcessStateLocked(); err != nil {
+		stream.throttled = !throttle
+		return
+	}
+	m.logger.Info("HLS packager pacing", "playback_id", playbackID, "paused", throttle,
+		"packaged_seconds", snapshot.seconds(), "playhead_seconds", snapshot.playheadSeconds)
+}
+
+// packagingSnapshot is one reading of the packager's event playlist.
+type packagingSnapshot struct {
+	segmentEnds     []float64
+	complete        bool
+	lastProgress    time.Time
+	playheadSeconds float64
+}
+
+func (snapshot packagingSnapshot) seconds() float64 {
+	if len(snapshot.segmentEnds) == 0 {
+		return 0
+	}
+	return snapshot.segmentEnds[len(snapshot.segmentEnds)-1]
+}
+
+// observe reads the event playlist and records when it last gained a segment.
+func (stream *runningStream) observe() packagingSnapshot {
+	playlist, _ := readMediaPlaylist(stream.dir)
+	stream.progressMu.Lock()
+	defer stream.progressMu.Unlock()
+	if len(playlist.durations) > len(stream.segmentEnds) {
+		ends := make([]float64, len(playlist.durations))
+		total := 0.0
+		for index, duration := range playlist.durations {
+			total += duration
+			ends[index] = total
+		}
+		stream.segmentEnds = ends
+		stream.lastProgress = time.Now()
+	}
+	stream.complete = stream.complete || playlist.complete
+	return packagingSnapshot{
+		segmentEnds:     stream.segmentEnds,
+		complete:        stream.complete,
+		lastProgress:    stream.lastProgress,
+		playheadSeconds: stream.playheadSeconds,
+	}
+}
+
+func (stream *runningStream) segmentCount() int {
+	stream.progressMu.Lock()
+	defer stream.progressMu.Unlock()
+	return len(stream.segmentEnds)
+}
+
+func (stream *runningStream) setPlayhead(seconds float64) {
+	stream.progressMu.Lock()
+	stream.playheadSeconds = seconds
+	stream.progressMu.Unlock()
+}
+
+// noteSegmentRequest moves the playhead to the end of a segment the client fetched.
+func (stream *runningStream) noteSegmentRequest(number int) {
+	snapshot := stream.observe()
+	if number < 0 || number >= len(snapshot.segmentEnds) {
+		return
+	}
+	stream.setPlayhead(snapshot.segmentEnds[number])
+}
+
+// StartSubtitle validates a text track for clients that fetch the full WebVTT
+// file. Every text track is already extracted by the packager in lockstep with
+// the video, so there is nothing to start.
 func (m *Manager) StartSubtitle(_ context.Context, playbackID string, index int) error {
 	if !validPlaybackID(playbackID) || index < 0 {
 		return os.ErrNotExist
@@ -925,76 +1104,88 @@ func (m *Manager) StartSubtitle(_ context.Context, playbackID string, index int)
 	m.mu.RLock()
 	stream := m.streams[playbackID]
 	m.mu.RUnlock()
-	if stream == nil || !hasTextSubtitle(stream.info.Subtitles, index) {
+	if stream == nil || !stream.published.Load() || !hasTextSubtitle(stream.info.Subtitles, index) {
 		return os.ErrNotExist
 	}
-
-	stream.subtitleMu.Lock()
-	defer stream.subtitleMu.Unlock()
-	if stream.subtitleIndex == index && stream.subtitleCancel != nil {
-		return nil
-	}
-	m.stopSubtitleLocked(stream)
-
-	for _, match := range []string{"subtitle-*.vtt", "subtitle-*.log"} {
-		paths, _ := filepath.Glob(filepath.Join(stream.dir, match))
-		for _, path := range paths {
-			_ = os.Remove(path)
-		}
-	}
-
-	logPath := filepath.Join(stream.dir, fmt.Sprintf("subtitle-%d.log", index))
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("create subtitle log: %w", err)
-	}
-	subtitleContext, cancel := context.WithCancel(stream.ctx)
-	args := m.subtitleArgs(stream, index)
-	command := exec.CommandContext(subtitleContext, m.ffmpegPath, args...)
-	command.Stdout = logFile
-	command.Stderr = logFile
-	if err := command.Start(); err != nil {
-		cancel()
-		_ = logFile.Close()
-		return fmt.Errorf("start subtitle conversion: %w", err)
-	}
-	stream.subtitleIndex = index
-	stream.subtitleCancel = cancel
-	stream.subtitleDone = make(chan struct{})
-	done := stream.subtitleDone
-	go func() {
-		err := command.Wait()
-		_ = logFile.Close()
-		close(done)
-		if err != nil && subtitleContext.Err() == nil {
-			m.logger.Warn("subtitle conversion stopped", "playback_id", playbackID, "index", index, "error", err)
-		}
-	}()
-	m.logger.Info("subtitle conversion started", "playback_id", playbackID, "index", index)
 	return nil
 }
 
-func (m *Manager) AssetPath(playbackID, name string) (string, error) {
-	if !validPlaybackID(playbackID) || !validAssetName(name) {
-		return "", os.ErrNotExist
+// Asset resolves one HLS resource. Playlists are generated so they carry the
+// playback start hint and the native subtitle renditions.
+func (m *Manager) Asset(playbackID, name string) (Asset, error) {
+	asset, ok := parseAssetName(name)
+	if !validPlaybackID(playbackID) || !ok {
+		return Asset{}, os.ErrNotExist
 	}
 	m.mu.RLock()
 	stream := m.streams[playbackID]
 	m.mu.RUnlock()
-	if stream == nil {
-		return "", os.ErrNotExist
+	if stream == nil || !stream.published.Load() {
+		return Asset{}, os.ErrNotExist
 	}
-	if name == "index.m3u8" {
+	if asset.subtitleIndex >= 0 && !hasTextSubtitle(stream.info.Subtitles, asset.subtitleIndex) {
+		return Asset{}, os.ErrNotExist
+	}
+	switch asset.kind {
+	case assetMasterPlaylist:
 		if err := stream.producerError(); err != nil {
-			return "", err
+			return Asset{}, err
 		}
+		return Asset{Content: masterPlaylist(stream.info.Subtitles, stream.bandwidth), ContentType: playlistContentType}, nil
+	case assetMediaPlaylist:
+		if err := stream.producerError(); err != nil {
+			return Asset{}, err
+		}
+		playlist, err := os.ReadFile(filepath.Join(stream.dir, "index.m3u8"))
+		if err != nil {
+			return Asset{}, os.ErrNotExist
+		}
+		return Asset{Content: withPlaybackStart(playlist), ContentType: playlistContentType}, nil
+	case assetSubtitlePlaylist:
+		if err := stream.producerError(); err != nil {
+			return Asset{}, err
+		}
+		playlist, final := stream.subtitleSource()
+		return Asset{
+			Content:     subtitlePlaylist(playlist, asset.subtitleIndex, final),
+			ContentType: playlistContentType,
+		}, nil
+	case assetSubtitleSegment:
+		playlist, final := stream.subtitleSource()
+		start, end, ok := subtitleSegmentWindow(playlist, asset.sequence, final)
+		if !ok {
+			return Asset{}, os.ErrNotExist
+		}
+		contents, _ := os.ReadFile(filepath.Join(stream.dir, subtitleFileName(asset.subtitleIndex)))
+		return Asset{
+			Content: subtitleSegment(
+				parseWebVTTCues(contents), start, end,
+				stream.timeline.sourceVideoPTSSeconds, stream.timeline.packagedVideoPTSSeconds,
+			),
+			ContentType: webVTTContentType,
+		}, nil
+	case assetMediaSegment:
+		stream.noteSegmentRequest(asset.sequence)
 	}
 	path := filepath.Join(stream.dir, name)
 	info, err := os.Stat(path)
 	if err != nil || !info.Mode().IsRegular() {
-		return "", os.ErrNotExist
+		return Asset{}, os.ErrNotExist
 	}
-	return path, nil
+	return Asset{Path: path, ContentType: asset.contentType()}, nil
+}
+
+// subtitleSource returns the video playlist that subtitle segments follow and
+// whether it is final: the packager exited cleanly, so every cue is written.
+func (stream *runningStream) subtitleSource() (mediaPlaylist, bool) {
+	playlist, _ := readMediaPlaylist(stream.dir)
+	final := false
+	select {
+	case <-stream.done:
+		final = playlist.complete && stream.producerError() == nil
+	default:
+	}
+	return playlist, final
 }
 
 func (m *Manager) Stop(playbackID string) {
@@ -1035,44 +1226,28 @@ func (m *Manager) stopPlaybackStream(playbackID string, lifetime *playbackLifeti
 }
 
 func (m *Manager) stopStream(playbackID string, stream *runningStream) {
-	stream.processMu.Lock()
-	stream.parked = false
-	stream.parkedAt = time.Time{}
-	if stream.parkTimer != nil {
-		stream.parkTimer.Stop()
-		stream.parkTimer = nil
-	}
-	stream.processMu.Unlock()
-	segments, seconds, complete := playlistStatus(stream.dir)
-	m.logger.Info("removing HLS stream", "playback_id", playbackID,
-		"packaged_segments", segments, "packaged_seconds", seconds, "complete", complete)
-	stream.subtitleMu.Lock()
-	m.stopSubtitleLocked(stream)
-	stream.subtitleMu.Unlock()
-	stream.cancel()
-	select {
-	case <-stream.done:
-	case <-time.After(5 * time.Second):
-	}
-	if err := os.RemoveAll(stream.dir); err != nil {
-		m.logger.Warn("remove HLS stream", "playback_id", playbackID, "error", err)
-	}
-}
-
-func (m *Manager) stopSubtitleLocked(stream *runningStream) {
-	if stream.subtitleCancel == nil {
-		return
-	}
-	stream.subtitleCancel()
-	if stream.subtitleDone != nil {
+	stream.stopOnce.Do(func() {
+		stream.processMu.Lock()
+		stream.parked = false
+		stream.parkedAt = time.Time{}
+		if stream.parkTimer != nil {
+			stream.parkTimer.Stop()
+			stream.parkTimer = nil
+		}
+		stream.processMu.Unlock()
+		snapshot := stream.observe()
+		m.logger.Info("removing HLS stream", "playback_id", playbackID,
+			"packaged_segments", len(snapshot.segmentEnds), "packaged_seconds", snapshot.seconds(),
+			"complete", snapshot.complete)
+		stream.cancel()
 		select {
-		case <-stream.subtitleDone:
+		case <-stream.done:
 		case <-time.After(5 * time.Second):
 		}
-	}
-	stream.subtitleIndex = -1
-	stream.subtitleCancel = nil
-	stream.subtitleDone = nil
+		if err := os.RemoveAll(stream.dir); err != nil {
+			m.logger.Warn("remove HLS stream", "playback_id", playbackID, "error", err)
+		}
+	})
 }
 
 func (m *Manager) Close() error {
@@ -1190,10 +1365,9 @@ func (m *Manager) closeProbes() {
 	m.probeWG.Wait()
 }
 
-// monitorSource cancels a probe or packager when the torrent engine exhausts
-// the playback's shared serve-readiness deadline. This prevents a child
-// FFprobe or FFmpeg process from continuing to retry source requests until the
-// much longer generic HLS startup timeout.
+// monitorSource cancels a probe or packager when the source engine reports the
+// playback's source as unavailable. This is the engine's hard verdict; the
+// packager never derives one from a stall.
 func (m *Manager) monitorSource(parent context.Context, playbackID string) (context.Context, context.CancelCauseFunc) {
 	ctx, cancel := context.WithCancelCause(parent)
 	if m.sourceUnavailable == nil {
@@ -1240,7 +1414,9 @@ func (m *Manager) probe(parent context.Context, sourceURL string) (mediaProbe, e
 	defer cancel()
 	command := exec.CommandContext(ctx, m.ffprobePath,
 		"-v", "error",
-		"-show_entries", "stream=index,codec_name,codec_type,channels:stream_tags=language,title:stream_disposition=default,forced:stream_side_data=side_data_type:format=start_time,duration",
+		// stream_side_data_list (all entries) is accepted by FFprobe 4.4 through
+		// 8.x; the newer per-entry stream_side_data section is not.
+		"-show_entries", "stream=index,codec_name,codec_type,channels,avg_frame_rate:stream_tags=language,title:stream_disposition=default,forced:stream_side_data_list:format=start_time,duration,bit_rate",
 		"-of", "json",
 		sourceURL,
 	)
@@ -1258,10 +1434,9 @@ func (m *Manager) probe(parent context.Context, sourceURL string) (mediaProbe, e
 	return probe, nil
 }
 
-func readPackagerSourceAnchor(
-	path string,
-	requestedSeconds float64,
-) (sourceVideoAnchor, error) {
+// readPackagerSourceAnchor reads the first source video packet (or decoded
+// frame, for burn-in) that the packager's own seek delivered.
+func readPackagerSourceAnchor(path string) (sourceVideoAnchor, error) {
 	contents, err := os.ReadFile(path)
 	if err != nil {
 		return sourceVideoAnchor{}, fmt.Errorf("read source video packet: %w", err)
@@ -1327,15 +1502,6 @@ func readPackagerSourceAnchor(
 	}
 	if mediaPTS < 0 {
 		mediaPTS = 0
-	}
-	// Compare against the millisecond seek value actually passed to FFmpeg, not
-	// the higher-precision API value that was rounded to create that command.
-	commandSeek, err := strconv.ParseFloat(strconv.FormatFloat(requestedSeconds, 'f', 3, 64), 64)
-	if err != nil || mediaPTS > commandSeek+timelineTimestampEpsilon {
-		return sourceVideoAnchor{}, fmt.Errorf(
-			"source video packet timestamp %.6f follows packager seek %.6f",
-			mediaPTS, commandSeek,
-		)
 	}
 	return sourceVideoAnchor{
 		ptsSeconds: mediaPTS,
@@ -1422,25 +1588,61 @@ func parseTimelineTimestamp(value string) (float64, error) {
 	return seconds, nil
 }
 
-func compatibleVideo(probe mediaProbe) (string, float64, error) {
+type videoInfo struct {
+	codec     string
+	duration  float64
+	frameRate float64
+}
+
+func compatibleVideo(probe mediaProbe) (videoInfo, error) {
 	for _, stream := range probe.Streams {
 		if stream.CodecType != "video" {
 			continue
 		}
 		codec := strings.ToLower(stream.CodecName)
 		if codec != "h264" && codec != "hevc" {
-			return "", 0, fmt.Errorf("video codec %q is not supported by native Apple playback", codec)
+			return videoInfo{}, fmt.Errorf("video codec %q is not supported by native Apple playback", codec)
 		}
 		for _, sideData := range stream.SideDataList {
 			name := strings.ToLower(sideData.SideDataType)
 			if strings.Contains(name, "dovi") || strings.Contains(name, "dolby vision") {
-				return "", 0, errors.New("this Dolby Vision profile is not supported by native Apple playback")
+				return videoInfo{}, errors.New("this Dolby Vision profile is not supported by native Apple playback")
 			}
 		}
 		duration, _ := strconv.ParseFloat(probe.Format.Duration, 64)
-		return codec, duration, nil
+		return videoInfo{codec: codec, duration: duration, frameRate: parseFrameRate(stream.AvgFrameRate)}, nil
 	}
-	return "", 0, errors.New("playback has no video stream")
+	return videoInfo{}, errors.New("playback has no video stream")
+}
+
+func parseFrameRate(value string) float64 {
+	numerator, denominator, found := strings.Cut(value, "/")
+	top, err := strconv.ParseFloat(numerator, 64)
+	if err != nil {
+		return 0
+	}
+	bottom := 1.0
+	if found {
+		if bottom, err = strconv.ParseFloat(denominator, 64); err != nil || bottom <= 0 {
+			return 0
+		}
+	}
+	rate := top / bottom
+	if math.IsNaN(rate) || math.IsInf(rate, 0) || rate <= 0 || rate > 240 {
+		return 0
+	}
+	return rate
+}
+
+// estimatedBandwidth is the master playlist's peak bits per second: the source
+// bit rate with headroom, plus the packaged audio.
+func estimatedBandwidth(probe mediaProbe) int {
+	const fallback = 20_000_000
+	bitRate, err := strconv.ParseFloat(probe.Format.BitRate, 64)
+	if err != nil || bitRate <= 0 || math.IsInf(bitRate, 0) {
+		return fallback
+	}
+	return int(bitRate*1.25) + 256_000
 }
 
 // isCommentaryAudioTrack reports whether the stream looks like a commentary
@@ -1557,6 +1759,7 @@ func supportedSubtitles(probe mediaProbe) []SubtitleTrack {
 			Kind:     kind,
 		})
 	}
+	assignRenditionNames(tracks)
 	return tracks
 }
 
@@ -1626,82 +1829,98 @@ func canonicalLanguage(language string) string {
 	return language
 }
 
-func (m *Manager) ffmpegArgs(
-	sourceURL string,
-	dir string,
-	codec string,
-	timeline playbackTimeline,
-	audioStreamIndex int,
-	bitmapSubtitleIndex int,
-) []string {
-	// Allow one segment beyond the target buffer to be packaged without rate limiting.
-	// Stream-copied video can only cut on keyframes, so segment lengths may exceed the target.
-	initialBurstSeconds := m.bufferSeconds + m.segmentSeconds
+type packagerPlan struct {
+	codec               string
+	frameRate           float64
+	timeline            playbackTimeline
+	audioStreamIndex    int
+	bitmapSubtitleIndex int
+	textSubtitles       []int
+}
+
+// ffmpegArgs builds the single packager process: a source anchor record, one
+// full WebVTT file per text subtitle track, and the fMP4 HLS output. Every
+// output reads the same demuxed packets, so subtitles advance with the video.
+// The HLS playlist is the last argument.
+func (m *Manager) ffmpegArgs(sourceURL string, dir string, plan packagerPlan) []string {
 	args := []string{
 		"-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
 		"-copyts", "-start_at_zero",
-		"-readrate", strconv.FormatFloat(m.readRate, 'f', -1, 64),
-		"-readrate_initial_burst", strconv.Itoa(initialBurstSeconds),
 	}
-	if timeline.seekSeconds > 0 {
+	if strings.HasPrefix(sourceURL, "http://") || strings.HasPrefix(sourceURL, "https://") {
+		args = append(args,
+			"-rw_timeout", strconv.FormatInt(sourceReadTimeout.Microseconds(), 10),
+			"-reconnect", "1", "-reconnect_on_network_error", "1",
+			"-reconnect_delay_max", strconv.Itoa(sourceReconnectDelayMaxSeconds),
+		)
+	}
+	if plan.timeline.seekSeconds > 0 {
 		// Preserve both streams' source timestamps through the keyframe seek, then shift
 		// the shared timeline together. The final source-to-HLS origin is measured from
 		// the packaged first video packet rather than inferred from these FFmpeg options.
-		args = append(args, "-noaccurate_seek", "-ss", strconv.FormatFloat(timeline.seekSeconds, 'f', 3, 64))
-	}
-	audioMap := "0:a:0?"
-	if audioStreamIndex >= 0 {
-		audioMap = fmt.Sprintf("0:%d?", audioStreamIndex)
+		args = append(args, "-noaccurate_seek", "-ss", strconv.FormatFloat(plan.timeline.seekSeconds, 'f', 3, 64))
 	}
 	args = append(args, "-i", sourceURL)
-	if bitmapSubtitleIndex >= 0 {
+	burnIn := plan.bitmapSubtitleIndex >= 0
+	if burnIn {
 		args = append(args,
-			"-filter_complex", fmt.Sprintf("[0:v:0][0:%d]overlay=eof_action=pass[v]", bitmapSubtitleIndex),
-		)
-	}
-	if timeline.seekSeconds > 0 {
-		// Record the first video delivered by this exact demux seek. Stream-copy
-		// keeps packet identity for HLS verification; bitmap burn-in records the
-		// first decoded frame because the packaged packet is necessarily different.
-		sourceAnchorCodec := "copy"
-		if bitmapSubtitleIndex >= 0 {
-			sourceAnchorCodec = "rawvideo"
-		}
-		args = append(args,
-			"-map", "0:v:0", "-c:v", sourceAnchorCodec, "-frames:v", "1",
-			"-flush_packets", "1", "-hash", "sha256", "-f", "framehash",
-			filepath.Join(dir, sourceVideoAnchorFileName),
-		)
-	}
-	if bitmapSubtitleIndex >= 0 {
-		args = append(args,
-			"-map", "[v]", "-map", audioMap, "-sn", "-dn",
-		)
-		args = append(args, m.bitmapVideoEncoderArgs()...)
-		args = append(args,
-			"-force_key_frames", fmt.Sprintf(
-				"expr:if(isnan(prev_forced_t),1,gte(t,prev_forced_t+%d))",
-				m.segmentSeconds,
+			"-filter_complex", fmt.Sprintf(
+				"[0:v:0][0:%d]overlay=eof_action=pass,"+
+					"scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2[v]",
+				plan.bitmapSubtitleIndex,
 			),
 		)
-	} else {
+	}
+	// Record the first video delivered by this exact demux seek. Stream-copy
+	// records the packet; bitmap burn-in records the first decoded frame
+	// because the packaged packet is necessarily different.
+	sourceAnchorCodec := "copy"
+	if burnIn {
+		sourceAnchorCodec = "rawvideo"
+	}
+	args = append(args,
+		"-map", "0:v:0", "-c:v", sourceAnchorCodec, "-frames:v", "1",
+		"-flush_packets", "1", "-hash", "sha256", "-f", "framehash",
+		filepath.Join(dir, sourceVideoAnchorFileName),
+	)
+	for _, index := range plan.textSubtitles {
 		args = append(args,
-			"-map", "0:v:0", "-map", audioMap, "-sn", "-dn",
-			"-c:v", "copy",
+			"-map", fmt.Sprintf("0:%d", index), "-c:s", "webvtt",
+			"-flush_packets", "1", "-f", "webvtt", filepath.Join(dir, subtitleFileName(index)),
 		)
-		if codec == "hevc" {
+	}
+	if burnIn {
+		args = append(args, "-map", "[v]")
+		args = append(args, m.bitmapVideoEncoderArgs(plan.frameRate)...)
+	} else {
+		args = append(args, "-map", "0:v:0", "-c:v", "copy")
+		if plan.codec == "hevc" {
 			args = append(args, "-tag:v", "hvc1")
 		}
 	}
-	args = append(args,
-		"-c:a", "aac", "-b:a", "256k", "-ac", "2",
-	)
-	if timeline.seekSeconds > 0 {
+	if plan.audioStreamIndex >= 0 {
+		// Fill gaps and trim overlaps in source audio timestamps. Without this the
+		// muxer stretches sample durations across a gap while AVPlayer plays the
+		// samples back to back, so audio drifts ahead after every gap. first_pts=0
+		// also pads a late audio start, but only without a seek: the filter sees
+		// source timestamps under -copyts, so after a seek it would prepend the
+		// entire skipped duration as silence.
+		resample := "aresample=async=1"
+		if plan.timeline.seekSeconds == 0 {
+			resample += ":first_pts=0"
+		}
 		args = append(args,
-			"-output_ts_offset", strconv.FormatFloat(-timeline.seekSeconds, 'f', 3, 64),
+			"-map", fmt.Sprintf("0:%d", plan.audioStreamIndex),
+			"-c:a", "aac", "-b:a", "256k", "-ac", "2", "-af", resample,
 		)
 	}
-	args = append(args,
+	args = append(args, "-sn", "-dn")
+	if plan.timeline.seekSeconds > 0 {
+		args = append(args,
+			"-output_ts_offset", strconv.FormatFloat(-plan.timeline.seekSeconds, 'f', 3, 64),
+		)
+	}
+	return append(args,
 		"-avoid_negative_ts", "make_zero", "-max_muxing_queue_size", "2048",
 		"-f", "hls",
 		"-hls_time", strconv.Itoa(m.segmentSeconds),
@@ -1713,51 +1932,59 @@ func (m *Manager) ffmpegArgs(
 		"-hls_segment_filename", filepath.Join(dir, "segment-%06d.m4s"),
 		filepath.Join(dir, "index.m3u8"),
 	)
-	return args
 }
 
-func (m *Manager) bitmapVideoEncoderArgs() []string {
+// bitmapVideoEncoderArgs encodes burned-in video with an IDR frame at every
+// segment boundary, so the HLS muxer can cut segments of the configured length.
+func (m *Manager) bitmapVideoEncoderArgs(frameRate float64) []string {
+	var args []string
 	if m.bitmapSubtitleEncoder == "h264_nvenc" {
-		return []string{
+		// NVENC turns forced keyframes into non-IDR intra frames unless
+		// forced-idr is set, and the HLS muxer only cuts on IDR frames.
+		args = []string{
 			"-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
 			"-rc", "vbr", "-cq", "18", "-b:v", "0", "-maxrate", "16M", "-bufsize", "32M",
 			"-profile:v", "high", "-pix_fmt", "yuv420p",
+			"-forced-idr", "1", "-no-scenecut", "1",
+		}
+	} else {
+		args = []string{
+			"-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+			"-profile:v", "high", "-pix_fmt", "yuv420p",
 		}
 	}
-	return []string{
-		"-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-		"-profile:v", "high", "-pix_fmt", "yuv420p",
+	if frameRate > 0 {
+		args = append(args, "-g", strconv.Itoa(int(math.Ceil(frameRate*float64(m.segmentSeconds)))))
 	}
-}
-
-func (m *Manager) subtitleArgs(stream *runningStream, index int) []string {
-	initialBurstSeconds := m.bufferSeconds + m.segmentSeconds
-	args := []string{
-		"-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
-		"-copyts", "-start_at_zero",
-		"-readrate", strconv.FormatFloat(m.readRate, 'f', -1, 64),
-		"-readrate_initial_burst", strconv.Itoa(initialBurstSeconds),
-	}
-	if stream.timeline.sourceVideoPTSSeconds > 0 {
-		// Start subtitle demuxing at the video anchor so a cue that begins before
-		// the requested resume point but remains active is still emitted.
-		args = append(args,
-			"-noaccurate_seek", "-ss",
-			strconv.FormatFloat(stream.timeline.sourceVideoPTSSeconds, 'f', 3, 64),
-		)
-	}
-	args = append(args,
-		"-i", stream.sourceURL,
-		"-map", fmt.Sprintf("0:%d", index),
-		"-c:s", "webvtt",
-	)
 	return append(args,
-		"-flush_packets", "1", "-f", "webvtt",
-		filepath.Join(stream.dir, fmt.Sprintf("subtitle-%d.vtt", index)),
+		"-force_key_frames", fmt.Sprintf(
+			"expr:if(isnan(prev_forced_t),1,gte(t,prev_forced_t+%d))",
+			m.segmentSeconds,
+		),
 	)
 }
 
-func (m *Manager) waitUntilReady(ctx context.Context, stream *runningStream) error {
+// sourceEndedEarly reports whether FFmpeg logged a source read failure. FFmpeg
+// treats a failed demuxer read as the end of input and exits successfully with
+// a final playlist, so the exit status alone cannot tell truncation from the end.
+func sourceEndedEarly(logPath string) bool {
+	contents, err := os.ReadFile(logPath)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(contents), "\n") {
+		if strings.Contains(line, "Stream ends prematurely") ||
+			(strings.Contains(line, "Input/output error") &&
+				(strings.Contains(line, "Error during demuxing") || strings.Contains(line, "Error retrieving a packet"))) {
+			return true
+		}
+	}
+	return false
+}
+
+// waitForMedia waits until the packager has published media through
+// endSeconds of player time, or its playlist is complete.
+func (m *Manager) waitForMedia(ctx context.Context, stream *runningStream, endSeconds float64, stage string) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	nextProgress := time.Now().Add(startupProgressInterval)
@@ -1768,19 +1995,19 @@ func (m *Manager) waitUntilReady(ctx context.Context, stream *runningStream) err
 		if err := stream.producerError(); err != nil {
 			return err
 		}
-		if playlistReady(stream.dir, m.bufferSeconds) {
+		if playlistReady(stream.dir, endSeconds) {
 			return nil
 		}
 		if time.Now().After(nextProgress) {
 			nextProgress = time.Now().Add(startupProgressInterval)
-			segments, seconds, complete := playlistStatus(stream.dir)
-			m.logger.Info("HLS startup buffering", "playback_id", stream.info.PlaybackID,
-				"packaged_segments", segments, "packaged_seconds", seconds,
-				"target_seconds", m.bufferSeconds, "complete", complete)
+			snapshot := stream.observe()
+			m.logger.Info("HLS "+stage+" buffering", "playback_id", stream.info.PlaybackID,
+				"packaged_segments", len(snapshot.segmentEnds), "packaged_seconds", snapshot.seconds(),
+				"target_seconds", endSeconds, "complete", snapshot.complete)
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("wait for HLS startup buffer: %w", context.Cause(ctx))
+			return fmt.Errorf("wait for HLS %s buffer: %w", stage, context.Cause(ctx))
 		case <-stream.done:
 			// Recheck producer outcome before accepting its cached buffer.
 		case <-ticker.C:
@@ -1788,72 +2015,11 @@ func (m *Manager) waitUntilReady(ctx context.Context, stream *runningStream) err
 	}
 }
 
-func (m *Manager) waitUntilBuffered(ctx context.Context, stream *runningStream, minimumSeconds int) error {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	nextProgress := time.Now().Add(startupProgressInterval)
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := stream.producerError(); err != nil {
-			return err
-		}
-		if playlistReady(stream.dir, minimumSeconds) {
-			return nil
-		}
-		if time.Now().After(nextProgress) {
-			nextProgress = time.Now().Add(startupProgressInterval)
-			segments, seconds, complete := playlistStatus(stream.dir)
-			m.logger.Info("HLS prewarm buffering", "playback_id", stream.info.PlaybackID,
-				"packaged_segments", segments, "packaged_seconds", seconds,
-				"target_seconds", minimumSeconds, "complete", complete)
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("wait for HLS prewarm buffer: %w", context.Cause(ctx))
-		case <-stream.done:
-			// Recheck producer outcome before accepting its cached buffer.
-		case <-ticker.C:
-		}
-	}
-}
-
-func (m *Manager) waitForPlaylistGrowth(
-	parent context.Context,
-	stream *runningStream,
-	initialSegments int,
-) error {
-	ctx, cancel := context.WithTimeout(parent, m.parkedResumeTimeout)
-	defer cancel()
-	m.logger.Info("checking HLS playlist growth", "playback_id", stream.info.PlaybackID,
-		"packaged_segments", initialSegments)
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		if err := parent.Err(); err != nil {
-			return err
-		}
-		if err := stream.producerError(); err != nil {
-			return err
-		}
-		segments, _, complete := playlistStatus(stream.dir)
-		if segments > initialSegments || complete {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-stream.done:
-			// Recheck producer outcome before accepting its final playlist.
-		case <-ticker.C:
-		}
-	}
-}
-
-func playlistReady(dir string, minimumSeconds int) bool {
+// playlistReady reports whether the playlist and its segment files cover
+// minimumSeconds, or the complete media when it is shorter.
+func playlistReady(dir string, minimumSeconds float64) bool {
 	segmentCount, duration, complete := playlistStatus(dir)
-	if segmentCount == 0 || (!complete && duration < float64(minimumSeconds)) {
+	if segmentCount == 0 || (!complete && duration < minimumSeconds) {
 		return false
 	}
 	matches, _ := filepath.Glob(filepath.Join(dir, "segment-*.m4s"))
@@ -1861,23 +2027,42 @@ func playlistReady(dir string, minimumSeconds int) bool {
 }
 
 func playlistStatus(dir string) (segments int, duration float64, complete bool) {
-	playlist, err := os.ReadFile(filepath.Join(dir, "index.m3u8"))
-	if err != nil {
-		return 0, 0, false
+	playlist, _ := readMediaPlaylist(dir)
+	for _, seconds := range playlist.durations {
+		duration += seconds
 	}
-	for _, line := range strings.Split(string(playlist), "\n") {
+	return len(playlist.durations), duration, playlist.complete
+}
+
+type mediaPlaylist struct {
+	durations      []float64
+	targetDuration int
+	complete       bool
+}
+
+func readMediaPlaylist(dir string) (mediaPlaylist, error) {
+	contents, err := os.ReadFile(filepath.Join(dir, "index.m3u8"))
+	if err != nil {
+		return mediaPlaylist{}, err
+	}
+	var playlist mediaPlaylist
+	for _, line := range strings.Split(string(contents), "\n") {
+		line = strings.TrimSpace(line)
 		switch {
 		case strings.HasPrefix(line, "#EXTINF:"):
-			segments++
-			value := strings.TrimSuffix(strings.TrimPrefix(line, "#EXTINF:"), ",")
-			if seconds, err := strconv.ParseFloat(value, 64); err == nil && seconds > 0 {
-				duration += seconds
+			value, _, _ := strings.Cut(strings.TrimPrefix(line, "#EXTINF:"), ",")
+			seconds, err := strconv.ParseFloat(value, 64)
+			if err != nil || seconds < 0 || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+				seconds = 0
 			}
+			playlist.durations = append(playlist.durations, seconds)
+		case strings.HasPrefix(line, "#EXT-X-TARGETDURATION:"):
+			playlist.targetDuration, _ = strconv.Atoi(strings.TrimPrefix(line, "#EXT-X-TARGETDURATION:"))
 		case line == "#EXT-X-ENDLIST":
-			complete = true
+			playlist.complete = true
 		}
 	}
-	return segments, duration, complete
+	return playlist, nil
 }
 
 func validPlaybackID(id string) bool {
@@ -1892,21 +2077,6 @@ func validPlaybackID(id string) bool {
 		}
 	}
 	return true
-}
-
-func validAssetName(name string) bool {
-	if name == "index.m3u8" || name == "init.mp4" {
-		return true
-	}
-	if strings.HasPrefix(name, "segment-") && strings.HasSuffix(name, ".m4s") {
-		return filepath.Base(name) == name
-	}
-	if !strings.HasPrefix(name, "subtitle-") || !strings.HasSuffix(name, ".vtt") || filepath.Base(name) != name {
-		return false
-	}
-	index := strings.TrimSuffix(strings.TrimPrefix(name, "subtitle-"), ".vtt")
-	value, err := strconv.Atoi(index)
-	return err == nil && value >= 0
 }
 
 func tailFile(path string, limit int64) string {

@@ -155,6 +155,123 @@ struct MacDetailButtonStyle: ButtonStyle {
     }
 }
 
+/// Covers a detail view while its title is prepared for playback, with Cancel, and
+/// explains a failed preparation with Try Again. Invisible otherwise.
+struct MacPlaybackPreparationPanel: View {
+    let title: String
+    let preparation: PlaybackPreparation
+
+    var body: some View {
+        if preparation.isPreparing || preparation.errorMessage != nil {
+            ZStack {
+                Color.black.opacity(0.62)
+                    .ignoresSafeArea()
+
+                VStack(alignment: .leading, spacing: 16) {
+                    if let errorMessage = preparation.errorMessage {
+                        failureContent(errorMessage)
+                    } else {
+                        progressContent
+                    }
+                }
+                .padding(32)
+                .frame(width: 580, alignment: .leading)
+                .background(Color.macTeaPanel, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(Color.macTeaAccent.opacity(0.32), lineWidth: 1)
+                }
+                .shadow(color: .black.opacity(0.45), radius: 24, y: 12)
+                .accessibilityElement(children: .contain)
+                .accessibilityAddTraits(.isModal)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var progressContent: some View {
+        let progress = preparation.progress
+
+        Text(title)
+            .font(.title3.weight(.semibold))
+            .foregroundStyle(Color.macTeaCream.opacity(0.9))
+            .lineLimit(2)
+
+        Text(progress?.headline ?? "Starting…")
+            .font(.largeTitle.weight(.bold))
+            .foregroundStyle(Color.macTeaCream)
+            .fixedSize(horizontal: false, vertical: true)
+
+        if let detail = progress?.detail {
+            Text(detail)
+                .font(.title3)
+                .foregroundStyle(Color.macTeaAccentLight)
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+
+        Group {
+            if let fraction = progress?.fraction {
+                ProgressView(value: fraction)
+            } else {
+                ProgressView()
+                    .progressViewStyle(.linear)
+            }
+        }
+        .tint(Color.macTeaAccent)
+        .padding(.vertical, 4)
+
+        Button {
+            preparation.cancel()
+        } label: {
+            Label("Cancel", systemImage: "xmark")
+                .frame(minWidth: 120)
+        }
+        .buttonStyle(MacDetailButtonStyle(kind: .standard))
+        .keyboardShortcut(.cancelAction)
+    }
+
+    @ViewBuilder
+    private func failureContent(_ message: String) -> some View {
+        Label("Couldn't Start Playback", systemImage: "exclamationmark.triangle.fill")
+            .font(.largeTitle.weight(.bold))
+            .foregroundStyle(Color.macTeaAmber)
+
+        Text(title)
+            .font(.title3.weight(.semibold))
+            .foregroundStyle(Color.macTeaCream.opacity(0.9))
+            .lineLimit(2)
+
+        Text(message)
+            .font(.title3)
+            .foregroundStyle(Color.macTeaCream)
+            .lineSpacing(3)
+            .fixedSize(horizontal: false, vertical: true)
+
+        HStack(spacing: 12) {
+            if preparation.canRetry {
+                Button {
+                    preparation.retry()
+                } label: {
+                    Label("Try Again", systemImage: "arrow.clockwise")
+                        .frame(minWidth: 120)
+                }
+                .buttonStyle(MacDetailButtonStyle(kind: .prominent))
+            }
+
+            Button {
+                preparation.cancel()
+            } label: {
+                Label("Close", systemImage: "xmark")
+                    .frame(minWidth: 120)
+            }
+            .buttonStyle(MacDetailButtonStyle(kind: .standard))
+            .keyboardShortcut(.cancelAction)
+        }
+        .padding(.top, 4)
+    }
+}
+
 struct MacMovieRatingBadges: View {
     let ratings: MovieRatings?
 

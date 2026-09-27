@@ -544,39 +544,51 @@ public struct HLSSubtitleTrack: Codable, Hashable, Identifiable, Sendable {
     public let isForced: Bool?
     public let codec: String?
     public let kind: String?
+    /// NAME of this text track's SUBTITLES rendition in the master playlist.
+    /// Bitmap tracks have no rendition; they can only be burned into the video.
+    public let renditionName: String?
 
     public var isBitmap: Bool { kind == "bitmap" }
 
-    public static func savedPreference(in tracks: [HLSSubtitleTrack]) -> HLSSubtitleTrack? {
-        let defaults = UserDefaults.standard
-        if defaults.object(forKey: "filmstream.subtitles.enabled") == nil {
-            return tracks.first(where: { $0.isForced == true })
+    private static let enabledKey = "filmstream.subtitles.enabled"
+    private static let languageKey = "filmstream.subtitles.language"
+    private static let titleKey = "filmstream.subtitles.title"
+    private static let kindKey = "filmstream.subtitles.kind"
+
+    /// Automatic selection only lands on a bitmap track when the viewer explicitly
+    /// chose a bitmap track before: burning one in forces a full video re-encode.
+    public static func savedPreference(
+        in tracks: [HLSSubtitleTrack],
+        defaults: UserDefaults = .standard
+    ) -> HLSSubtitleTrack? {
+        guard defaults.object(forKey: enabledKey) != nil else {
+            return tracks.first(where: { $0.isForced == true && !$0.isBitmap })
         }
-        guard defaults.bool(forKey: "filmstream.subtitles.enabled") else { return nil }
-        let language = defaults.string(forKey: "filmstream.subtitles.language")
-        let title = defaults.string(forKey: "filmstream.subtitles.title")
-        let kind = defaults.string(forKey: "filmstream.subtitles.kind")
+        guard defaults.bool(forKey: enabledKey) else { return nil }
+        let language = defaults.string(forKey: languageKey)
+        let title = defaults.string(forKey: titleKey)
+        let kind = defaults.string(forKey: kindKey)
+        let candidates = kind == "bitmap" ? tracks : tracks.filter { !$0.isBitmap }
         let selected: HLSSubtitleTrack?
         if let kind {
-            selected = tracks.first(where: {
+            selected = candidates.first(where: {
                 $0.kind == kind && $0.language == language && $0.title == title
-            }) ?? tracks.first(where: { $0.kind == kind && $0.language == language })
-                ?? tracks.first(where: { $0.language == language && $0.title == title })
-                ?? tracks.first(where: { $0.language == language })
+            }) ?? candidates.first(where: { $0.kind == kind && $0.language == language })
+                ?? candidates.first(where: { $0.language == language && $0.title == title })
+                ?? candidates.first(where: { $0.language == language })
         } else {
-            selected = tracks.first(where: { $0.language == language && $0.title == title })
-                ?? tracks.first(where: { $0.language == language })
-            defaults.set(selected?.kind, forKey: "filmstream.subtitles.kind")
+            selected = candidates.first(where: { $0.language == language && $0.title == title })
+                ?? candidates.first(where: { $0.language == language })
+            defaults.set(selected?.kind, forKey: kindKey)
         }
         return selected
     }
 
-    public static func savePreference(_ track: HLSSubtitleTrack?) {
-        let defaults = UserDefaults.standard
-        defaults.set(track != nil, forKey: "filmstream.subtitles.enabled")
-        defaults.set(track?.language, forKey: "filmstream.subtitles.language")
-        defaults.set(track?.title, forKey: "filmstream.subtitles.title")
-        defaults.set(track?.kind, forKey: "filmstream.subtitles.kind")
+    public static func savePreference(_ track: HLSSubtitleTrack?, defaults: UserDefaults = .standard) {
+        defaults.set(track != nil, forKey: enabledKey)
+        defaults.set(track?.language, forKey: languageKey)
+        defaults.set(track?.title, forKey: titleKey)
+        defaults.set(track?.kind, forKey: kindKey)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -584,6 +596,7 @@ public struct HLSSubtitleTrack: Codable, Hashable, Identifiable, Sendable {
         case isDefault = "default"
         case isForced = "forced"
         case codec, kind
+        case renditionName = "rendition_name"
     }
 }
 
@@ -594,6 +607,28 @@ public struct HLSAudioTrack: Codable, Hashable, Identifiable, Sendable {
     public let title: String?
     public let channels: Int?
     public let isDefault: Bool?
+
+    public var displayName: String {
+        var parts: [String] = []
+        if let language, !language.isEmpty {
+            parts.append(
+                Locale.current.localizedString(forLanguageCode: language)?.capitalized
+                    ?? language.uppercased()
+            )
+        }
+        if let title, !title.isEmpty, title.lowercased() != language?.lowercased() {
+            parts.append(title)
+        }
+        if let channels, channels > 0 {
+            parts.append(channels > 6 ? "7.1" : channels == 6 ? "5.1" : channels == 2 ? "Stereo" : "Mono")
+        }
+        return parts.isEmpty ? "Track \(index)" : parts.joined(separator: " — ")
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case index, language, title, channels
+        case isDefault = "default"
+    }
 }
 
 public struct HLSPlayback: Codable, Hashable, Identifiable, Sendable {
@@ -608,6 +643,9 @@ public struct HLSPlayback: Codable, Hashable, Identifiable, Sendable {
 
     public let playbackID: String
     public let playlistURL: URL
+    /// Master playlist that adds WebVTT subtitle renditions to `playlistURL`.
+    /// Older servers omit it; clients then fall back to polling subtitle files.
+    public let masterURL: URL?
     public let requestedStartSeconds: Double?
     public let startSeconds: Double
     public let playerTimeOffsetSeconds: Double?
@@ -618,9 +656,35 @@ public struct HLSPlayback: Codable, Hashable, Identifiable, Sendable {
     public let audioTracks: [HLSAudioTrack]?
     public let audioStreamIndex: Int?
 
+    /// The URL AVPlayer should open.
+    public var streamURL: URL { masterURL ?? playlistURL }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        playbackID = try container.decode(String.self, forKey: .playbackID)
+        playlistURL = try container.decode(URL.self, forKey: .playlistURL)
+        if let master = try container.decodeIfPresent(String.self, forKey: .masterURL),
+           !master.isEmpty {
+            // Resolve a path-only value against the absolute media playlist URL.
+            masterURL = URL(string: master, relativeTo: playlistURL)?.absoluteURL
+        } else {
+            masterURL = nil
+        }
+        requestedStartSeconds = try container.decodeIfPresent(Double.self, forKey: .requestedStartSeconds)
+        startSeconds = try container.decode(Double.self, forKey: .startSeconds)
+        playerTimeOffsetSeconds = try container.decodeIfPresent(Double.self, forKey: .playerTimeOffsetSeconds)
+        durationSeconds = try container.decodeIfPresent(Double.self, forKey: .durationSeconds)
+        videoCodec = try container.decode(String.self, forKey: .videoCodec)
+        subtitles = try container.decodeIfPresent([HLSSubtitleTrack].self, forKey: .subtitles)
+        burnedSubtitleIndex = try container.decodeIfPresent(Int.self, forKey: .burnedSubtitleIndex)
+        audioTracks = try container.decodeIfPresent([HLSAudioTrack].self, forKey: .audioTracks)
+        audioStreamIndex = try container.decodeIfPresent(Int.self, forKey: .audioStreamIndex)
+    }
+
     private enum CodingKeys: String, CodingKey {
         case playbackID = "playback_id"
         case playlistURL = "playlist_url"
+        case masterURL = "master_url"
         case requestedStartSeconds = "requested_start_seconds"
         case startSeconds = "start_seconds"
         case playerTimeOffsetSeconds = "player_time_offset_seconds"
@@ -669,7 +733,8 @@ public struct HLSPlaybackTimeline: Hashable, Sendable {
 
 public enum PlaybackPreparationStage: Hashable, Sendable {
     case findingRelease
-    case bufferingVideo
+    /// The playback exists on the server, which is now buffering the opening.
+    case bufferingVideo(playbackID: String)
 }
 
 public struct PreparedPlayback: Hashable, Identifiable, Sendable {

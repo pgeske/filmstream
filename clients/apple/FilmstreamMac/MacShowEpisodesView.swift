@@ -8,7 +8,7 @@ struct MacShowEpisodesView: View {
     @State private var selectedSeasonNumber: Int
     @State private var loadedSeason: ShowSeason?
     @State private var isLoading = false
-    @State private var preparingEpisodeID: String?
+    @State private var preparingEpisode: Episode?
     @State private var preparation = PlaybackPreparation()
     @State private var hoveredEpisodeID: String?
     @State private var errorMessage: String?
@@ -30,6 +30,9 @@ struct MacShowEpisodesView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .padding(28)
+        }
+        .overlay {
+            MacPlaybackPreparationPanel(title: preparingTitle, preparation: preparation)
         }
         .navigationTitle("Episodes & More")
         .task(id: selectedSeasonNumber) {
@@ -104,7 +107,7 @@ struct MacShowEpisodesView: View {
                 }
             }
 
-            if let errorMessage = preparation.errorMessage ?? errorMessage {
+            if let errorMessage {
                 Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                     .font(.headline)
                     .foregroundStyle(Color.macTeaAmber)
@@ -133,7 +136,7 @@ struct MacShowEpisodesView: View {
                     .frame(width: 260, height: 146)
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
                     .overlay {
-                        if preparation.isPreparing && preparingEpisodeID == episode.id {
+                        if preparation.isPreparing && preparingEpisode?.id == episode.id {
                             ZStack {
                                 Color.black.opacity(0.5)
                                 ProgressView()
@@ -210,6 +213,11 @@ struct MacShowEpisodesView: View {
         model.watchHistory.first { $0.mediaID == episode.id }
     }
 
+    private var preparingTitle: String {
+        guard let episode = preparingEpisode else { return details.show.title }
+        return "\(details.show.title) · \(episode.label) · \(episode.title)"
+    }
+
     private func loadSelectedSeason() async {
         isLoading = true
         defer { if !Task.isCancelled { isLoading = false } }
@@ -225,7 +233,7 @@ struct MacShowEpisodesView: View {
     }
 
     private func preparePlayback(for episode: Episode) {
-        preparingEpisodeID = episode.id
+        preparingEpisode = episode
         errorMessage = nil
         let movie = episode.playbackMovie(in: details.show)
         let startSeconds = history(for: episode).flatMap {

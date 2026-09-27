@@ -11,6 +11,7 @@ struct MacShowDetailView: View {
     @State private var preparation = PlaybackPreparation()
     private var isPreparing: Bool { preparation.isPreparing }
     private var preparationStage: PlaybackPreparationStage? { preparation.stage }
+    @State private var preparingTitle = ""
     @State private var isRemoving = false
     @State private var errorMessage: String?
 
@@ -69,7 +70,7 @@ struct MacShowDetailView: View {
                                 .frame(maxWidth: 680, alignment: .leading)
                         }
 
-                        if let errorMessage = preparation.errorMessage ?? errorMessage {
+                        if let errorMessage {
                             Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                                 .foregroundStyle(Color.macTeaAmber)
                                 .font(.headline)
@@ -86,6 +87,9 @@ struct MacShowDetailView: View {
             }
         }
         .background(Color.macTeaBackground)
+        .overlay {
+            MacPlaybackPreparationPanel(title: preparingTitle, preparation: preparation)
+        }
         .navigationTitle(show.title)
         .task(id: show.id) {
             await loadShow()
@@ -244,6 +248,7 @@ struct MacShowDetailView: View {
         guard let details, let playbackSelection else { return }
         errorMessage = nil
         let movie = playbackSelection.episode.playbackMovie(in: details.show)
+        preparingTitle = "\(details.show.title) · \(playbackSelection.episode.label) · \(playbackSelection.episode.title)"
         preparation.start(
             api: model.api,
             movie: movie,

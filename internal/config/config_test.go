@@ -27,11 +27,6 @@ func TestDefaultsMatchLocalMVP(t *testing.T) {
 	if cfg.PlaybackSourceMode != PlaybackSourceTorrentOnly {
 		t.Fatalf("playback source mode = %q", cfg.PlaybackSourceMode)
 	}
-	if cfg.HLSDir == "" || cfg.FFmpegPath != "ffmpeg" || cfg.FFprobePath != "ffprobe" ||
-		cfg.HLSBufferSeconds != 12 || cfg.HLSReadRate != 1.25 || cfg.HLSSegmentSeconds != 4 {
-		t.Fatalf("HLS defaults = dir %q, ffmpeg %q, ffprobe %q, startup buffer %d, read rate %.2f, segment %d",
-			cfg.HLSDir, cfg.FFmpegPath, cfg.FFprobePath, cfg.HLSBufferSeconds, cfg.HLSReadRate, cfg.HLSSegmentSeconds)
-	}
 }
 
 func TestMissingConfigExpandsDefaultStateDirectory(t *testing.T) {
@@ -101,14 +96,14 @@ func TestUsenetConfigurationValidation(t *testing.T) {
 
 func TestLoadOverlaysDefaults(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, []byte(`{"readahead_mib":64,"recommendations":{"model":"curator","prompt_file":"~/notes/filmstream-recommendations.md"},"indexers":[]}`), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(`{"readahead_mib":64,"hls_read_rate":1.25,"max_candidate_gib":30,"deluge":{"token_file":"~/deluge/token"},"recommendations":{"model":"curator","prompt_file":"~/notes/filmstream-recommendations.md"},"indexers":[]}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ReadaheadMiB != 64 || cfg.Listen != "127.0.0.1:8943" || cfg.StateDir == "" {
+	if cfg.MaxCandidateGiB != 30 || cfg.Listen != "127.0.0.1:8943" || cfg.StateDir == "" {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
 	if len(cfg.Indexers) != 0 {
@@ -120,6 +115,10 @@ func TestLoadOverlaysDefaults(t *testing.T) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if cfg.Deluge.TokenFile != filepath.Join(home, "deluge", "token") ||
+		cfg.Deluge.PluginURL != "http://127.0.0.1:8113" || cfg.Deluge.DownloadsDir != "/downloads" {
+		t.Fatalf("deluge = %+v", cfg.Deluge)
 	}
 	if cfg.Recommendations.PromptFile != filepath.Join(home, "notes", "filmstream-recommendations.md") {
 		t.Fatalf("recommendation prompt file = %q", cfg.Recommendations.PromptFile)

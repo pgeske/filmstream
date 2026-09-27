@@ -15,15 +15,15 @@ const (
 
 	defaultListen            = "127.0.0.1:8943"
 	defaultMaxCandidateGiB   = 60
-	defaultReadaheadMiB      = 32
 	defaultCacheLimitGiB     = 20
 	defaultMaxSeedSessions   = 20
 	defaultSeedMaxHours      = 168
 	defaultIdleGraceSeconds  = 120
 	defaultHLSStartupSeconds = 90
-	defaultHLSBufferSeconds  = 12
-	defaultHLSReadRate       = 1.25
+	defaultHLSBufferSeconds  = 8
 	defaultHLSSegmentSeconds = 4
+	defaultDelugePluginURL   = "http://127.0.0.1:8113"
+	defaultDelugeDownloads   = "/downloads"
 )
 
 // SeedRule is a tracker's hit-and-run requirement. A torrent satisfies it once
@@ -64,6 +64,18 @@ type Metadata struct {
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 }
 
+// Deluge locates the Deluge daemon's TeaStream plugin, which performs all
+// BitTorrent transfers.
+type Deluge struct {
+	// PluginURL is the plugin's loopback HTTP API.
+	PluginURL string `json:"plugin_url,omitempty"`
+	// TokenFile holds the plugin's bearer token.
+	TokenFile string `json:"token_file,omitempty"`
+	// DownloadsDir is where Deluge saves torrents; Filmstream reads payload
+	// from the same path, so both must mount it identically.
+	DownloadsDir string `json:"downloads_dir,omitempty"`
+}
+
 type Recommendations struct {
 	Model      string `json:"model,omitempty"`
 	PromptFile string `json:"prompt_file,omitempty"`
@@ -90,10 +102,8 @@ type Config struct {
 	FFprobePath         string    `json:"ffprobe_path"`
 	HLSStartupSeconds   int       `json:"hls_startup_seconds"`
 	HLSBufferSeconds    int       `json:"hls_startup_buffer_seconds"`
-	HLSReadRate         float64   `json:"hls_read_rate"`
 	HLSSegmentSeconds   int       `json:"hls_segment_seconds"`
 	MaxCandidateGiB     int64     `json:"max_candidate_gib"`
-	ReadaheadMiB        int64     `json:"readahead_mib"`
 	MetadataTimeoutSecs int       `json:"metadata_timeout_seconds"`
 	SeedRatioTarget     float64   `json:"seed_ratio_target"`
 	CacheLimitGiB       int64     `json:"cache_limit_gib"`
@@ -107,6 +117,7 @@ type Config struct {
 	Resolver            Resolver  `json:"resolver,omitempty"`
 	Metadata            Metadata  `json:"metadata,omitempty"`
 	Usenet              Usenet    `json:"usenet,omitempty"`
+	Deluge              Deluge    `json:"deluge,omitempty"`
 	Indexers            []Indexer `json:"indexers"`
 
 	Recommendations Recommendations `json:"recommendations,omitempty"`
@@ -122,10 +133,8 @@ func Defaults() Config {
 		FFprobePath:         "ffprobe",
 		HLSStartupSeconds:   defaultHLSStartupSeconds,
 		HLSBufferSeconds:    defaultHLSBufferSeconds,
-		HLSReadRate:         defaultHLSReadRate,
 		HLSSegmentSeconds:   defaultHLSSegmentSeconds,
 		MaxCandidateGiB:     defaultMaxCandidateGiB,
-		ReadaheadMiB:        defaultReadaheadMiB,
 		MetadataTimeoutSecs: 120,
 		SeedRatioTarget:     1,
 		CacheLimitGiB:       defaultCacheLimitGiB,
@@ -136,6 +145,10 @@ func Defaults() Config {
 		PreferredLanguages:  []string{"en", "english"},
 		PlaybackSourceMode:  PlaybackSourceTorrentOnly,
 		Player:              "mpv",
+		Deluge: Deluge{
+			PluginURL:    defaultDelugePluginURL,
+			DownloadsDir: defaultDelugeDownloads,
+		},
 		Indexers: []Indexer{
 			{
 				Name:     "open-media",
@@ -176,6 +189,8 @@ func Load(path string) (Config, error) {
 	cfg.Metadata.APIKeyFile = expandHome(cfg.Metadata.APIKeyFile)
 	cfg.Usenet.APIKeyFile = expandHome(cfg.Usenet.APIKeyFile)
 	cfg.Usenet.WebDAVPasswordFile = expandHome(cfg.Usenet.WebDAVPasswordFile)
+	cfg.Deluge.TokenFile = expandHome(cfg.Deluge.TokenFile)
+	cfg.Deluge.DownloadsDir = expandHome(cfg.Deluge.DownloadsDir)
 	cfg.Recommendations.PromptFile = expandHome(cfg.Recommendations.PromptFile)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -242,14 +257,8 @@ func (c Config) Validate() error {
 	if c.HLSStartupSeconds <= 0 || c.HLSBufferSeconds <= 0 || c.HLSSegmentSeconds <= 0 {
 		return errors.New("HLS timeout, startup buffer, and segment duration must be positive")
 	}
-	if c.HLSReadRate < 1 || c.HLSReadRate > 4 {
-		return errors.New("hls_read_rate must be between 1 and 4")
-	}
 	if c.MaxCandidateGiB <= 0 {
 		return errors.New("max_candidate_gib must be positive")
-	}
-	if c.ReadaheadMiB <= 0 {
-		return errors.New("readahead_mib must be positive")
 	}
 	if c.MetadataTimeoutSecs <= 0 {
 		return errors.New("metadata_timeout_seconds must be positive")
@@ -307,6 +316,12 @@ func (c Config) Validate() error {
 			return errors.New("Usenet startup_timeout_seconds cannot be negative")
 		}
 	}
+	if c.Deluge.PluginURL == "" {
+		return errors.New("deluge plugin_url cannot be empty")
+	}
+	if !filepath.IsAbs(c.Deluge.DownloadsDir) {
+		return errors.New("deluge downloads_dir must be an absolute path")
+	}
 	for i, indexer := range c.Indexers {
 		if indexer.Name == "" || indexer.Type == "" || indexer.Endpoint == "" {
 			return fmt.Errorf("indexers[%d] must have name, type, and endpoint", i)
@@ -317,10 +332,6 @@ func (c Config) Validate() error {
 
 func (c Config) MaxCandidateBytes() int64 {
 	return c.MaxCandidateGiB << 30
-}
-
-func (c Config) ReadaheadBytes() int64 {
-	return c.ReadaheadMiB << 20
 }
 
 func (c Config) CacheLimitBytes() int64 {

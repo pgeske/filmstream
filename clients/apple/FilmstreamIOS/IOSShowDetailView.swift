@@ -12,6 +12,7 @@ struct IOSShowDetailView: View {
     @State private var preparation = PlaybackPreparation()
     private var isPreparing: Bool { preparation.isPreparing }
     private var preparationStage: PlaybackPreparationStage? { preparation.stage }
+    @State private var preparingEpisode: Episode?
     @State private var isRemoving = false
     @State private var errorMessage: String?
 
@@ -44,6 +45,13 @@ struct IOSShowDetailView: View {
             } else {
                 compactLayout(width: geometry.size.width, layout: layout)
             }
+        }
+        .overlay {
+            IOSPlaybackPreparationPanel(
+                preparation: preparation,
+                title: (details?.show ?? show).title,
+                subtitle: preparingEpisode.map { "\($0.label) · \($0.title)" }
+            )
         }
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
@@ -183,7 +191,7 @@ struct IOSShowDetailView: View {
                     .lineSpacing(3)
             }
 
-            if let errorMessage = preparation.errorMessage ?? errorMessage {
+            if let errorMessage {
                 Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                     .font(.footnote.weight(.semibold))
                     .foregroundStyle(Color.mobileTeaAmber)
@@ -323,6 +331,7 @@ struct IOSShowDetailView: View {
     private func preparePlayback(startSeconds: Double) {
         guard let details, let playbackSelection else { return }
         errorMessage = nil
+        preparingEpisode = playbackSelection.episode
         let movie = playbackSelection.episode.playbackMovie(in: details.show)
         preparation.start(
             api: model.api,
@@ -340,11 +349,7 @@ struct IOSShowDetailView: View {
         guard let details else { return }
         let movie = episode.playbackMovie(in: details.show)
         async let next = try? await model.api.nextEpisode(after: episode, in: details)
-        let prepared = try await model.preparePlayback(
-            for: movie,
-            startSeconds: 0,
-            onStage: { _ in }
-        )
+        let prepared = try await model.api.preparePlayback(for: movie, startSeconds: 0)
         let nextEpisode = await next
         guard !Task.isCancelled else {
             Task { try? await model.api.stopNativePlayback(prepared.playback.id) }

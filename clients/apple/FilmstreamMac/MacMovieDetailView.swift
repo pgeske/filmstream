@@ -71,7 +71,7 @@ struct MacMovieDetailView: View {
                                 .frame(maxWidth: 680, alignment: .leading)
                         }
 
-                        if let errorMessage = preparation.errorMessage ?? errorMessage {
+                        if let errorMessage {
                             Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                                 .foregroundStyle(Color.macTeaAmber)
                                 .font(.headline)
@@ -88,6 +88,9 @@ struct MacMovieDetailView: View {
             }
         }
         .background(Color.macTeaBackground)
+        .overlay {
+            MacPlaybackPreparationPanel(title: movie.title, preparation: preparation)
+        }
         .navigationTitle(movie.title)
         .task(id: movie.id) {
             async let ratings: Void = model.loadRatings(for: movie)
