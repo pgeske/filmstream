@@ -26,11 +26,24 @@ const (
 	defaultHLSSegmentSeconds = 4
 )
 
+// SeedRule is a tracker's hit-and-run requirement. A torrent satisfies it once
+// it is fully downloaded and either reaches Ratio (when Ratio > 0) or has been
+// seeding as a complete torrent for Hours + HoursPerGiB*size(GiB).
+type SeedRule struct {
+	Ratio       float64 `json:"ratio,omitempty"`
+	Hours       float64 `json:"hours,omitempty"`
+	HoursPerGiB float64 `json:"hours_per_gib,omitempty"`
+}
+
 type Indexer struct {
 	Name     string `json:"name"`
 	Type     string `json:"type"`
 	Endpoint string `json:"endpoint"`
 	APIKey   string `json:"api_key,omitempty"`
+	// Private marks a private tracker: its torrents are downloaded completely
+	// and seeded until Seed is satisfied.
+	Private bool      `json:"private,omitempty"`
+	Seed    *SeedRule `json:"seed,omitempty"`
 }
 
 type Resolver struct {

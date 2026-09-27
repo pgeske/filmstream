@@ -71,6 +71,9 @@ type Source struct {
 	TorrentURL  string
 	TorrentPath string
 	FileHint    string
+	// Indexer is the configured indexer name the release came from; it selects
+	// the private-tracker seed rule. Empty for direct magnet/.torrent input.
+	Indexer string
 }
 
 type Engine struct {
