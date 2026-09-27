@@ -1569,8 +1569,9 @@ func (m *Manager) probePackagedTimelineStart(
 	if err != nil || math.Abs(packetPTS-start.videoPTS) > timelineTimestampEpsilon {
 		return packagedTimelineStart{}, errors.New("packaged HLS video start does not match its first packet")
 	}
-	start.videoDTS, err = parseTimelineTimestamp(probe.Packets[0].DTSTime)
-	if err != nil {
+	// DTS precedes PTS when B-frames reorder, so it may be slightly negative.
+	start.videoDTS, err = strconv.ParseFloat(strings.TrimSpace(probe.Packets[0].DTSTime), 64)
+	if err != nil || math.IsNaN(start.videoDTS) || math.IsInf(start.videoDTS, 0) {
 		return packagedTimelineStart{}, fmt.Errorf(
 			"invalid packaged video DTS %q", probe.Packets[0].DTSTime,
 		)

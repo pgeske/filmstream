@@ -803,6 +803,46 @@ JSON
 	}
 }
 
+// MP4 releases with B-frames begin with a negative decode timestamp; startup
+// verification must accept it instead of rejecting a playable release.
+func TestManagerStartsMP4WithNegativeInitialDTS(t *testing.T) {
+	ffmpegPath, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg is not installed")
+	}
+	ffprobePath, err := exec.LookPath("ffprobe")
+	if err != nil {
+		t.Skip("ffprobe is not installed")
+	}
+	fixturePath := filepath.Join(t.TempDir(), "bframes.mp4")
+	command := exec.CommandContext(t.Context(), ffmpegPath,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=6",
+		"-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
+		"-c:v", "libx264", "-g", "24", "-bf", "3", "-c:a", "aac", fixturePath,
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("create fixture: %v: %s", err, output)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, fixturePath)
+	}))
+	defer server.Close()
+	manager, err := New(Config{
+		DataDir: t.TempDir(), FFmpegPath: ffmpegPath, FFprobePath: ffprobePath,
+		SourceBaseURL: server.URL, StartupTimeout: 15 * time.Second,
+		BufferSeconds: 1, SegmentSeconds: 1,
+		LocalSourcePath: func(string) (string, bool) { return fixturePath, true },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	if _, err := manager.Start(t.Context(), "playback-1", 0, nil, -1, -1); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestManagerAlignsPackagedMediaAndFullTimelineWebVTT(t *testing.T) {
 	ffmpegPath, err := exec.LookPath("ffmpeg")
 	if err != nil {
