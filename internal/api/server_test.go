@@ -1489,6 +1489,28 @@ func TestCreatePlaybackFallsBackToTorrent(t *testing.T) {
 	}
 }
 
+func TestUnknownPlaybackHLSStartIsNotFoundWithoutUsenet(t *testing.T) {
+	torrentEngine, _ := newAPITestTorrentEngine(t)
+	registry, err := indexer.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := New(registry, torrentEngine, catalog.Preferences{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	server.hlsManager = &fakeHLSManager{}
+	// main passes its nil engine when Usenet is disabled.
+	var usenet *usenetstream.Engine
+	server.SetUsenetEngine(usenet)
+
+	// Clients answer a 404 (for example after a restart forgot the playback)
+	// by creating a new playback.
+	request := httptest.NewRequest(http.MethodPost, "/v1/playbacks/forgotten/hls", strings.NewReader(`{"start_seconds":0}`))
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
 func newAPITestTorrentEngine(t *testing.T) (*torrentstream.Engine, *torrentstreamtest.Plugin) {
 	t.Helper()
 	plugin := torrentstreamtest.NewPlugin(t)

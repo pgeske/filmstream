@@ -220,12 +220,15 @@ func (s *Server) SetPlaybackSourceMode(mode string) {
 }
 
 func (s *Server) SetUsenetEngine(engine *usenetstream.Engine) {
-	s.usenetEngine = engine
-	if engine != nil {
-		engine.SetCleanupHandler(func(id, _ string) {
-			s.cleanupPlayback(id)
-		})
+	if engine == nil {
+		// A typed nil in the interface would pass every usenetEngine == nil check.
+		s.usenetEngine = nil
+		return
 	}
+	s.usenetEngine = engine
+	engine.SetCleanupHandler(func(id, _ string) {
+		s.cleanupPlayback(id)
+	})
 }
 
 func (s *Server) cleanupPlayback(id string) {
