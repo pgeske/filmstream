@@ -34,9 +34,17 @@ only loads eggs tagged with its own Python version, for example
      directory each (default `/downloads`).
    - `TEASTREAM_BIND` / `TEASTREAM_PORT`: API address (default
      `127.0.0.1:8113`).
+   - `TEASTREAM_MAX_DOWNLOAD_KIB` / `TEASTREAM_MAX_UPLOAD_KIB`: daemon-wide
+     caps in KiB/s, applied to Deluge's global limits at startup (default
+     unlimited).
+   - `TEASTREAM_BACKGROUND_DOWNLOAD_KIB`: per-torrent download cap in KiB/s
+     for torrents no stream is reading (finishing a snatch, seeding); a
+     torrent with a live stream window is uncapped (default unlimited).
 
-   The same keys (`token_file`, `save_root`, `bind`, `port`) can instead be
-   set in `teastream.conf` in Deluge's config directory; the environment wins.
+   The same keys (`token_file`, `save_root`, `bind`, `port`,
+   `max_download_kib`, `max_upload_kib`, `background_download_kib`) can
+   instead be set in `teastream.conf` in Deluge's config directory; the
+   environment wins.
 4. Enable the plugin once: stop deluged, set `"enabled_plugins": ["TeaStream"]`
    in `core.conf`, and start it again (or tick TeaStream under Preferences →
    Plugins in the Web UI). Deluge remembers enabled plugins across restarts.

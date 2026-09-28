@@ -17,7 +17,10 @@ left untouched. It also tunes three libtorrent session settings for streaming
 Configuration (``teastream.conf`` in Deluge's config dir; environment wins):
 ``bind`` / TEASTREAM_BIND (default 127.0.0.1), ``port`` / TEASTREAM_PORT
 (default 8113), ``token_file`` / TEASTREAM_TOKEN_FILE, ``save_root`` /
-TEASTREAM_SAVE_ROOT (default /downloads).
+TEASTREAM_SAVE_ROOT (default /downloads), and KiB/s bandwidth caps
+``max_download_kib`` / ``max_upload_kib`` / ``background_download_kib``
+(TEASTREAM_MAX_DOWNLOAD_KIB etc.; default unlimited; the background cap applies
+to each torrent no stream window is reading).
 
 Authentication: every endpoint except ``GET /v1/health`` needs
 ``Authorization: Bearer <token>``, the stripped contents of the token file. With
@@ -155,6 +158,9 @@ STREAMING_SESSION_SETTINGS = {
     'resolver_cache_timeout': 60,
 }
 WAIT_POLL_SECONDS = 0.05
+# Stream-window expiry, deadline refresh and bandwidth limits run on the
+# plugin's own timer: Deluge 2 never calls CorePluginBase.update().
+REFRESH_SECONDS = 1.0
 # Upper bound on waiting for libtorrent to confirm new file priorities.
 FILE_PRIORITY_TIMEOUT_SECONDS = 10
 
@@ -244,6 +250,8 @@ class Core(CorePluginBase):
         site = _QuietSite(_Api(self))
         self.listener = reactor.listenTCP(port, site, interface=bind)
         log.info('TeaStream API listening on %s:%d', bind, port)
+        self.refresh_loop = task.LoopingCall(self._refresh)
+        self.refresh_loop.start(REFRESH_SECONDS, now=False)
 
     def disable(self):
         alerts = component.get('AlertManager')
@@ -251,6 +259,8 @@ class Core(CorePluginBase):
         alerts.deregister_handler(self._on_file_priorities_applied)
         if self.waiter_loop.running:
             self.waiter_loop.stop()
+        if self.refresh_loop.running:
+            self.refresh_loop.stop()
         for waiter in list(self.waiters) + [w for ws in self.file_priority_waiters.values() for w in ws]:
             self._finish(waiter, 503, {'error': 'TeaStream plugin disabled'})
         self.waiters = []
@@ -261,7 +271,15 @@ class Core(CorePluginBase):
         self.streams = {}
         return self.listener.stopListening()
 
-    def update(self):
+    def _refresh(self):
+        # A LoopingCall stops for good on an uncaught exception, so log and
+        # carry on: one bad torrent must not freeze every stream's deadlines.
+        try:
+            self._refresh_streams()
+        except Exception:
+            log.exception('TeaStream refresh failed')
+
+    def _refresh_streams(self):
         now = time.monotonic()
         for info_hash, streams in list(self.streams.items()):
             for stream, window in list(streams.windows.items()):
