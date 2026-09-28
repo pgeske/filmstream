@@ -2076,6 +2076,62 @@ func TestPrewarmNeverMountsNewPrivateReleaseButReusesOneAlreadyPlaying(t *testin
 	}
 }
 
+// A tracker that allows head prewarm lets opening a title mount a large
+// private release (the engine then fetches only its head and tail); a small
+// release, whose head would be a large share of it, still is not mounted.
+func TestHeadPrewarmMountsOnlyLargePrivateReleases(t *testing.T) {
+	registry, err := indexer.NewRegistry([]config.Indexer{
+		{Name: "torrentleech", Type: "torznab", Endpoint: "https://tl.example/api", Private: true, HeadPrewarm: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		size   int64
+		status int
+		mounts int
+	}{
+		{name: "large release", size: 8 << 30, status: http.StatusCreated, mounts: 1},
+		{name: "small release", size: 1 << 30, status: http.StatusConflict, mounts: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			release := catalog.RankedCandidate{Score: 900, Candidate: catalog.Candidate{
+				ID: "tl-movie", Indexer: "torrentleech", Private: true, Protocol: catalog.ProtocolTorrent,
+				Name: "The.Movie.2020.1080p.WEB.H264-TL", SizeBytes: tc.size,
+				InfoHash:  "00000000000000000000000000000000000000cc",
+				MagnetURI: "magnet:?xt=urn:btih:00000000000000000000000000000000000000cc",
+			}}
+			engine := &fakeTorrentPlaybackEngine{}
+			server := &Server{
+				indexers: registry, engine: engine,
+				playbackSourceMode: config.PlaybackSourceTorrentOnly,
+				logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+				selected:           make(map[string]catalog.RankedCandidate),
+				playbackCacheKeys:  make(map[string]playbackCacheKey),
+				playbackLanguages:  make(map[string][]string),
+				playbackRequests:   make(map[string]CreatePlaybackRequest),
+				playbackResponses:  make(map[string]CreatePlaybackResponse),
+				releaseSearches:    make(map[string]*releaseSearchState),
+			}
+			request := CreatePlaybackRequest{MediaID: "tmdb:9", MediaType: "movie", Query: "The Movie", Year: 2020}
+			ready := make(chan struct{})
+			close(ready)
+			server.releaseSearches[releaseSearchKey(request)] = &releaseSearchState{
+				ready: ready, ranked: []catalog.RankedCandidate{release}, expiresAt: time.Now().Add(time.Minute),
+			}
+			httpRequest := httptest.NewRequest(http.MethodPost, "/v1/playbacks",
+				strings.NewReader(`{"media_id":"tmdb:9","media_type":"movie","query":"The Movie","year":2020}`))
+			httpRequest.Header.Set(prewarmRequestHeader, "1")
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, httpRequest)
+			if response.Code != tc.status || len(engine.created) != tc.mounts {
+				t.Fatalf("status = %d, mounts = %d, body = %s", response.Code, len(engine.created), response.Body.String())
+			}
+		})
+	}
+}
+
 func newRankedPlaybackTestServer(
 	t *testing.T,
 	logOutput io.Writer,

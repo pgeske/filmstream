@@ -44,6 +44,11 @@ type Indexer struct {
 	// and seeded until Seed is satisfied.
 	Private bool      `json:"private,omitempty"`
 	Seed    *SeedRule `json:"seed,omitempty"`
+	// HeadPrewarm lets opening a title fetch only the head and tail of a large
+	// private release before Play is pressed. Enable it only for trackers
+	// whose hit-and-run rules ignore torrents below a download threshold far
+	// above that (TorrentLeech: 10%).
+	HeadPrewarm bool `json:"head_prewarm,omitempty"`
 }
 
 type Resolver struct {

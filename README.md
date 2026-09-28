@@ -190,7 +190,8 @@ The optional configuration file is `~/.config/filmstream/config.json`:
       "endpoint": "http://prowlarr:9696/12/api",
       "api_key": "your-prowlarr-api-key",
       "private": true,
-      "seed": {"ratio": 1, "hours": 240}
+      "seed": {"ratio": 1, "hours": 240},
+      "head_prewarm": true
     }
   ]
 }
@@ -287,7 +288,7 @@ MPV waits for a two-second initial cache before playback to avoid startup jitter
 Every verified piece remains available for upload while the torrent is retained. After playback becomes idle, Filmstream manages the lifecycle automatically:
 
 1. Keep seeding a played public torrent until either `seed_ratio_target` is reached or it has held its finished files for `seed_max_hours`.
-2. Treat a torrent as private when it carries the BEP 27 private flag or comes from an indexer marked `"private": true`. Once playback has served data from it, or 5% of it has downloaded, Filmstream downloads the whole torrent and seeds it until the indexer's `seed` rule is met: the `ratio` is reached, or it has seeded as a complete torrent for `hours` plus `hours_per_gib` per GiB of size. Without a configured rule, indexers named like TorrentLeech use ratio 1 or 240 hours, AvistaZ uses 72 hours plus 2 hours per GiB, and any other private tracker uses ratio 1 or 240 hours. Only time spent seeding a complete torrent counts.
+2. Treat a torrent as private when it carries the BEP 27 private flag or comes from an indexer marked `"private": true`. Until playback serves data from it, a private torrent downloads only the head and tail of its selected file, so browsing, prewarming or losing a candidate race never snatches it. Once playback has served data from it, or 5% of it has downloaded, Filmstream downloads the whole torrent and seeds it until the indexer's `seed` rule is met: the `ratio` is reached, or it has seeded as a complete torrent for `hours` plus `hours_per_gib` per GiB of size. Without a configured rule, indexers named like TorrentLeech use ratio 1 or 240 hours, AvistaZ uses 72 hours plus 2 hours per GiB, and any other private tracker uses ratio 1 or 240 hours. Only time spent seeding a complete torrent counts. Prewarming (opening a title before pressing Play) mounts a new private release only when its indexer sets `"head_prewarm": true` and the release is at least 2 GiB; it then fetches just that head and tail. Enable it only for trackers whose hit-and-run rule ignores torrents downloaded below a threshold far above that, such as TorrentLeech's 10%.
 3. Rely on Deluge to persist torrents and their transfer and seeding counters; Filmstream persists its records and a copy of each `.torrent`, and re-adds any torrent Deluge lost, so restarts of either process resume the obligation.
 4. Retire an eligible torrent after the two-minute idle grace expires.
 5. Apply `max_seed_sessions` and `cache_limit_gib` only to public torrents and private torrents whose rule is met; protected torrents are never deleted early to satisfy a local cache target.

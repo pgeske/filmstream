@@ -290,7 +290,7 @@ func (e *Engine) readd(ctx context.Context, t *torrentState) {
 		return
 	}
 	_, err := e.plugin.add(ctx, pluginAddRequest{
-		Torrent: encodeTorrent(contents), SaveRoot: e.downloadsDir, WantedFiles: wantedFiles(record.WantAll, record.Files),
+		Torrent: encodeTorrent(contents), SaveRoot: e.downloadsDir, WantedFiles: record.wanted(),
 	})
 	if err != nil {
 		if !warned {

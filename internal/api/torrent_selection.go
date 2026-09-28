@@ -173,7 +173,7 @@ func (s *Server) createTorrentPlayback(
 	if err != nil {
 		return result, err
 	}
-	if prewarm && status.Private && !s.releaseInUse(selected.Candidate) {
+	if prewarm && status.Private && !s.releaseInUse(selected.Candidate) && !s.headPrewarmAllowed(selected.Candidate) {
 		// The indexer was not configured as private but the torrent is: reading
 		// payload now would create a seeding obligation the user never asked for.
 		_ = s.engine.Drop(session.ID)
@@ -243,7 +243,8 @@ func (s *Server) createCachedPlayback(
 		removeCached("quarantined")
 		return nil, nil, nil
 	}
-	if prewarm && s.candidateIsPrivate(cached.Selected.Candidate) && !s.releaseInUse(cached.Selected.Candidate) {
+	if prewarm && s.candidateIsPrivate(cached.Selected.Candidate) && !s.releaseInUse(cached.Selected.Candidate) &&
+		!s.headPrewarmAllowed(cached.Selected.Candidate) {
 		s.logger.Info("prewarm skips cached private release that no playback is using",
 			"media_id", request.MediaID, "name", cached.Selected.Candidate.Name)
 		return nil, nil, nil
@@ -653,13 +654,16 @@ func (s *Server) torrentAttemptSource(ctx context.Context, attempt torrentAttemp
 
 // prewarmableTorrentCandidates keeps the candidates a background prewarm may
 // mount without creating a private-tracker obligation the user never asked
-// for: public releases and releases an active playback already uses. When the
-// best candidate is a new private release, the prewarm is skipped instead of
+// for: public releases, releases an active playback already uses, and large
+// releases on private trackers that allow head prewarm (the engine downloads
+// only an unplayed private torrent's file head and tail). When the best
+// candidate is any other private release, the prewarm is skipped instead of
 // substituting a lower-ranked public release for the user's real choice.
 func (s *Server) prewarmableTorrentCandidates(ranked []catalog.RankedCandidate) ([]catalog.RankedCandidate, error) {
 	allowed := make([]catalog.RankedCandidate, 0, len(ranked))
 	for index, candidate := range ranked {
-		if !s.candidateIsPrivate(candidate.Candidate) || s.releaseInUse(candidate.Candidate) {
+		if !s.candidateIsPrivate(candidate.Candidate) || s.releaseInUse(candidate.Candidate) ||
+			s.headPrewarmAllowed(candidate.Candidate) {
 			allowed = append(allowed, candidate)
 			continue
 		}
@@ -668,6 +672,17 @@ func (s *Server) prewarmableTorrentCandidates(ranked []catalog.RankedCandidate) 
 		}
 	}
 	return allowed, nil
+}
+
+// headPrewarmMinBytes keeps a prewarmed head and tail (a few 16 MiB pieces)
+// a small fraction of the release, far below hit-and-run thresholds.
+const headPrewarmMinBytes = 2 << 30
+
+// headPrewarmAllowed reports whether a private release may be mounted by a
+// prewarm that fetches only its file head and tail.
+func (s *Server) headPrewarmAllowed(candidate catalog.Candidate) bool {
+	return s.indexers != nil && s.indexers.HeadPrewarm(candidate.Indexer) &&
+		candidate.SizeBytes >= headPrewarmMinBytes
 }
 
 func (s *Server) candidateIsPrivate(candidate catalog.Candidate) bool {

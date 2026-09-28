@@ -231,9 +231,13 @@ type Status struct {
 	UploadRate           int64      `json:"upload_rate"`
 	Progress             float64    `json:"progress"`
 	Private              bool       `json:"private"`
-	SeedingSeconds       int64      `json:"seeding_seconds"`
-	SeedRequirementMet   bool       `json:"seed_requirement_met"`
-	TrackerMessage       string     `json:"tracker_message"`
+	// Snatched reports that a private torrent was played (or downloaded far
+	// enough) and must now be completed and seeded. An unsnatched private
+	// torrent downloads only its file head and tail.
+	Snatched           bool   `json:"snatched"`
+	SeedingSeconds     int64  `json:"seeding_seconds"`
+	SeedRequirementMet bool   `json:"seed_requirement_met"`
+	TrackerMessage     string `json:"tracker_message"`
 }
 
 func New(cfg Config) (*Engine, error) {
@@ -491,11 +495,13 @@ func (e *Engine) Create(ctx context.Context, source Source) (*Session, error) {
 		}
 	}
 	e.saveMetainfo(t.hash, metainfo)
+	// Windows first: an unplayed private torrent wants no files, and with
+	// nothing wanted libtorrent would count it finished and drop its seeds.
+	e.setMountWindows(ctx, session)
 	if err := e.plugin.setFiles(ctx, t.hash, wanted); err != nil {
 		_ = e.Drop(id)
 		return nil, fmt.Errorf("select torrent files: %w", err)
 	}
-	e.setMountWindows(ctx, session)
 
 	e.logger.Info("torrent mounted",
 		"id", session.ID, "name", session.Name, "file", session.FileName, "info_hash", t.hash,
@@ -608,9 +614,8 @@ func (e *Engine) register(t *torrentState, session *Session, detail pluginTorren
 	e.persistLocked()
 	if record.WantAll {
 		t.wantAllPushed = true
-		return wantedFiles(true, nil)
 	}
-	return wantedFiles(false, record.Files)
+	return record.wanted()
 }
 
 func (e *Engine) setMountWindows(ctx context.Context, session *Session) {
@@ -886,6 +891,7 @@ func (e *Engine) Status(id string) (Status, bool) {
 	status.UploadRate = detail.UploadRate
 	status.Progress = detail.Progress
 	status.Private = record.Private || detail.Private
+	status.Snatched = status.Private && (record.Started || record.Obligated)
 	status.SeedingSeconds = detail.SeedingSeconds
 	status.SeedRequirementMet = seed.met
 	status.TrackerMessage = detail.TrackerMessage

@@ -165,6 +165,22 @@ func (r *managedTorrent) addFile(index int) bool {
 	return true
 }
 
+// wanted is the file selection Deluge should download in the background.
+// A private torrent nobody has played yet wants no files: only the stream
+// windows (file head and tail) download, so browsing, prewarming or losing a
+// candidate race never snatches it. Its first played byte switches it to
+// every file (see markServing).
+func (r *managedTorrent) wanted() any {
+	switch {
+	case r.WantAll:
+		return wantedFiles(true, nil)
+	case r.Private && !r.Started && !r.Obligated:
+		return wantedFiles(false, nil)
+	default:
+		return wantedFiles(false, r.Files)
+	}
+}
+
 func validInfoHash(value string) bool {
 	if len(value) != 40 {
 		return false

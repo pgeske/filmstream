@@ -30,10 +30,11 @@ type Indexer interface {
 }
 
 type Registry struct {
-	mu       sync.RWMutex
-	indexers map[string]Indexer
-	ordered  []Indexer
-	private  map[string]bool
+	mu          sync.RWMutex
+	indexers    map[string]Indexer
+	ordered     []Indexer
+	private     map[string]bool
+	headPrewarm map[string]bool
 }
 
 // SearchPolicy bounds a search across every configured indexer.
@@ -53,7 +54,9 @@ type SearchPolicy struct {
 
 func NewRegistry(configs []config.Indexer) (*Registry, error) {
 	client := &http.Client{Timeout: 20 * time.Second}
-	registry := &Registry{indexers: make(map[string]Indexer), private: make(map[string]bool)}
+	registry := &Registry{
+		indexers: make(map[string]Indexer), private: make(map[string]bool), headPrewarm: make(map[string]bool),
+	}
 	for _, cfg := range configs {
 		var implementation Indexer
 		var err error
@@ -76,6 +79,7 @@ func NewRegistry(configs []config.Indexer) (*Registry, error) {
 		registry.indexers[cfg.Name] = implementation
 		registry.ordered = append(registry.ordered, implementation)
 		registry.private[cfg.Name] = cfg.Private
+		registry.headPrewarm[cfg.Name] = cfg.Private && cfg.HeadPrewarm
 	}
 	return registry, nil
 }
@@ -89,6 +93,7 @@ func (r *Registry) Replace(configs []config.Indexer) error {
 	r.indexers = replacement.indexers
 	r.ordered = replacement.ordered
 	r.private = replacement.private
+	r.headPrewarm = replacement.headPrewarm
 	r.mu.Unlock()
 	return nil
 }
@@ -98,6 +103,14 @@ func (r *Registry) Private(name string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.private[name]
+}
+
+// HeadPrewarm reports whether the named private indexer allows prewarming
+// the head and tail of a release before the user presses Play.
+func (r *Registry) HeadPrewarm(name string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.headPrewarm[name]
 }
 
 // Search queries every configured indexer concurrently and returns when all of

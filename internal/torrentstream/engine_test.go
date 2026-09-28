@@ -144,8 +144,13 @@ func TestPrivateTorrentDownloadsEveryFileOncePlayed(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := plugin.Priorities(hash); !slices.Equal(got, []int{0, 4}) {
-				t.Fatalf("unplayed private priorities = %v, want only the selected file", got)
+			// Unplayed, a private torrent wants no files: only its stream windows
+			// download, so browsing or a lost race never snatches it.
+			if got := plugin.Priorities(hash); !slices.Equal(got, []int{0, 0}) {
+				t.Fatalf("unplayed private priorities = %v, want no files", got)
+			}
+			if status, _ := engine.Status(session.ID); status.Snatched {
+				t.Fatalf("unplayed status = %+v, want not snatched", status)
 			}
 			if _, err := fetch(t.Context(), engine, session.ID, "bytes=0-9"); err != nil {
 				t.Fatal(err)
@@ -153,8 +158,8 @@ func TestPrivateTorrentDownloadsEveryFileOncePlayed(t *testing.T) {
 			if got := plugin.Priorities(hash); !slices.Equal(got, []int{4, 4}) {
 				t.Fatalf("played private priorities = %v, want every file", got)
 			}
-			if status, _ := engine.Status(session.ID); !status.Private {
-				t.Fatalf("status = %+v, want private", status)
+			if status, _ := engine.Status(session.ID); !status.Private || !status.Snatched {
+				t.Fatalf("status = %+v, want private and snatched", status)
 			}
 		})
 	}

@@ -16,6 +16,7 @@ import (
 	"github.com/pgeske/filmstream/internal/history"
 	"github.com/pgeske/filmstream/internal/hls"
 	"github.com/pgeske/filmstream/internal/metadata"
+	"github.com/pgeske/filmstream/internal/torrentstream"
 )
 
 const (
@@ -272,6 +273,14 @@ func (s *Server) runPlaybackPrewarm(ctx context.Context, key string, state *play
 		}
 		return
 	}
+	if status := s.prewarmTorrentStatus(response.ID); status.Private && !status.Snatched {
+		// Packaging would read payload and snatch the release; the engine is
+		// already fetching its file head and tail, which is all Play needs.
+		// Unclaimed, the playback is stopped and the untouched torrent dropped.
+		s.logger.Info("prewarmed private release head only", "id", response.ID, "name", status.Name)
+		time.AfterFunc(prewarmHintTTL, func() { s.expireUnusedPrewarm(key, state) })
+		return
+	}
 	bitmapSubtitleIndex := s.bitmapSubtitleIndexForPrewarm(
 		ctx, response.ID, state.target.subtitleSelection,
 	)
@@ -344,6 +353,16 @@ func (s *Server) runPlaybackPrewarm(ctx context.Context, key string, state *play
 	if err == nil {
 		time.AfterFunc(prewarmHintTTL, func() { s.expireUnusedPrewarm(key, state) })
 	}
+}
+
+// prewarmTorrentStatus is the torrent status of a prewarmed playback, zero
+// for Usenet playbacks and servers without a torrent engine.
+func (s *Server) prewarmTorrentStatus(id string) torrentstream.Status {
+	if s.engine == nil {
+		return torrentstream.Status{}
+	}
+	status, _ := s.engine.Status(id)
+	return status
 }
 
 func (s *Server) expireUnusedPrewarm(key string, state *playbackPrewarmState) {
