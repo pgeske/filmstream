@@ -32,7 +32,8 @@ for device in devices:
     connection = device.get("connectionProperties", {})
     if (
         hardware.get("platform") == "iOS"
-        and hardware.get("reality") == "physical"
+        # Newer devicectl lists simulators too and omits "reality" for real devices.
+        and hardware.get("reality", "physical") == "physical"
         and connection.get("pairingState") == "paired"
     ):
         candidates.append(device)
