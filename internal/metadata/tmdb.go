@@ -51,10 +51,11 @@ type TMDB struct {
 	language string
 	client   *http.Client
 
-	mu      sync.RWMutex
-	imdbIDs map[string]string
-	shows   map[string]Show
-	seasons map[string]Season
+	mu       sync.RWMutex
+	imdbIDs  map[string]string
+	runtimes map[string]int
+	shows    map[string]Show
+	seasons  map[string]Season
 }
 
 type tmdbMediaResult struct {
@@ -100,7 +101,8 @@ func NewTMDB(baseURL, token, language string, client *http.Client) (*TMDB, error
 	}
 	return &TMDB{
 		baseURL: baseURL, token: strings.TrimSpace(token), language: language, client: client,
-		imdbIDs: make(map[string]string), shows: make(map[string]Show), seasons: make(map[string]Season),
+		imdbIDs: make(map[string]string), runtimes: make(map[string]int),
+		shows: make(map[string]Show), seasons: make(map[string]Season),
 	}, nil
 }
 
@@ -150,6 +152,36 @@ func (t *TMDB) IMDbID(ctx context.Context, mediaID string) (string, error) {
 	t.imdbIDs[mediaID] = imdbID
 	t.mu.Unlock()
 	return imdbID, nil
+}
+
+func (t *TMDB) MovieRuntime(ctx context.Context, mediaID string) (int, error) {
+	kind, id, err := parseTMDBMediaID(mediaID)
+	if err != nil {
+		return 0, err
+	}
+	if kind != "movie" {
+		return 0, fmt.Errorf("TMDB %s %s is not a movie", kind, id)
+	}
+	t.mu.RLock()
+	cached, ok := t.runtimes[mediaID]
+	t.mu.RUnlock()
+	if ok {
+		return cached, nil
+	}
+
+	var payload struct {
+		Runtime int `json:"runtime"`
+	}
+	if err := t.getJSON(ctx, "movie/"+id, nil, &payload); err != nil {
+		return 0, fmt.Errorf("request TMDB movie details: %w", err)
+	}
+	if payload.Runtime <= 0 {
+		return 0, fmt.Errorf("TMDB movie %s has no runtime", id)
+	}
+	t.mu.Lock()
+	t.runtimes[mediaID] = payload.Runtime
+	t.mu.Unlock()
+	return payload.Runtime, nil
 }
 
 func (t *TMDB) Discover(ctx context.Context, collection Collection) ([]Movie, error) {

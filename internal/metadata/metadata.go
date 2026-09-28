@@ -102,6 +102,11 @@ type IMDbIDProvider interface {
 	IMDbID(context.Context, string) (string, error)
 }
 
+// MovieRuntimeProvider reports a movie's runtime in minutes.
+type MovieRuntimeProvider interface {
+	MovieRuntime(context.Context, string) (int, error)
+}
+
 type Collection string
 
 const (

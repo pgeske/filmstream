@@ -15,13 +15,13 @@ Use it only with media you are authorized to access, download, or share.
 - On-demand Usenet streaming through InfiniDysk, including HTTP Range seeking and virtual RAR/7z access
 - Configurable hybrid, Usenet-only, or torrent-only source selection
 - Optional natural-language movie resolution through OpenAI-compatible models
-- Release ranking by title, year or episode, resolution, language, codec, size, seeders, and leechers
+- Release ranking by title, year or episode, resolution, language, codec, estimated bitrate, seeders, private tracker, and freeleech, with concurrent selection among the top three healthy torrents
 - Direct magnet and `.torrent` playback
-- HTTP Range streaming with seeking and 32 MiB read-ahead
-- Demand-driven smart sampling without downloading payload data from rejected candidates
-- Durable seeding until either a 1.0 ratio or 168 hours of active seeding is reached
+- BitTorrent through a Deluge sidecar and its TeaStream plugin ([deluge/](deluge/README.md)), with HTTP Range streaming, seeking, and a growing window of deadline-prioritized pieces ahead of every reader
+- Candidate evaluation that fetches only each file's head and tail, and removes rejected public candidates with their data
+- Public torrents seed until a 1.0 ratio or 168 hours; private-tracker torrents are completed and seeded until their tracker's hit-and-run rule is met
 - Automatic retirement and a 20 GiB cache target that never evicts torrents with outstanding seeding obligations
-- Torrent-only TV playback that prefers full-season packs, reuses one release across the season, and falls back to individual episodes only when no pack is available
+- Torrent-only TV playback that prefers healthy full-season packs, reuses one release across the season, and falls back to individual episodes when no healthy pack is available
 - Episode-aware file selection within season packs, with largest-video fallback for direct and movie sources
 
 ## Install
@@ -34,6 +34,8 @@ make install
 ```
 
 This installs `filmstream` to `~/.local/bin` by default. Ubuntu 22.04 ships MPV 0.34.1; it works through Filmstream's compatibility path. Under WSL, a current native Windows MPV can instead be selected with its mounted path, such as `/mnt/c/Users/you/mpv/mpv.com`; Filmstream preserves watch-progress tracking through a temporary MPV script.
+
+Torrent playback additionally needs a Deluge 2 daemon running the TeaStream plugin on the same host; see [`deluge/README.md`](deluge/README.md).
 
 ## Use
 
@@ -127,11 +129,9 @@ The optional configuration file is `~/.config/filmstream/config.json`:
   "ffmpeg_path": "ffmpeg",
   "ffprobe_path": "ffprobe",
   "hls_startup_seconds": 90,
-  "hls_startup_buffer_seconds": 12,
-  "hls_read_rate": 1.25,
+  "hls_startup_buffer_seconds": 8,
   "hls_segment_seconds": 4,
   "max_candidate_gib": 60,
-  "readahead_mib": 32,
   "metadata_timeout_seconds": 120,
   "seed_ratio_target": 1.0,
   "cache_limit_gib": 20,
@@ -168,6 +168,11 @@ The optional configuration file is `~/.config/filmstream/config.json`:
     "category": "movies",
     "startup_timeout_seconds": 20
   },
+  "deluge": {
+    "plugin_url": "http://127.0.0.1:8113",
+    "token_file": "/secrets/teastream-token",
+    "downloads_dir": "/downloads"
+  },
   "indexers": [
     {
       "name": "open-media",
@@ -178,6 +183,15 @@ The optional configuration file is `~/.config/filmstream/config.json`:
       "name": "internet-archive",
       "type": "internet_archive",
       "endpoint": "https://archive.org"
+    },
+    {
+      "name": "my-private-tracker",
+      "type": "torznab",
+      "endpoint": "http://prowlarr:9696/12/api",
+      "api_key": "your-prowlarr-api-key",
+      "private": true,
+      "seed": {"ratio": 1, "hours": 240},
+      "head_prewarm": true
     }
   ]
 }
@@ -185,7 +199,7 @@ The optional configuration file is `~/.config/filmstream/config.json`:
 
 Set `FILMSTREAM_CONFIG` to use another path or `FILMSTREAM_SERVER` to use an already-running backend. Set `OMDB_API_KEY` to enable the optional `GET /v1/catalog/ratings` endpoint. When a client opens media details, the server resolves a supplied TMDB movie or show ID to its IMDb ID, queries OMDb, and caches successful results in memory. This avoids misses caused by localized or alternate titles, and the API key never leaves the server.
 
-Managed torrent data is stored beneath `<data_dir>/torrents`, with private resume metadata beside it so required seeding survives normal server restarts. Temporary native-player segments are stored beneath `<hls_dir>` and may be discarded between sessions. Do not place unrelated files in either location. Durable watch progress, personalized recommendations, and private selected-release metadata are stored separately beneath `<state_dir>` with owner-only permissions. Recommendations use the resolver's existing OpenAI-compatible endpoint and credentials; omit `recommendations.model` to use the resolver model, or set it to choose another model from the same provider. Each daily recommendation refresh uses one model completion to request a surplus of both media types, then validates and caches up to 50 shows followed by up to 50 movies in the existing `items` array. Individual metadata failures are tolerated only when that media type has already filled its 50-item cap; otherwise the last good cached list is retained. Set `recommendations.prompt_file` to an absolute path whose text is the authoritative taste prompt whenever the file exists and is non-empty; the server re-reads it after its modification time changes and falls back to the stored prompt when the file is missing or empty, while `PUT /v1/recommendations/prompt` remains available when no prompt file is configured.
+Deluge saves torrent payload beneath `deluge.downloads_dir`, one `<info_hash>` directory per torrent; Filmstream reads it at the same path, so both containers must mount it identically. Filmstream keeps its torrent records and a copy of each `.torrent` beneath `<data_dir>/managed-torrents`, so required seeding survives restarts of either process and a torrent Deluge loses is re-added. Temporary native-player segments are stored beneath `<hls_dir>` and may be discarded between sessions. Do not place unrelated files in any of these locations. Durable watch progress, personalized recommendations, and private selected-release metadata are stored separately beneath `<state_dir>` with owner-only permissions. Recommendations use the resolver's existing OpenAI-compatible endpoint and credentials; omit `recommendations.model` to use the resolver model, or set it to choose another model from the same provider. Each daily recommendation refresh uses one model completion to request a surplus of both media types, then validates and caches up to 50 shows followed by up to 50 movies in the existing `items` array. Individual metadata failures are tolerated only when that media type has already filled its 50-item cap; otherwise the last good cached list is retained. Set `recommendations.prompt_file` to an absolute path whose text is the authoritative taste prompt whenever the file exists and is non-empty; the server re-reads it after its modification time changes and falls back to the stored prompt when the file is missing or empty, while `PUT /v1/recommendations/prompt` remains available when no prompt file is configured.
 
 ## Usenet streaming
 
@@ -193,7 +207,9 @@ Filmstream delegates NNTP article retrieval, yEnc decoding, archive mapping, and
 
 `playback_source_mode` controls movie playback and defaults to `torrent_only`. `torrent_only` uses BitTorrent for both movies and TV, does not initialize the Usenet backend, and clears cached NZBs and Usenet failure state at startup. `hybrid` strongly prefers compatible Usenet releases and falls back to cached or newly ranked torrents. `usenet_only` uses only NZBs for movies, while TV episodes still use torrents. Explicit `--magnet` and `--torrent` inputs remain direct overrides.
 
-TV browsing searches every torrent indexer for the requested season and caches the ranked results for ten minutes without mounting or downloading a torrent. Season and TV queries run concurrently, and an explicit episode query is skipped as soon as an eligible full-season pack is found. Playback uses only full-season packs when at least one valid pack is available for a completed season. For the currently airing season, it allows exact individual episodes until the published episode count indicates that the season is complete. Successful torrent metadata is cached under a season identity rather than an episode identity, so subsequent and prefetched episodes reuse the same release and select their own `SxxExx` file from that torrent.
+TV browsing searches every torrent indexer for the requested season and caches the ranked results for ten minutes without mounting or downloading a torrent. Season, episode, and TV (IMDb/TMDB ID when the indexer supports it) queries run concurrently. Playback prefers full-season packs when at least one pack with a healthy swarm (five or more seeders) is available for a completed season; thin or dead packs never hide healthy individual episodes. For the currently airing season, it allows exact individual episodes until the published episode count indicates that the season is complete. Successful torrent metadata is cached under a season identity rather than an episode identity, so subsequent and prefetched episodes reuse the same release and select their own `SxxExx` file from that torrent.
+
+A playback request searches all indexers concurrently for at most 12 seconds, and stops waiting four seconds after a playable release with a healthy swarm appears, so a slower private tracker can still outrank a fast public one. The same torrent listed by several indexers is ranked once. Ranking rejects zero-seeder torrents, penalizes fewer than three seeders, weighs seeders about as heavily as the preferred resolution, estimates bitrate from size and TMDB runtime (penalizing more than 15 Mbps at 1080p or 40 Mbps at 2160p), prefers compact WEB/Blu-ray H.264/HEVC encodes, and favors private-tracker and freeleech releases. Selection then mounts the top three candidates concurrently (20 seconds for metadata, 10 more for a connected peer), keeps the best-ranked one whose swarm delivers data, and drops the others before playback reads them. Any candidate that fails to mount, stays silent, or later fails HLS startup or media probing is skipped for that title for ten minutes, by info hash across indexers. Cache, search, and selection together are bounded at 45 seconds. Background prewarms never mount a new private-tracker release; they only reuse one an active playback already streams (such as the next episode of a season pack) or mount public releases.
 
 After HLS starts successfully, Filmstream stores the selected NZB and sanitized release metadata privately under `state_dir`. Later playback tries that NZB before contacting an indexer. Missing articles, invalid archives, unsupported files, or changed subtitle requirements invalidate the cached release and resume the normal ranked search. Filmstream otherwise tries ranked NZBs within one 30-second preparation budget, up to ten candidates when failures are detected quickly; only `hybrid` continues to torrent fallback afterward.
 
@@ -265,17 +281,18 @@ The config file is written with mode `0600` because it contains API keys. The CL
 
 ## Smart streaming, cleanup, and ratio behavior
 
-Filmstream only requests the pieces needed by MPV's current HTTP Range request, a 32 MiB read-ahead window, and samples used to validate container metadata. It does not prefetch payload bytes while merely evaluating torrent candidates. Native HLS prepares `hls_startup_buffer_seconds` of media (12 seconds by default) before opening the player, then packages at `hls_read_rate` times playback speed to build resilience against brief source stalls without racing through the full movie immediately. Closing either player closes its readers and removes temporary HLS segments.
+Deluge downloads only the selected file of a torrent. Mounting it immediately requests the file's first 16 MiB and last 4 MiB so probing can start at once. Each HTTP reader then keeps a stream window ahead of its position: it starts at 64 MiB, grows to 1 GiB during a long sequential read, and restarts at the new position after a seek; its nearest quarter (32–256 MiB) gets staggered piece deadlines so Deluge fetches it in reading order. Bytes are served only once Deluge has verified their pieces. Native HLS prepares `hls_startup_buffer_seconds` of media (8 seconds by default) before opening the player, then packages as fast as the source delivers so a recovering torrent refills the player's buffer at full speed. The packager pauses only while it is more than 10 minutes ahead of the player and continues once the lead drops below 9 minutes. The old `hls_read_rate` setting is ignored. Text subtitles are extracted by the same FFmpeg process as the video, so they never fall behind it. Closing either player closes its readers and removes temporary HLS segments.
 
-MPV waits for a two-second initial cache before playback to avoid startup jitter. Native Windows MPV uses its D3D11 hardware-decoding and GPU-rendering path. Linux MPV on WSL uses `gpu-next` with `nvdec-copy` when supported and retains `wlshm` as a compatibility fallback; other environments keep MPV's portable automatic output and software-decoding fallback. Apple clients request streaming-optimized H.264/H.265 releases, avoid known-incompatible Dolby Vision releases, and reject AI-upscaled releases and 2160p remuxes. Filmstream normally copies video without quality loss and transcodes only audio for AVPlayer compatibility. When a bitmap subtitle such as Blu-ray PGS is selected, it instead uses a hardware-accelerated H.264 rendition to preserve the original subtitle artwork because Apple HLS does not carry PGS directly. Within the matching season-pack or episode set, ranking strongly prioritizes the requested resolution and then reported seeders; file size is not a ranking signal beyond the configured safety ceiling. Filmstream still checks the top candidates for live peers because indexer seeder counts can be stale. It prefers a comparably healthy release with verified supported subtitles and uses the best live fallback only when none of the viable candidates exposes subtitles.
+MPV waits for a two-second initial cache before playback to avoid startup jitter. Native Windows MPV uses its D3D11 hardware-decoding and GPU-rendering path. Linux MPV on WSL uses `gpu-next` with `nvdec-copy` when supported and retains `wlshm` as a compatibility fallback; other environments keep MPV's portable automatic output and software-decoding fallback. Apple clients request streaming-optimized H.264/H.265 releases, avoid known-incompatible Dolby Vision releases, and reject AI-upscaled releases and 2160p remuxes. Filmstream normally copies video without quality loss and transcodes only audio for AVPlayer compatibility. When a bitmap subtitle such as Blu-ray PGS is selected, it instead burns the subtitle into an H.264 rendition scaled to at most 1080p, with a keyframe at every segment boundary, because Apple HLS does not carry PGS directly. `--bitmap-subtitle-encoder` selects `libx264` (default) or `h264_nvenc`; NVENC is test-encoded at startup and falls back to libx264 with a warning when no usable GPU is present. Within the matching season-pack or episode set, ranking strongly prioritizes the requested resolution and then reported seeders; file size is not a ranking signal beyond the configured safety ceiling. Filmstream still checks the top candidates for live peers because indexer seeder counts can be stale. It prefers a comparably healthy release with verified supported subtitles and uses the best live fallback only when none of the viable candidates exposes subtitles.
 
 Every verified piece remains available for upload while the torrent is retained. After playback becomes idle, Filmstream manages the lifecycle automatically:
 
-1. Keep seeding downloaded pieces until either `seed_ratio_target` is reached or `seed_max_hours` of active seeding has accumulated.
-2. Persist torrent metainfo, transfer counters, and accumulated seeding time so normal restarts resume the obligation.
-3. Retire an eligible torrent after the two-minute idle grace expires.
-4. Apply `max_seed_sessions` and `cache_limit_gib` only to torrents that have no outstanding seeding obligation; protected torrents are never deleted early to satisfy a local cache target.
-5. Remove unused candidates that never downloaded playback payload after the idle grace.
+1. Keep seeding a played public torrent until either `seed_ratio_target` is reached or it has held its finished files for `seed_max_hours`.
+2. Treat a torrent as private when it carries the BEP 27 private flag or comes from an indexer marked `"private": true`. Until playback serves data from it, a private torrent downloads only the head and tail of its selected file, so browsing, prewarming or losing a candidate race never snatches it. Once playback has served data from it, or 5% of it has downloaded, Filmstream downloads the whole torrent and seeds it until the indexer's `seed` rule is met: the `ratio` is reached, or it has seeded as a complete torrent for `hours` plus `hours_per_gib` per GiB of size. Without a configured rule, indexers named like TorrentLeech use ratio 1 or 240 hours, AvistaZ uses 72 hours plus 2 hours per GiB, and any other private tracker uses ratio 1 or 240 hours. Only time spent seeding a complete torrent counts. Prewarming (opening a title before pressing Play) mounts a new private release only when its indexer sets `"head_prewarm": true` and the release is at least 2 GiB; it then fetches just that head and tail. Enable it only for trackers whose hit-and-run rule ignores torrents downloaded below a threshold far above that, such as TorrentLeech's 10%.
+3. Rely on Deluge to persist torrents and their transfer and seeding counters; Filmstream persists its records and a copy of each `.torrent`, and re-adds any torrent Deluge lost, so restarts of either process resume the obligation.
+4. Retire an eligible torrent after the two-minute idle grace expires.
+5. Apply `max_seed_sessions` and `cache_limit_gib` only to public torrents and private torrents whose rule is met; protected torrents are never deleted early to satisfy a local cache target.
+6. Remove unused candidates after the idle grace, and remove a rejected candidate at once unless it already served playback data or is a private torrent that downloaded 5%.
 
 Active playback is never evicted. A full episode watch may naturally download the selected file from a season pack, and the same torrent can serve and prefetch later episodes without selecting another release. Usenet sessions fetch only article ranges requested by the player; their virtual release metadata is deleted after the idle grace period and has no seeding lifecycle.
 
@@ -285,7 +302,7 @@ Inspect an active session with:
 filmstream status PLAYBACK_ID
 ```
 
-A 1.0 ratio means one uploaded byte per downloaded byte. Filmstream cannot force peers to request data, so the 168-hour path remains necessary when ratio cannot be reached. Configure both values to match the tracker whose releases are being used; the local session and cache targets do not override them.
+A 1.0 ratio means one uploaded byte per downloaded byte. Filmstream cannot force peers to request data, so the 168-hour path remains necessary when ratio cannot be reached. These two values apply to public torrents; private trackers use their indexer's `seed` rule. The local session and cache targets override neither.
 
 ## API
 
@@ -308,7 +325,7 @@ A 1.0 ratio means one uploaded byte per downloaded byte. Filmstream cannot force
 - `POST|DELETE /v1/playbacks/{id}/hls`
 - `GET /v1/playbacks/{id}/hls/{asset}`
 
-Playback status includes an optional `hls` object describing producer state and packaged seconds separately from the source's active-reader count. A stopped or failed producer cannot remain ready merely because its startup segments still exist. Canceling an HLS request does not stop an already-published producer shared by other consumers; explicit DELETE retires the playback's current generation, including unfinished startup. See [playback ownership and reliability](docs/playback-lifecycle.md) for the lifecycle contract, diagnostics, and remaining device-validation boundaries.
+Playback status includes an optional `hls` object describing producer state and packaged seconds separately from the source's active-reader count. A stopped or failed producer cannot remain ready merely because its startup segments still exist. `POST /v1/playbacks/{id}/hls` returns `playlist_url` (the video media playlist) and `master_url`, a master playlist that adds every text subtitle track as a segmented WebVTT rendition; each text track's `rendition_name` is its `NAME` there. The full growing WebVTT file stays available at `subtitle-{index}.vtt`. A source that is slow or briefly stalled never fails playback: start or resume answers HTTP 503 with `Retry-After` while the packager keeps working, and status reports `buffering` after 45 seconds without a new segment. Only a producer failure (FFmpeg error, unsupported media, or the torrent engine declaring the source unavailable) returns 502. Canceling an HLS request does not stop an already-published producer shared by other consumers; explicit DELETE retires the playback's current generation, including unfinished startup. See [playback ownership and reliability](docs/playback-lifecycle.md) for the lifecycle contract, diagnostics, and remaining device-validation boundaries.
 
 ## Development
 

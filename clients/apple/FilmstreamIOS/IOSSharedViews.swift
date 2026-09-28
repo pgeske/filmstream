@@ -454,3 +454,143 @@ struct MobileDetailButtonStyle: ButtonStyle {
         kind == .destructive ? Color.mobileTeaAmber.opacity(0.42) : Color.mobileTeaCream.opacity(0.12)
     }
 }
+
+/// Covers a detail screen while a title is prepared for playback, and keeps a failed
+/// preparation on screen until the viewer tries again or closes it.
+struct IOSPlaybackPreparationPanel: View {
+    let preparation: PlaybackPreparation
+    let title: String
+    var subtitle: String?
+
+    var body: some View {
+        ZStack {
+            if preparation.isPreparing || preparation.errorMessage != nil {
+                Color.black.opacity(0.68)
+                    .ignoresSafeArea()
+                    .transition(.opacity)
+
+                ViewThatFits(in: .vertical) {
+                    card
+                    ScrollView {
+                        card
+                            .frame(maxWidth: .infinity)
+                    }
+                    .scrollBounceBehavior(.basedOnSize)
+                }
+                .padding(20)
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
+            }
+        }
+        .animation(.easeOut(duration: 0.2), value: preparation.isPreparing)
+        .animation(.easeOut(duration: 0.2), value: preparation.errorMessage)
+    }
+
+    private var card: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if let errorMessage = preparation.errorMessage {
+                failureContent(errorMessage)
+            } else {
+                progressContent
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: 480, alignment: .leading)
+        .background(Color.mobileTeaPanel, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(Color.mobileTeaCream.opacity(0.18), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.45), radius: 24, y: 12)
+        .accessibilityElement(children: .contain)
+        .accessibilityAddTraits(.isModal)
+    }
+
+    @ViewBuilder
+    private var progressContent: some View {
+        let progress = preparation.progress
+
+        titleBlock
+
+        Text(progress?.headline ?? "Preparing…")
+            .font(.title2.weight(.bold))
+            .foregroundStyle(Color.mobileTeaCream)
+            .fixedSize(horizontal: false, vertical: true)
+
+        if let detail = progress?.detail {
+            Text(detail)
+                .font(.body.weight(.semibold))
+                .foregroundStyle(Color.mobileTeaAccentLight)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+
+        if let fraction = progress?.fraction {
+            ProgressView(value: min(max(fraction, 0), 1))
+                .tint(Color.mobileTeaAccent)
+                .padding(.vertical, 4)
+        } else {
+            ProgressView()
+                .controlSize(.large)
+                .tint(Color.mobileTeaAccentLight)
+                .frame(maxWidth: .infinity)
+        }
+
+        Button {
+            preparation.cancel()
+        } label: {
+            Label("Cancel", systemImage: "xmark")
+        }
+        .buttonStyle(MobileDetailButtonStyle(kind: .standard))
+        .keyboardShortcut(.cancelAction)
+    }
+
+    @ViewBuilder
+    private func failureContent(_ message: String) -> some View {
+        Label {
+            Text("Couldn't Start Playback")
+                .foregroundStyle(Color.mobileTeaCream)
+        } icon: {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(Color.mobileTeaAmber)
+        }
+        .font(.title2.weight(.bold))
+
+        titleBlock
+
+        Text(message)
+            .font(.body.weight(.medium))
+            .foregroundStyle(Color.mobileTeaCream)
+            .fixedSize(horizontal: false, vertical: true)
+
+        if preparation.canRetry {
+            Button {
+                preparation.retry()
+            } label: {
+                Label("Try Again", systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(MobileDetailButtonStyle(kind: .prominent))
+            .keyboardShortcut(.defaultAction)
+        }
+
+        Button {
+            preparation.cancel()
+        } label: {
+            Label("Close", systemImage: "xmark")
+        }
+        .buttonStyle(MobileDetailButtonStyle(kind: .standard))
+        .keyboardShortcut(.cancelAction)
+    }
+
+    private var titleBlock: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.title3.weight(.bold))
+                .foregroundStyle(Color.mobileTeaAccentLight)
+            if let subtitle {
+                Text(subtitle)
+                    .font(.headline)
+                    .foregroundStyle(Color.mobileTeaCream)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+}

@@ -8,13 +8,12 @@ import SwiftUI
 
 struct MacPlayerView: View {
     let movie: Movie
-    let prepared: PreparedPlayback
     let api: FilmstreamAPI
     let nextEpisode: Episode?
     let onPlayNext: (@MainActor (Episode) async throws -> Void)?
     let onClose: () -> Void
 
-    @StateObject private var controller: MacPlaybackController
+    @StateObject private var controller: NativePlaybackController
     @StateObject private var pictureInPicture = MacPictureInPictureController()
     @State private var didClose = false
     @State private var nextEpisodeTask: Task<Void, Never>?
@@ -36,13 +35,12 @@ struct MacPlayerView: View {
         onClose: @escaping () -> Void
     ) {
         self.movie = movie
-        self.prepared = prepared
         self.api = api
         self.nextEpisode = nextEpisode
         self.onPlayNext = onPlayNext
         self.onClose = onClose
         _controller = StateObject(
-            wrappedValue: MacPlaybackController(prepared: prepared, api: api)
+            wrappedValue: NativePlaybackController(movie: movie, prepared: prepared, api: api)
         )
     }
 
@@ -87,20 +85,36 @@ struct MacPlayerView: View {
             .animation(.easeOut(duration: 0.2), value: controlsAreVisible)
 
             if let errorMessage = nextEpisodeError ?? controller.errorMessage {
-                VStack(spacing: 14) {
+                VStack(spacing: 16) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .font(.largeTitle)
                         .foregroundStyle(Color.macTeaAmber)
                     Text(nextEpisodeError == nil ? "Unable to Play" : "Unable to Start Next Episode")
-                        .font(.headline)
-                    Text(errorMessage)
-                        .font(.callout)
-                        .foregroundStyle(Color.macTeaMuted)
+                        .font(.title.weight(.bold))
+                        .foregroundStyle(Color.macTeaCream)
                         .multilineTextAlignment(.center)
-                        .frame(maxWidth: 420)
+                    Text(errorMessage)
+                        .font(.title3)
+                        .foregroundStyle(Color.macTeaCream)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(6)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: 520)
+                    HStack(spacing: 12) {
+                        Button(action: retryAfterError) {
+                            Label("Try Again", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(MacDetailButtonStyle(kind: .prominent))
+
+                        Button(action: requestClose) {
+                            Label("Close", systemImage: "xmark")
+                        }
+                        .buttonStyle(MacDetailButtonStyle(kind: .standard))
+                    }
+                    .padding(.top, 6)
                 }
-                .padding(28)
-                .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 18))
+                .padding(32)
+                .background(.black.opacity(0.86), in: RoundedRectangle(cornerRadius: 20))
             } else if isStartingNextEpisode {
                 VStack(spacing: 14) {
                     ProgressView()
@@ -112,12 +126,29 @@ struct MacPlayerView: View {
                 .padding(28)
                 .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 18))
             } else if controller.isWaiting {
-                ProgressView()
-                    .controlSize(.large)
-                    .tint(Color.macTeaAccent)
-                    .padding(24)
-                    .background(.black.opacity(0.56), in: Circle())
-                    .allowsHitTesting(false)
+                VStack(spacing: 16) {
+                    ProgressView()
+                        .controlSize(.large)
+                        .tint(Color.macTeaAccent)
+                        .padding(24)
+                        .background(.black.opacity(0.56), in: Circle())
+
+                    if let waitingDetail = controller.waitingDetail {
+                        Text(waitingDetail)
+                            .font(.title3.weight(.semibold))
+                            .foregroundStyle(Color.macTeaCream)
+                            .multilineTextAlignment(.center)
+                            .lineLimit(2)
+                            .frame(maxWidth: 560)
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 10)
+                            .background(
+                                .black.opacity(0.72),
+                                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            )
+                    }
+                }
+                .allowsHitTesting(false)
             }
         }
         .onAppear {
@@ -201,13 +232,36 @@ struct MacPlayerView: View {
 
             Spacer()
 
+            if controller.audioOptions.count > 1 {
+                Menu {
+                    ForEach(controller.audioOptions) { track in
+                        Button {
+                            revealControls()
+                            controller.selectAudio(track)
+                        } label: {
+                            trackMenuLabel(
+                                track.displayName,
+                                selected: controller.selectedAudio?.index == track.index
+                            )
+                        }
+                    }
+                } label: {
+                    Label(
+                        controller.selectedAudio?.displayName ?? "Audio",
+                        systemImage: "waveform"
+                    )
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+            }
+
             if !controller.subtitleOptions.isEmpty {
                 Menu {
                     Button {
                         revealControls()
                         controller.selectSubtitle(nil)
                     } label: {
-                        subtitleMenuLabel("Off", selected: controller.selectedSubtitle == nil)
+                        trackMenuLabel("Off", selected: controller.selectedSubtitle == nil)
                     }
                     Divider()
                     ForEach(controller.subtitleOptions) { track in
@@ -215,7 +269,7 @@ struct MacPlayerView: View {
                             revealControls()
                             controller.selectSubtitle(track)
                         } label: {
-                            subtitleMenuLabel(
+                            trackMenuLabel(
                                 track.macDisplayName,
                                 selected: controller.selectedSubtitle?.index == track.index
                             )
@@ -363,7 +417,7 @@ struct MacPlayerView: View {
         revealControls()
     }
 
-    private func subtitleMenuLabel(_ title: String, selected: Bool) -> some View {
+    private func trackMenuLabel(_ title: String, selected: Bool) -> some View {
         HStack {
             Text(title)
             if selected {
@@ -405,6 +459,15 @@ struct MacPlayerView: View {
                 controlsAreVisible = true
             }
         }
+    }
+
+    private func retryAfterError() {
+        if nextEpisodeError != nil {
+            startNextEpisode()
+        } else {
+            controller.retry()
+        }
+        revealControls()
     }
 
     private func requestClose() {
@@ -489,6 +552,8 @@ struct MacPlayerView: View {
         let position = controller.positionSeconds
         let duration = controller.durationSeconds
         let activeSubtitle = controller.selectedSubtitle
+        // Recovery may replace the playback the view was opened with.
+        let playbackID = controller.playbackID
         // Autoplay already saved completion; a second update would start a duplicate prewarm.
         let shouldSaveProgress = !didSaveEndProgress
         controller.stop()
@@ -501,7 +566,7 @@ struct MacPlayerView: View {
                     activeSubtitle: activeSubtitle
                 )
             }
-            try? await api.stopNativePlayback(prepared.playback.id)
+            try? await api.stopNativePlayback(playbackID)
         }
     }
 
@@ -541,7 +606,7 @@ struct MacPlayerView: View {
 // AppKit avoids a SwiftUI VideoPlayer bridge crash on current macOS releases.
 // TeaStream supplies movie controls because growing HLS playlists otherwise appear live to AVKit.
 private struct MacAVPlayerView: NSViewRepresentable {
-    let controller: MacPlaybackController
+    let controller: NativePlaybackController
     private var player: AVPlayer { controller.player }
     let pictureInPicture: MacPictureInPictureController
     let onPointerActivity: () -> Void
@@ -767,557 +832,5 @@ private extension HLSSubtitleTrack {
             return "\(languageName) (Forced)"
         }
         return languageName
-    }
-}
-
-@MainActor
-private final class MacPlaybackController: ObservableObject {
-    let player = AVPlayer()
-
-    @Published private(set) var positionSeconds: Double
-    @Published private(set) var durationSeconds: Double
-    @Published private(set) var isPlaying = false
-    @Published private(set) var isSeeking = false
-    @Published private(set) var isWaiting = true
-    @Published private(set) var didReachEnd = false
-    @Published private(set) var stateLabel = "Preparing Stream…"
-    @Published private(set) var errorMessage: String?
-    @Published private(set) var subtitleOptions: [HLSSubtitleTrack]
-    @Published private(set) var selectedSubtitle: HLSSubtitleTrack?
-    @Published private(set) var activeSubtitleText: String?
-
-    private let api: FilmstreamAPI
-    private let playback: Playback
-    private var timeline: HLSPlaybackTimeline
-    private var burnedSubtitleIndex: Int?
-    private var timeObserver: Any?
-    private var statusObservation: NSKeyValueObservation?
-    private var playbackObservation: NSKeyValueObservation?
-    private var itemEndObserver: NSObjectProtocol?
-    private var seekTask: Task<Void, Never>?
-    private var subtitleTask: Task<Void, Never>?
-    private var subtitleSwitchTask: Task<Void, Never>?
-    private var playbackFailureTask: Task<Void, Never>?
-    private var liveness: PlaybackLiveness?
-    private weak var videoLayer: AVPlayerLayer?
-    private var subtitleCues: [SubtitleCue] = []
-    private var seekGeneration = 0
-    private var seekOriginSeconds: Double
-    private var pendingSeekSeconds: Double?
-    private var resumeAfterSeek = true
-    private var wantsToPlay = false
-    private var stopped = false
-
-    init(prepared: PreparedPlayback, api: FilmstreamAPI) {
-        self.api = api
-        playback = prepared.playback
-        timeline = prepared.hls.timeline
-        positionSeconds = timeline.requestedSeconds
-        durationSeconds = max(0, prepared.hls.durationSeconds ?? 0)
-        seekOriginSeconds = timeline.requestedSeconds
-        subtitleOptions = prepared.hls.subtitles ?? []
-        selectedSubtitle = Self.preferredSubtitle(in: subtitleOptions)
-        burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
-
-        player.automaticallyWaitsToMinimizeStalling = true
-        player.actionAtItemEnd = .pause
-        installItem(url: prepared.hls.playlistURL)
-        let initialPlayerSeconds = timeline.playerSeconds(
-            forMediaSeconds: timeline.requestedSeconds
-        )
-        if initialPlayerSeconds > 0 {
-            player.seek(
-                to: CMTime(seconds: initialPlayerSeconds, preferredTimescale: 600),
-                toleranceBefore: .zero,
-                toleranceAfter: .zero
-            )
-        }
-
-        timeObserver = player.addPeriodicTimeObserver(
-            forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
-            queue: .main
-        ) { [weak self] time in
-            Task { @MainActor in
-                guard let self, !self.stopped, !self.isSeeking else { return }
-                let current = self.player.currentTime().seconds
-                if current.isFinite, current >= 0 {
-                    self.positionSeconds = min(
-                        self.timeline.mediaSeconds(forPlayerSeconds: current),
-                        self.durationSeconds > 0 ? self.durationSeconds : .greatestFiniteMagnitude
-                    )
-                    self.updateActiveSubtitle()
-                }
-            }
-        }
-
-        restartSubtitleUpdates()
-
-        playbackObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self] player, _ in
-            Task { @MainActor in
-                guard let self, !self.stopped, !self.isSeeking,
-                      self.subtitleSwitchTask == nil, self.errorMessage == nil else { return }
-                switch player.timeControlStatus {
-                case .playing:
-                    self.wantsToPlay = true
-                    self.isPlaying = true
-                    self.isWaiting = self.videoLayer?.isReadyForDisplay != true
-                    self.stateLabel = self.isWaiting ? "Buffering…" : "Playing"
-                    self.schedulePlaybackFailure()
-                case .waitingToPlayAtSpecifiedRate:
-                    self.isPlaying = self.wantsToPlay
-                    self.isWaiting = true
-                    self.stateLabel = "Buffering…"
-                    self.schedulePlaybackFailure()
-                case .paused:
-                    // PiP may pause AVPlayer directly after playback has started.
-                    if self.liveness?.hasRenderedPlayback == true {
-                        self.wantsToPlay = false
-                        self.cancelPlaybackFailure()
-                    }
-                    self.isPlaying = false
-                    self.isWaiting = self.wantsToPlay
-                    self.stateLabel = self.wantsToPlay ? "Buffering…" : "Paused"
-                @unknown default:
-                    self.isWaiting = true
-                    self.stateLabel = "Preparing Stream…"
-                }
-            }
-        }
-    }
-
-    func play() {
-        guard !stopped, errorMessage == nil else { return }
-        wantsToPlay = true
-        isPlaying = true
-        didReachEnd = false
-        player.play()
-        schedulePlaybackFailure()
-    }
-
-    func pause() {
-        guard !stopped else { return }
-        wantsToPlay = false
-        resumeAfterSeek = false
-        isPlaying = false
-        cancelPlaybackFailure()
-        player.pause()
-    }
-
-    func togglePlayback() {
-        guard !stopped else { return }
-        if isSeeking {
-            resumeAfterSeek.toggle()
-            wantsToPlay = resumeAfterSeek
-            isPlaying = resumeAfterSeek
-            return
-        }
-        if wantsToPlay {
-            pause()
-        } else {
-            play()
-        }
-    }
-
-    func jump(by seconds: Double) {
-        guard !stopped, durationSeconds > 0 else { return }
-        let origin = pendingSeekSeconds ?? positionSeconds
-        seek(to: origin + seconds)
-    }
-
-    func seek(to requestedSeconds: Double) {
-        let target = min(max(0, requestedSeconds), max(0, durationSeconds - 1))
-        if !isSeeking {
-            seekOriginSeconds = positionSeconds
-            resumeAfterSeek = wantsToPlay
-        }
-        let generation = beginItemOperation()
-        cancelPlaybackFailure()
-        pendingSeekSeconds = target
-        positionSeconds = target
-        isSeeking = true
-        isWaiting = true
-        stateLabel = "Seeking…"
-        errorMessage = nil
-        player.pause()
-
-        seekTask = Task { [weak self] in
-            do {
-                try await Task.sleep(for: .milliseconds(450))
-                guard !Task.isCancelled else { return }
-                await self?.performSeek(to: target, generation: generation)
-            } catch {
-                return
-            }
-        }
-    }
-
-    func selectSubtitle(_ track: HLSSubtitleTrack?) {
-        selectedSubtitle = track
-        HLSSubtitleTrack.savePreference(track)
-        switchSubtitleStreamIfNeeded()
-    }
-
-    func attachVideoLayer(_ layer: AVPlayerLayer) {
-        videoLayer = layer
-    }
-
-    private func schedulePlaybackFailure() {
-        guard playbackFailureTask == nil, wantsToPlay, !stopped else { return }
-        liveness = PlaybackLiveness(now: ProcessInfo.processInfo.systemUptime, playerSeconds: player.currentTime().seconds)
-        playbackFailureTask = Task { @MainActor [weak self] in
-            while !Task.isCancelled {
-                do {
-                    try await Task.sleep(for: .seconds(1))
-                } catch {
-                    return
-                }
-                guard !Task.isCancelled, let self else { return }
-                guard !self.stopped, self.wantsToPlay else {
-                    self.playbackFailureTask = nil
-                    return
-                }
-                let playing = self.player.timeControlStatus == .playing
-                    && !self.isSeeking && self.subtitleSwitchTask == nil
-                let ready = self.videoLayer?.isReadyForDisplay == true
-                if playing, ready {
-                    self.isWaiting = false
-                    self.stateLabel = "Playing"
-                }
-                if self.liveness?.observe(
-                    now: ProcessInfo.processInfo.systemUptime,
-                    playerSeconds: self.player.currentTime().seconds,
-                    isPlaying: playing,
-                    isReadyForDisplay: ready,
-                    canRecover: false
-                ) == .fail {
-                    _ = self.beginItemOperation()
-                    self.wantsToPlay = false
-                    self.isPlaying = false
-                    self.isWaiting = false
-                    self.stateLabel = "Unable to Play Stream"
-                    self.errorMessage = self.liveness?.hasRenderedPlayback == true
-                        ? "Playback stalled and could not resume. Close the player and try this episode again."
-                        : "The stream did not begin playing. Close the player and try this episode again."
-                    self.player.pause()
-                    self.playbackFailureTask = nil
-                    return
-                }
-            }
-        }
-    }
-
-    private func cancelPlaybackFailure() {
-        playbackFailureTask?.cancel()
-        playbackFailureTask = nil
-    }
-
-    func stop() {
-        guard !stopped else { return }
-        stopped = true
-        _ = beginItemOperation()
-        subtitleTask?.cancel()
-        subtitleTask = nil
-        cancelPlaybackFailure()
-        if let itemEndObserver {
-            NotificationCenter.default.removeObserver(itemEndObserver)
-            self.itemEndObserver = nil
-        }
-        player.pause()
-        player.replaceCurrentItem(with: nil)
-        if let timeObserver {
-            player.removeTimeObserver(timeObserver)
-            self.timeObserver = nil
-        }
-        statusObservation?.invalidate()
-        statusObservation = nil
-        playbackObservation?.invalidate()
-        playbackObservation = nil
-    }
-
-    private func performSeek(to target: Double, generation: Int) async {
-        guard generation == seekGeneration, !stopped else { return }
-        let playerTarget = timeline.playerSeconds(forMediaSeconds: target)
-        if canSeekLocally(to: playerTarget) {
-            schedulePlaybackFailure()
-            let time = CMTime(seconds: playerTarget, preferredTimescale: 600)
-            player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
-                Task { @MainActor in
-                    self?.finishSeek(generation: generation, finished: finished)
-                }
-            }
-            return
-        }
-
-        do {
-            let prepared = try await api.prepareNativePlayback(playback, startSeconds: target)
-            guard !Task.isCancelled, generation == seekGeneration, !stopped else { return }
-            timeline = prepared.hls.timeline
-            burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
-            updateSubtitleOptions(prepared.hls.subtitles ?? [])
-            if let duration = prepared.hls.durationSeconds, duration > 0 {
-                durationSeconds = duration
-            }
-            positionSeconds = target
-            installItem(url: cacheBusted(prepared.hls.playlistURL))
-            let playerPosition = timeline.playerSeconds(forMediaSeconds: target)
-            player.seek(
-                to: CMTime(seconds: playerPosition, preferredTimescale: 600),
-                toleranceBefore: .zero,
-                toleranceAfter: .zero
-            ) { [weak self] finished in
-                Task { @MainActor in
-                    self?.finishSeek(generation: generation, finished: finished)
-                }
-            }
-        } catch {
-            guard !Task.isCancelled, generation == seekGeneration, !stopped else { return }
-            cancelPlaybackFailure()
-            pendingSeekSeconds = nil
-            positionSeconds = seekOriginSeconds
-            isSeeking = false
-            isWaiting = false
-            isPlaying = false
-            wantsToPlay = false
-            stateLabel = "Seek Failed"
-            errorMessage = error.localizedDescription
-            seekTask = nil
-        }
-    }
-
-    private func finishSeek(generation: Int, finished: Bool) {
-        guard generation == seekGeneration, !stopped else { return }
-        pendingSeekSeconds = nil
-        isSeeking = false
-        seekTask = nil
-        if !finished {
-            pause()
-            isWaiting = false
-            stateLabel = "Seek Failed"
-            errorMessage = "The player could not seek to the requested position."
-            return
-        }
-        if resumeAfterSeek {
-            play()
-        } else {
-            wantsToPlay = false
-            isPlaying = false
-            isWaiting = false
-            stateLabel = "Paused"
-        }
-    }
-
-    private func canSeekLocally(to seconds: Double) -> Bool {
-        guard seconds >= 0, let item = player.currentItem else { return false }
-        let target = CMTime(seconds: seconds, preferredTimescale: 600)
-        return item.seekableTimeRanges.contains { value in
-            CMTimeRangeContainsTime(value.timeRangeValue, time: target)
-        }
-    }
-
-    private func updateSubtitleOptions(_ tracks: [HLSSubtitleTrack]) {
-        let previous = selectedSubtitle
-        subtitleOptions = tracks
-        if let previous {
-            selectedSubtitle = tracks.first(where: { $0.index == previous.index })
-                ?? tracks.first(where: {
-                    $0.language == previous.language && $0.title == previous.title
-                })
-        }
-        restartSubtitleUpdates()
-    }
-
-    private func switchSubtitleStreamIfNeeded() {
-        let desiredBitmapIndex = selectedSubtitle?.isBitmap == true ? selectedSubtitle?.index : nil
-        guard desiredBitmapIndex != burnedSubtitleIndex || subtitleSwitchTask != nil else {
-            restartSubtitleUpdates()
-            return
-        }
-
-        let generation = beginItemOperation()
-        cancelPlaybackFailure()
-        subtitleTask?.cancel()
-        subtitleTask = nil
-        subtitleCues = []
-        activeSubtitleText = nil
-        let resumePosition = max(0, positionSeconds)
-        player.pause()
-        isWaiting = true
-        stateLabel = "Changing Subtitles…"
-        errorMessage = nil
-
-        subtitleSwitchTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                let prepared = try await self.api.prepareNativePlayback(
-                    self.playback,
-                    startSeconds: resumePosition,
-                    bitmapSubtitleIndex: desiredBitmapIndex,
-                    useSavedSubtitlePreference: false
-                )
-                guard !Task.isCancelled, generation == self.seekGeneration, !self.stopped else { return }
-                self.timeline = prepared.hls.timeline
-                self.burnedSubtitleIndex = prepared.hls.burnedSubtitleIndex
-                self.updateSubtitleOptions(prepared.hls.subtitles ?? [])
-                self.installItem(url: self.cacheBusted(prepared.hls.playlistURL))
-                let playerPosition = self.timeline.playerSeconds(
-                    forMediaSeconds: resumePosition
-                )
-                self.player.seek(
-                    to: CMTime(seconds: playerPosition, preferredTimescale: 600),
-                    toleranceBefore: .zero,
-                    toleranceAfter: .zero
-                ) { [weak self] finished in
-                    Task { @MainActor in
-                        guard let self, generation == self.seekGeneration, !self.stopped else { return }
-                        self.subtitleSwitchTask = nil
-                        self.isWaiting = self.wantsToPlay
-                        guard finished else {
-                            self.pause()
-                            self.isWaiting = false
-                            self.stateLabel = "Unable to Change Subtitles"
-                            self.errorMessage = "The player could not resume after changing subtitles."
-                            return
-                        }
-                        if self.wantsToPlay {
-                            self.play()
-                        } else {
-                            self.stateLabel = "Paused"
-                        }
-                    }
-                }
-            } catch {
-                guard !Task.isCancelled, generation == self.seekGeneration, !self.stopped else { return }
-                self.subtitleSwitchTask = nil
-                self.cancelPlaybackFailure()
-                self.isWaiting = false
-                self.wantsToPlay = false
-                self.isPlaying = false
-                self.stateLabel = "Unable to Change Subtitles"
-                self.errorMessage = error.localizedDescription
-            }
-        }
-    }
-
-    private func restartSubtitleUpdates() {
-        subtitleTask?.cancel()
-        subtitleTask = nil
-        subtitleCues = []
-        activeSubtitleText = nil
-        guard let track = selectedSubtitle, !track.isBitmap, !stopped else { return }
-
-        let subtitleTimeline = timeline
-        subtitleTask = Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await self.api.startSubtitle(playbackID: self.playback.id, track: track)
-            } catch {
-                return
-            }
-            while !Task.isCancelled {
-                guard !self.stopped,
-                      self.selectedSubtitle?.index == track.index,
-                      self.timeline == subtitleTimeline else {
-                    return
-                }
-                do {
-                    if let cues = try await self.api.subtitleCues(
-                        playbackID: self.playback.id,
-                        track: track
-                    ) {
-                        guard !Task.isCancelled,
-                              self.selectedSubtitle?.index == track.index,
-                              self.timeline == subtitleTimeline else {
-                            return
-                        }
-                        self.subtitleCues = cues
-                        self.updateActiveSubtitle()
-                    }
-                } catch {
-                    // Subtitle polling is best-effort while the WebVTT file grows.
-                }
-                do {
-                    try await Task.sleep(for: .seconds(2))
-                } catch {
-                    return
-                }
-            }
-        }
-    }
-
-    private func updateActiveSubtitle() {
-        let active = subtitleCues.filter {
-            positionSeconds >= $0.startSeconds && positionSeconds <= $0.endSeconds
-        }
-        activeSubtitleText = active.isEmpty ? nil : active.map(\.text).joined(separator: "\n")
-    }
-
-    private static func preferredSubtitle(in tracks: [HLSSubtitleTrack]) -> HLSSubtitleTrack? {
-        HLSSubtitleTrack.savedPreference(in: tracks)
-    }
-
-    private func beginItemOperation() -> Int {
-        seekGeneration += 1
-        seekTask?.cancel()
-        seekTask = nil
-        subtitleSwitchTask?.cancel()
-        subtitleSwitchTask = nil
-        player.currentItem?.cancelPendingSeeks()
-        pendingSeekSeconds = nil
-        isSeeking = false
-        return seekGeneration
-    }
-
-    private func installItem(url: URL) {
-        statusObservation?.invalidate()
-        if let itemEndObserver {
-            NotificationCenter.default.removeObserver(itemEndObserver)
-            self.itemEndObserver = nil
-        }
-        didReachEnd = false
-        let item = AVPlayerItem(url: url)
-        NativePlaybackConfiguration.configure(item)
-        statusObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
-            Task { @MainActor in
-                guard let self, !self.stopped, self.player.currentItem === item else { return }
-                if item.status == .failed {
-                    _ = self.beginItemOperation()
-                    self.cancelPlaybackFailure()
-                    self.isWaiting = false
-                    self.isPlaying = false
-                    self.wantsToPlay = false
-                    self.stateLabel = "Unable to Play Stream"
-                    self.errorMessage = item.error?.localizedDescription ?? "The HLS stream could not be opened."
-                }
-            }
-        }
-        itemEndObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
-            object: item,
-            queue: .main
-        ) { [weak self, weak item] _ in
-            Task { @MainActor in
-                guard let self, !self.stopped, self.player.currentItem === item else { return }
-                _ = self.beginItemOperation()
-                self.cancelPlaybackFailure()
-                self.positionSeconds = max(self.positionSeconds, self.durationSeconds)
-                self.wantsToPlay = false
-                self.isPlaying = false
-                self.isWaiting = false
-                self.didReachEnd = true
-                self.stateLabel = "Episode Finished"
-            }
-        }
-        player.replaceCurrentItem(with: item)
-        schedulePlaybackFailure()
-    }
-
-    private func cacheBusted(_ url: URL) -> URL {
-        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
-            return url
-        }
-        var items = components.queryItems ?? []
-        items.append(URLQueryItem(name: "seek", value: UUID().uuidString))
-        components.queryItems = items
-        return components.url ?? url
     }
 }

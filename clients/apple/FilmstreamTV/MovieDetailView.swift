@@ -9,6 +9,7 @@ struct MovieDetailView: View {
     @State private var preparation = PlaybackPreparation()
     private var isPreparing: Bool { preparation.isPreparing }
     private var preparationStage: PlaybackPreparationStage? { preparation.stage }
+    private var showsPreparationPanel: Bool { isPreparing || preparation.errorMessage != nil }
     @State private var isRemoving = false
     @State private var errorMessage: String?
     @FocusState private var focusedAction: DetailAction?
@@ -77,7 +78,7 @@ struct MovieDetailView: View {
                         .frame(maxWidth: 800, alignment: .leading)
                 }
 
-                if let errorMessage = preparation.errorMessage ?? errorMessage {
+                if let errorMessage {
                     Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(Color.teaAmber)
                         .font(.headline)
@@ -85,10 +86,16 @@ struct MovieDetailView: View {
                 }
 
                 actionButtons
+                    .disabled(showsPreparationPanel)
             }
             .padding(.leading, 82)
             .padding(.trailing, 60)
             .padding(.vertical, 54)
+
+            if showsPreparationPanel {
+                PlaybackPreparationPanel(title: movie.title, preparation: preparation)
+                    .transition(.opacity)
+            }
         }
         .background(Color.teaBackground)
         .task(id: movie.id) {
@@ -101,6 +108,11 @@ struct MovieDetailView: View {
             _ = await (ratings, prewarm)
         }
         .onDisappear { preparation.cancel() }
+        .onChange(of: showsPreparationPanel) { _, shown in
+            if !shown {
+                focusedAction = .play
+            }
+        }
         .fullScreenCover(
             item: $preparedPlayback,
             onDismiss: {

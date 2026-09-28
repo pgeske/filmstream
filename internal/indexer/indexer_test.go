@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,7 +44,7 @@ func (f protocolTestIndexer) Resolve(context.Context, catalog.Candidate) (Source
 	return Source{}, nil
 }
 
-func TestSearchProtocolUntilSkipsFastIrrelevantMovieResults(t *testing.T) {
+func TestSearchSkipsFastIrrelevantMovieResults(t *testing.T) {
 	seeders := 50
 	request := catalog.SearchRequest{
 		Query: "Dune: Part Two", Year: 2024, MediaType: "movie",
@@ -66,8 +67,11 @@ func TestSearchProtocolUntilSkipsFastIrrelevantMovieResults(t *testing.T) {
 			}},
 		},
 	}
-	candidates, err := registry.SearchProtocolUntil(t.Context(), request, catalog.ProtocolTorrent, func(candidates []catalog.Candidate) bool {
-		return len(catalog.Rank(request, candidates)) >= 2
+	candidates, err := registry.Search(t.Context(), request, SearchPolicy{
+		Protocol: catalog.ProtocolTorrent, Settle: time.Millisecond,
+		Acceptable: func(candidates []catalog.Candidate) bool {
+			return len(catalog.Rank(request, candidates)) > 0
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -78,58 +82,75 @@ func TestSearchProtocolUntilSkipsFastIrrelevantMovieResults(t *testing.T) {
 	}
 }
 
-func TestSearchProtocolUntilDoesNotWaitForSlowIndexersAfterEnoughMatches(t *testing.T) {
-	slowCanceled := make(chan struct{})
+func TestSearchWaitsForSlowerIndexersOnlyWithinSettleWindow(t *testing.T) {
+	hungCanceled := make(chan struct{})
 	registry := &Registry{
 		indexers: make(map[string]Indexer),
 		ordered: []Indexer{
-			protocolTestIndexer{name: "primary", candidates: []catalog.Candidate{
+			protocolTestIndexer{name: "fast-public", candidates: []catalog.Candidate{
 				{Name: "Movie 2024 1080p H264-A", Protocol: catalog.ProtocolTorrent},
+			}},
+			protocolTestIndexer{name: "slower-private", delay: 30 * time.Millisecond, candidates: []catalog.Candidate{
 				{Name: "Movie 2024 1080p H264-B", Protocol: catalog.ProtocolTorrent},
 			}},
-			protocolTestIndexer{name: "slow", wait: true, canceled: slowCanceled},
+			protocolTestIndexer{name: "hung", wait: true, canceled: hungCanceled},
 		},
 	}
 	started := time.Now()
-	candidates, err := registry.SearchProtocolUntil(
-		t.Context(), catalog.SearchRequest{Query: "Movie", Year: 2024}, catalog.ProtocolTorrent,
-		func(candidates []catalog.Candidate) bool { return len(candidates) >= 2 },
-	)
+	candidates, err := registry.Search(t.Context(), catalog.SearchRequest{Query: "Movie", Year: 2024}, SearchPolicy{
+		Protocol: catalog.ProtocolTorrent, Settle: 200 * time.Millisecond, Deadline: 10 * time.Second,
+		Acceptable: func(candidates []catalog.Candidate) bool { return len(candidates) > 0 },
+	})
 	if err != nil || len(candidates) != 2 {
-		t.Fatalf("candidates = %+v, error = %v", candidates, err)
+		t.Fatalf("candidates = %+v, error = %v; the slower indexer inside the settle window must be included", candidates, err)
 	}
-	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
-		t.Fatalf("primary search waited for slow indexer: %s", elapsed)
+	if elapsed := time.Since(started); elapsed < 200*time.Millisecond || elapsed > 2*time.Second {
+		t.Fatalf("search returned after %s, want the settle window rather than the hung indexer or deadline", elapsed)
 	}
 	select {
-	case <-slowCanceled:
+	case <-hungCanceled:
 	case <-time.After(time.Second):
-		t.Fatal("slower indexer was not canceled")
+		t.Fatal("hung indexer was not canceled")
 	}
 }
 
-func TestSearchFirstProtocolReturnsWithoutWaitingForOtherIndexers(t *testing.T) {
-	slowCanceled := make(chan struct{})
+func TestSearchDeadlineReturnsPartialCandidatesWithTimeoutError(t *testing.T) {
 	registry := &Registry{
 		indexers: make(map[string]Indexer),
 		ordered: []Indexer{
-			protocolTestIndexer{name: "slow-torrent", wait: true, canceled: slowCanceled},
-			protocolTestIndexer{name: "fast-usenet", candidates: []catalog.Candidate{{
-				Name: "Movie.1080p", Protocol: catalog.ProtocolUsenet,
-			}}},
+			protocolTestIndexer{name: "fast", candidates: []catalog.Candidate{
+				{Name: "Unrelated 2024 1080p H264", Protocol: catalog.ProtocolTorrent},
+			}},
+			protocolTestIndexer{name: "hung", wait: true, canceled: make(chan struct{})},
 		},
 	}
+	candidates, err := registry.Search(t.Context(), catalog.SearchRequest{Query: "Movie"}, SearchPolicy{
+		Settle: time.Second, Deadline: 50 * time.Millisecond,
+		Acceptable: func([]catalog.Candidate) bool { return false },
+	})
+	if len(candidates) != 1 || err == nil || !strings.Contains(err.Error(), "hung timed out") {
+		t.Fatalf("candidates = %+v, error = %v", candidates, err)
+	}
+}
 
-	candidates, err := registry.SearchFirstProtocol(t.Context(), catalog.SearchRequest{Query: "Movie"}, catalog.ProtocolUsenet)
-	if err != nil {
-		t.Fatal(err)
+func TestSearchStampsIndexerPrivacyAndNormalizedMagnetInfoHash(t *testing.T) {
+	const hexHash = "0123456789abcdef0123456789abcdef01234567"
+	registry := &Registry{
+		indexers: make(map[string]Indexer),
+		private:  map[string]bool{"tracker": true},
+		ordered: []Indexer{protocolTestIndexer{name: "tracker", candidates: []catalog.Candidate{
+			{Name: "Hex", Protocol: catalog.ProtocolTorrent, MagnetURI: "magnet:?xt=urn:btih:" + strings.ToUpper(hexHash)},
+			// The same hash in base32, as some magnet links encode it.
+			{Name: "Base32", Protocol: catalog.ProtocolTorrent, MagnetURI: "magnet:?dn=x&xt=urn:btih:aerukz4jvpg66ajdivtytk6n54asgrlh"},
+		}}},
 	}
-	if len(candidates) != 1 || candidates[0].Indexer != "fast-usenet" {
-		t.Fatalf("candidates = %+v", candidates)
+	candidates, err := registry.Search(t.Context(), catalog.SearchRequest{Query: "Movie"}, SearchPolicy{})
+	if err != nil || len(candidates) != 2 {
+		t.Fatalf("candidates = %+v, error = %v", candidates, err)
 	}
-	select {
-	case <-slowCanceled:
-	case <-time.After(time.Second):
-		t.Fatal("slower indexer was not canceled")
+	for _, candidate := range candidates {
+		if candidate.Indexer != "tracker" || !candidate.Private || candidate.InfoHash != hexHash {
+			t.Fatalf("candidate = %+v", candidate)
+		}
 	}
 }

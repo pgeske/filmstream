@@ -147,25 +147,6 @@ final class IOSAppModel {
         try? await api.prewarmPlayback(for: movie, startSeconds: startSeconds)
     }
 
-    func preparePlayback(
-        for movie: Movie,
-        startSeconds: Double,
-        onStage: (PlaybackPreparationStage) -> Void
-    ) async throws -> PreparedPlayback {
-        onStage(.findingRelease)
-        let playback = try await api.createPlayback(for: movie, startSeconds: startSeconds)
-        do {
-            try Task.checkCancellation()
-            onStage(.bufferingVideo)
-            return try await api.prepareNativePlaybackWithRetry(
-                playback, for: movie, startSeconds: startSeconds
-            )
-        } catch {
-            Task { try? await api.stopNativePlayback(playback.id) }
-            throw error
-        }
-    }
-
     func ratings(for movie: Movie) -> MovieRatings? {
         ratingsByMovieID[movie.id]
     }

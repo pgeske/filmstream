@@ -18,6 +18,15 @@ type SearchRequest struct {
 	EpisodeNumber    int         `json:"episode_number,omitempty"`
 	PreferSeasonPack bool        `json:"prefer_season_pack,omitempty"`
 	Preferences      Preferences `json:"preferences"`
+	// IMDBID ("tt…") and TMDBID identify the movie or series so indexers that
+	// support ID searches return exact matches.
+	IMDBID string `json:"imdb_id,omitempty"`
+	TMDBID int    `json:"tmdb_id,omitempty"`
+	// RuntimeMinutes covers the requested movie or episode and
+	// SeasonRuntimeMinutes the whole requested season. Ranking uses them to
+	// estimate a release's bitrate; zero means unknown.
+	RuntimeMinutes       int `json:"runtime_minutes,omitempty"`
+	SeasonRuntimeMinutes int `json:"season_runtime_minutes,omitempty"`
 }
 
 type Preferences struct {
@@ -54,9 +63,27 @@ type Candidate struct {
 	Trusted              bool     `json:"trusted,omitempty"`
 	Popularity           int64    `json:"popularity,omitempty"`
 	PublishedUnix        int64    `json:"published_unix,omitempty"`
-	MagnetURI            string   `json:"magnet_uri,omitempty"`
-	TorrentURL           string   `json:"torrent_url,omitempty"`
-	NZBURL               string   `json:"nzb_url,omitempty"`
+	// InfoHash is the lowercase hex BitTorrent v1 info hash when the indexer
+	// or magnet link reveals it.
+	InfoHash string `json:"info_hash,omitempty"`
+	// Private marks a release from a private-tracker indexer.
+	Private    bool   `json:"private,omitempty"`
+	MagnetURI  string `json:"magnet_uri,omitempty"`
+	TorrentURL string `json:"torrent_url,omitempty"`
+	NZBURL     string `json:"nzb_url,omitempty"`
+}
+
+// Key identifies a release across indexers: its info hash when known,
+// otherwise the indexer-scoped ID (or name).
+func (c Candidate) Key() string {
+	if c.InfoHash != "" {
+		return "btih:" + strings.ToLower(c.InfoHash)
+	}
+	id := c.ID
+	if id == "" {
+		id = c.Name
+	}
+	return strings.ToLower(c.Indexer + ":" + id)
 }
 
 type RankedCandidate struct {
@@ -79,6 +106,7 @@ type RankingDiagnostics struct {
 
 const (
 	rejectionMaxSize             = "max_size"
+	rejectionNoSeeders           = "no_seeders"
 	rejectionDolbyVision         = "dolby_vision"
 	rejectionAIUpscale           = "ai_upscale"
 	rejection2160pRemux          = "2160p_remux"
@@ -89,6 +117,21 @@ const (
 	rejectionYearMismatch        = "year_mismatch"
 	rejectionTitleMismatch       = "title_mismatch"
 	rejectionSeasonPackPreferred = "season_pack_preferred"
+)
+
+const (
+	// Torrents below lowSeeders are heavily penalized; zero seeders are rejected.
+	lowSeeders = 3
+	// healthySeeders is the smallest swarm treated as reliably streamable. A
+	// season pack must reach it before it may displace individual episodes.
+	healthySeeders = 5
+	// Seeders beyond seederScoreCap no longer improve streaming reliability, so
+	// they cannot outweigh the preferred resolution.
+	seederScoreCap = 64
+	// Estimated video bitrates above these limits are penalized: they exceed what
+	// a torrent swarm reliably sustains through the VPN (1080p remuxes, 4K remuxes).
+	maxStreamingMbps     = 15.0
+	maxStreamingMbps2160 = 40.0
 )
 
 var (
@@ -152,6 +195,11 @@ func RankWithDiagnostics(request SearchRequest, candidates []Candidate) ([]Ranke
 		}
 		if request.Preferences.MaxSizeBytes > 0 && candidate.SizeBytes > request.Preferences.MaxSizeBytes {
 			reject(candidate, rejectionMaxSize)
+			continue
+		}
+		// A swarm without seeders cannot stream; it would only burn the startup budget.
+		if candidate.Protocol != ProtocolUsenet && candidate.Seeders != nil && *candidate.Seeders <= 0 {
+			reject(candidate, rejectionNoSeeders)
 			continue
 		}
 		if request.Preferences.StreamingOptimized {
@@ -232,10 +280,16 @@ func RankWithDiagnostics(request SearchRequest, candidates []Candidate) ([]Ranke
 				score += 300
 				reasons = append(reasons, "preferred resolution")
 			case "2160p":
-				score += 160
+				// Streaming 4K instead of a preferred lower resolution costs
+				// roughly three times the bandwidth.
+				if request.Preferences.StreamingOptimized {
+					score += 80
+				} else {
+					score += 160
+				}
 				reasons = append(reasons, "alternate 2160p quality")
 			case "720p":
-				score += 100
+				score += 120
 				reasons = append(reasons, "alternate 720p quality")
 			case "480p":
 				score += 40
@@ -272,27 +326,37 @@ func RankWithDiagnostics(request SearchRequest, candidates []Candidate) ([]Ranke
 				}
 			}
 			words := wordSet(normalize(candidate.Name))
-			if hasWord(words, "remux") {
-				score -= 100
+			remux := hasWord(words, "remux")
+			if mbps, known := estimatedMbps(request, candidate, seasonPack); known {
+				limit := maxStreamingMbps
+				if strings.EqualFold(candidate.Resolution, "2160p") {
+					limit = maxStreamingMbps2160
+				}
+				if mbps > limit {
+					score -= min(300, (mbps/limit-1)*250)
+					reasons = append(reasons, formatReason("high bitrate Mbps", math.Round(mbps)))
+				}
+			} else if remux {
+				// Without a runtime, the remux label is the only bitrate signal.
+				score -= 250
 				reasons = append(reasons, "remux penalty")
 			}
-			if hasWord(words, "x264") || hasWord(words, "x265") {
-				score += 20
+			if !remux && streamingFriendlyEncode(words, candidate.Codec) {
+				score += 40
 				reasons = append(reasons, "streaming-friendly encode")
 			}
 		}
 
-		if candidate.Seeders != nil {
-			if *candidate.Seeders > 0 {
-				seederWeight := 16.0
-				if request.Preferences.StreamingOptimized {
-					seederWeight = 24
-				}
-				score += math.Log2(float64(*candidate.Seeders)+1) * seederWeight
-				reasons = append(reasons, formatReason("seeders", float64(*candidate.Seeders)))
-			} else {
-				score -= 60
-				reasons = append(reasons, "no reported seeders")
+		if candidate.Seeders != nil && *candidate.Seeders > 0 {
+			seederWeight := 30.0
+			if request.Preferences.StreamingOptimized {
+				seederWeight = 60
+			}
+			score += math.Log2(float64(min(*candidate.Seeders, seederScoreCap))+1) * seederWeight
+			reasons = append(reasons, formatReason("seeders", float64(*candidate.Seeders)))
+			if *candidate.Seeders < lowSeeders {
+				score -= 150
+				reasons = append(reasons, "few seeders")
 			}
 		}
 		if candidate.Leechers != nil && *candidate.Leechers > 0 {
@@ -300,8 +364,14 @@ func RankWithDiagnostics(request SearchRequest, candidates []Candidate) ([]Ranke
 			score += math.Log2(float64(*candidate.Leechers)+1) * 5
 			reasons = append(reasons, formatReason("leechers", float64(*candidate.Leechers)))
 		}
-		if !request.Preferences.StreamingOptimized && candidate.DownloadVolumeFactor != nil && *candidate.DownloadVolumeFactor < 1 {
-			score += (1 - *candidate.DownloadVolumeFactor) * 35
+		if candidate.Private {
+			// Private trackers are seeded by dedicated seedboxes and enforce
+			// ratios, so their swarms are faster than public ones of similar size.
+			score += 100
+			reasons = append(reasons, "private tracker")
+		}
+		if candidate.DownloadVolumeFactor != nil && *candidate.DownloadVolumeFactor < 1 {
+			score += (1 - max(0, *candidate.DownloadVolumeFactor)) * 40
 			reasons = append(reasons, formatReason("download factor", *candidate.DownloadVolumeFactor))
 		}
 		if candidate.UploadVolumeFactor != nil && *candidate.UploadVolumeFactor > 1 {
@@ -320,15 +390,21 @@ func RankWithDiagnostics(request SearchRequest, candidates []Candidate) ([]Ranke
 	}
 
 	if request.PreferSeasonPack && request.SeasonNumber > 0 {
-		seasonPacks := make([]RankedCandidate, 0, len(ranked))
+		// Prefer a season pack only when a healthy one exists; a dead pack must not
+		// hide healthy individual episode releases.
+		healthyPack := false
 		for _, candidate := range ranked {
-			if IsSeasonPack(candidate.Candidate.Name, request.SeasonNumber) {
-				seasonPacks = append(seasonPacks, candidate)
+			if IsSeasonPack(candidate.Candidate.Name, request.SeasonNumber) && HealthySwarm(candidate.Candidate) {
+				healthyPack = true
+				break
 			}
 		}
-		if len(seasonPacks) > 0 {
+		if healthyPack {
+			seasonPacks := make([]RankedCandidate, 0, len(ranked))
 			for _, candidate := range ranked {
-				if !IsSeasonPack(candidate.Candidate.Name, request.SeasonNumber) {
+				if IsSeasonPack(candidate.Candidate.Name, request.SeasonNumber) {
+					seasonPacks = append(seasonPacks, candidate)
+				} else {
 					reject(candidate.Candidate, rejectionSeasonPackPreferred)
 				}
 			}
@@ -349,6 +425,39 @@ func IsSeasonPack(name string, seasonNumber int) bool {
 	}
 	season, hasSeason := releaseSeason(name)
 	return hasSeason && season == seasonNumber
+}
+
+// HealthySwarm reports whether a release's reported swarm is large enough to
+// stream reliably. Unknown seeder counts (Usenet, curated catalogs) count as healthy.
+func HealthySwarm(candidate Candidate) bool {
+	return candidate.Seeders == nil || *candidate.Seeders >= healthySeeders
+}
+
+// estimatedMbps derives a release's average bitrate from its size and the
+// runtime it covers: the whole season for a season pack.
+func estimatedMbps(request SearchRequest, candidate Candidate, seasonPack bool) (float64, bool) {
+	runtime := request.RuntimeMinutes
+	if seasonPack {
+		runtime = request.SeasonRuntimeMinutes
+	}
+	if runtime <= 0 || candidate.SizeBytes <= 0 {
+		return 0, false
+	}
+	return float64(candidate.SizeBytes) * 8 / (float64(runtime) * 60) / 1e6, true
+}
+
+// streamingFriendlyEncode reports an H.264/HEVC re-encode of a web or Blu-ray
+// source: compact, widely seeded, and natively decodable by Apple TV.
+func streamingFriendlyEncode(words map[string]struct{}, codec string) bool {
+	if codec != "h264" && codec != "h265" {
+		return false
+	}
+	for _, source := range []string{"web", "webdl", "webrip", "bluray", "bdrip", "brrip"} {
+		if hasWord(words, source) {
+			return true
+		}
+	}
+	return hasWord(words, "blu") && hasWord(words, "ray")
 }
 
 func isUpscaledRelease(normalizedName string) bool {

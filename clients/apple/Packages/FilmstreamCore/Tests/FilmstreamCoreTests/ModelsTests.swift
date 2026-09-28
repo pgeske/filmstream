@@ -173,3 +173,42 @@ import Testing
     #expect(entry.movie.id == "tmdb:335984")
     #expect(entry.movie.primaryGenre == "Science Fiction")
 }
+
+@Test func playsMasterPlaylistOnlyWhenTheServerOffersSubtitleRenditions() throws {
+    let legacy = try JSONDecoder().decode(HLSPlayback.self, from: Data(#"{"playback_id":"a","playlist_url":"https://filmstream.example/v1/playbacks/a/hls/index.m3u8","start_seconds":0,"video_codec":"h264"}"#.utf8))
+    #expect(legacy.masterURL == nil)
+    #expect(legacy.streamURL == legacy.playlistURL)
+
+    let native = try JSONDecoder().decode(HLSPlayback.self, from: Data(#"{"playback_id":"a","playlist_url":"https://filmstream.example/v1/playbacks/a/hls/index.m3u8","master_url":"/v1/playbacks/a/hls/master.m3u8","start_seconds":0,"video_codec":"h264","subtitles":[{"index":3,"language":"en","kind":"text","rendition_name":"English"},{"index":4,"language":"en","kind":"bitmap"}]}"#.utf8))
+    #expect(native.streamURL.absoluteString == "https://filmstream.example/v1/playbacks/a/hls/master.m3u8")
+    #expect(native.subtitles?.map(\.renditionName) == ["English", nil])
+}
+
+@Test func firstRunSubtitleDefaultNeverBurnsInABitmapTrack() throws {
+    let suiteName = "filmstream-tests-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let tracks = try JSONDecoder().decode([HLSSubtitleTrack].self, from: Data(#"[{"index":4,"language":"en","forced":true,"kind":"bitmap"},{"index":5,"language":"en","forced":true,"kind":"text"}]"#.utf8))
+
+    #expect(HLSSubtitleTrack.savedPreference(in: tracks, defaults: defaults)?.index == 5)
+    #expect(HLSSubtitleTrack.savedPreference(in: [tracks[0]], defaults: defaults) == nil)
+
+    // A bitmap track the viewer chose explicitly is still honored.
+    HLSSubtitleTrack.savePreference(tracks[0], defaults: defaults)
+    #expect(HLSSubtitleTrack.savedPreference(in: tracks, defaults: defaults)?.index == 4)
+}
+
+@Test func describesServerSideWaitsFromPlaybackStatus() throws {
+    let connecting = try JSONDecoder().decode(PlaybackStatus.self, from: Data(#"{"id":"p1","state":"streaming","source":"torrent","active_peers":0,"connected_seeders":0,"total_peers":14,"download_rate":0,"upload_rate":0,"progress":0.01,"private":true,"tracker_message":"","hls":{"state":"starting","packaged_segments":0,"packaged_seconds":0,"target_seconds":8,"complete":false}}"#.utf8))
+    #expect(!connecting.needsReprepare)
+    let description = PlaybackProgressDescription(stage: .bufferingVideo(playbackID: "p1"), status: connecting)
+    #expect(description.headline == "Connecting to peers…")
+    #expect(description.detail == "14 peers found")
+    #expect(description.fraction == nil)
+
+    let stalled = try JSONDecoder().decode(PlaybackStatus.self, from: Data(#"{"active_peers":4,"download_rate":0}"#.utf8))
+    #expect(PlaybackProgressDescription(waitingFor: stalled).headline == "Waiting for peers to send data…")
+
+    let failed = try JSONDecoder().decode(PlaybackStatus.self, from: Data(#"{"hls":{"state":"failed","error":"ffmpeg exited"}}"#.utf8))
+    #expect(failed.needsReprepare)
+}

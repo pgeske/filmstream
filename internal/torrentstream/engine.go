@@ -1,69 +1,99 @@
+// Package torrentstream streams torrent payloads through a Deluge daemon.
+//
+// Deluge (libtorrent) does all BitTorrent work; the TeaStream Deluge plugin
+// (deluge/teastream) exposes a loopback API for adding torrents, selecting
+// files and steering piece deadlines. Payload bytes are read straight from the
+// shared downloads directory once their pieces are verified.
 package torrentstream
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"mime"
 	"net/http"
-	"net/url"
 	"os"
+	"path"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/anacrolix/torrent"
-	"github.com/anacrolix/torrent/metainfo"
+	"github.com/pgeske/filmstream/internal/config"
 )
 
 const (
-	maxMetainfoBytes       = 16 << 20
-	defaultCacheLimit      = int64(20 << 30)
-	defaultMaxSeedSessions = 20
-	defaultIdleGrace       = 2 * time.Minute
-	defaultSeedMaxAge      = 168 * time.Hour
-	defaultCleanupInterval = 30 * time.Second
+	maxMetainfoBytes = 16 << 20
 
-	// A source read only makes progress once the pieces it needs are complete
-	// locally or a connected peer can deliver them. Bound how long a read waits
-	// for that so a playback mounted on a dead swarm fails quickly and
-	// diagnosably instead of stalling until the client times out.
-	defaultServeReadinessWait = 15 * time.Second
-	serviceReadinessPoll      = 250 * time.Millisecond
-	serviceReadinessLogEvery  = 3 * time.Second
-	localVerifyBudget         = 8 * time.Second
+	defaultPluginURL           = "http://127.0.0.1:8113"
+	defaultDownloadsDir        = "/downloads"
+	defaultMetadataTimeout     = 2 * time.Minute
+	defaultCacheLimit          = int64(20 << 30)
+	defaultMaxSeedSessions     = 20
+	defaultIdleGrace           = 2 * time.Minute
+	defaultSeedMaxAge          = 168 * time.Hour
+	defaultCleanupInterval     = 30 * time.Second
+	defaultStallTimeout        = 3 * time.Minute
+	defaultPeerlessStartupWait = 45 * time.Second
+
+	// sourceUnavailableHold is how long an unavailable verdict fails blocked
+	// reads before the source may be tried again.
+	sourceUnavailableHold = time.Minute
+	// detailMaxAge bounds how stale cached Deluge status may be.
+	detailMaxAge        = time.Second
+	metadataPollMax     = 500 * time.Millisecond
+	torrentFetchTimeout = 30 * time.Second
+	listenPortPoll      = 10 * time.Second
+
+	// A new playback immediately asks for its file's head (container headers,
+	// first frames) and tail (MP4 moov, MKV cues) so probing starts at once.
+	mountHeadBytes = 16 << 20
+	mountTailBytes = 4 << 20
+	mountWindowTTL = 2 * time.Minute
 )
 
-var videoExtensions = map[string]bool{
-	".avi": true, ".m4v": true, ".mkv": true, ".mov": true,
-	".mp4": true, ".mpeg": true, ".mpg": true, ".ts": true, ".webm": true,
-}
-
 type Config struct {
-	DataDir            string
-	ListenPort         int
-	MaxTorrentBytes    int64
-	ReadaheadBytes     int64
-	MetadataTimeout    time.Duration
-	SeedRatioTarget    float64
-	CacheLimitBytes    int64
-	MaxSeedSessions    int
-	IdleGrace          time.Duration
-	SeedMaxAge         time.Duration
-	CleanupInterval    time.Duration
-	ServeReadinessWait time.Duration
-	CleanOnStart       bool
-	CleanOnClose       bool
-	Logger             *slog.Logger
+	// DataDir holds Filmstream's torrent records, not payload.
+	DataDir string
+	// PluginURL is the TeaStream Deluge plugin API.
+	PluginURL string
+	// PluginTokenFile holds the plugin's bearer token.
+	PluginTokenFile string
+	// DownloadsDir is where Deluge saves torrents. Deluge and Filmstream must
+	// see it at the same path.
+	DownloadsDir string
+	// ListenPort is a fixed peer port pushed to Deluge; 0 keeps Deluge's.
+	ListenPort int
+	// ListenPortFile holds a peer port that can change at runtime, such as a
+	// VPN's forwarded port. While readable it takes precedence over ListenPort.
+	ListenPortFile  string
+	MaxTorrentBytes int64
+	MetadataTimeout time.Duration
+	// Public torrents are retired once idle and past SeedRatioTarget or
+	// SeedMaxAge. Private torrents follow their indexer's seed rule instead.
+	SeedRatioTarget float64
+	SeedMaxAge      time.Duration
+	CacheLimitBytes int64
+	MaxSeedSessions int
+	IdleGrace       time.Duration
+	CleanupInterval time.Duration
+	// StallTimeout fails a blocked read once the torrent downloaded nothing
+	// for this long.
+	StallTimeout time.Duration
+	// PeerlessStartupWait fails a playback that has not served any data yet
+	// after this long without a connected peer.
+	PeerlessStartupWait time.Duration
+	// Indexers supply private flags and seed rules by indexer name.
+	Indexers []config.Indexer
+	Logger   *slog.Logger
 }
 
 type Source struct {
@@ -71,39 +101,80 @@ type Source struct {
 	TorrentURL  string
 	TorrentPath string
 	FileHint    string
+	// Indexer is the configured indexer name the release came from; it selects
+	// the private-tracker seed rule. Empty for direct magnet/.torrent input.
+	Indexer string
 }
 
 type Engine struct {
-	client           *torrent.Client
-	httpClient       *http.Client
+	plugin           *pluginClient
+	fetchClient      *http.Client
 	dataDir          string
 	managedDir       string
 	managedStatePath string
+	downloadsDir     string
+	listenPortFixed  int
+	listenPortFile   string
 	maxTorrentBytes  int64
-	readaheadBytes   int64
 	metadataTimeout  time.Duration
 	seedRatioTarget  float64
+	seedMaxAge       time.Duration
 	cacheLimitBytes  int64
 	maxSeedSessions  int
 	idleGrace        time.Duration
-	seedMaxAge       time.Duration
 	cleanupInterval  time.Duration
-	serveWait        time.Duration
-	cleanOnClose     bool
-	logger           *slog.Logger
-	lockFile         *os.File
+	stallTimeout     time.Duration
+	peerlessWait     time.Duration
+	// indexers maps indexerKey names to their settings; see SetIndexers.
+	indexers  atomic.Pointer[map[string]config.Indexer]
+	logger    *slog.Logger
+	lockFile  *os.File
+	streamSeq atomic.Uint64
 
+	// lifecycleMu serializes adding torrents to and removing them from
+	// Deluge. It is never held while waiting for metadata or a download.
 	lifecycleMu sync.Mutex
-	mu          sync.RWMutex
-	serveMu     sync.Mutex
-	sessions    map[string]*Session
-	managed     map[*torrent.Torrent]*managedTorrent
-	onCleanup   func(string, string)
 
-	cleanupCancel context.CancelFunc
-	cleanupWG     sync.WaitGroup
-	restoreWG     sync.WaitGroup
-	closeOnce     sync.Once
+	mu                sync.Mutex
+	sessions          map[string]*Session
+	torrents          map[string]*torrentState
+	unreadableRecords []json.RawMessage
+	onCleanup         func(string, string)
+	listenPort        int
+	missingWarned     map[string]bool
+
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	closeOnce sync.Once
+}
+
+// torrentState is one Deluge torrent shared by every playback of it.
+type torrentState struct {
+	hash string
+	// record is nil until a playback registers; afterwards it is persisted.
+	record   *managedTorrent
+	restored bool
+	// added records that Filmstream added the torrent to Deluge.
+	added bool
+	// pending counts Create calls that have not registered or abandoned yet.
+	pending       int
+	sessions      map[string]*Session
+	wantAllPushed bool
+	// wantMu serializes readers switching a snatched torrent to every file.
+	wantMu sync.Mutex
+
+	// Metadata, written once under Engine.mu before any session exists.
+	name        string
+	pieceLength int64
+	numPieces   int
+	files       []pluginFile
+	savePath    string
+
+	detailMu       sync.Mutex
+	detail         pluginTorrent
+	detailAt       time.Time
+	lastDone       int64
+	lastProgressAt time.Time
 }
 
 type Session struct {
@@ -113,20 +184,22 @@ type Session struct {
 	FileSize  int64     `json:"file_size"`
 	CreatedAt time.Time `json:"created_at"`
 
-	torrent       *torrent.Torrent
-	file          *torrent.File
-	activeStreams int
-	started       bool
-	lastActivity  time.Time
+	torrent   *torrentState
+	file      pluginFile
+	localPath string
 
-	serveDeadline       time.Time
-	serveUnavailable    error
-	serveInitialPending int
-	serveDialObserved   bool
+	// Guarded by Engine.mu.
+	activeStreams    int
+	served           bool
+	lastActivity     time.Time
+	serveDeadline    time.Time
+	unavailable      error
+	unavailableUntil time.Time
 }
 
-// ErrSourceUnavailable identifies a torrent that exhausted its one startup
-// readiness budget without local coverage or a peer that could serve it.
+// ErrSourceUnavailable identifies a playback whose torrent cannot currently
+// deliver data. The verdict is temporary: it expires, and any delivered piece
+// clears it.
 var ErrSourceUnavailable = errors.New("playback source unavailable")
 
 type Status struct {
@@ -156,11 +229,34 @@ type Status struct {
 	SourceUnavailable    bool       `json:"source_unavailable,omitempty"`
 	OutboundDialObserved bool       `json:"outbound_dial_observed,omitempty"`
 	ServeDeadline        *time.Time `json:"serve_deadline,omitempty"`
+	DownloadRate         int64      `json:"download_rate"`
+	UploadRate           int64      `json:"upload_rate"`
+	Progress             float64    `json:"progress"`
+	Private              bool       `json:"private"`
+	// Snatched reports that a private torrent was played (or downloaded far
+	// enough) and must now be completed and seeded. An unsnatched private
+	// torrent downloads only its file head and tail.
+	Snatched           bool   `json:"snatched"`
+	SeedingSeconds     int64  `json:"seeding_seconds"`
+	SeedRequirementMet bool   `json:"seed_requirement_met"`
+	TrackerMessage     string `json:"tracker_message"`
 }
 
 func New(cfg Config) (*Engine, error) {
 	if cfg.ListenPort < 0 || cfg.ListenPort > 65535 {
 		return nil, fmt.Errorf("listen port must be between 0 and 65535: %d", cfg.ListenPort)
+	}
+	if cfg.PluginURL == "" {
+		cfg.PluginURL = defaultPluginURL
+	}
+	if cfg.DownloadsDir == "" {
+		cfg.DownloadsDir = defaultDownloadsDir
+	}
+	if !filepath.IsAbs(cfg.DownloadsDir) {
+		return nil, fmt.Errorf("downloads directory must be absolute: %s", cfg.DownloadsDir)
+	}
+	if cfg.MetadataTimeout <= 0 {
+		cfg.MetadataTimeout = defaultMetadataTimeout
 	}
 	if cfg.CacheLimitBytes <= 0 {
 		cfg.CacheLimitBytes = defaultCacheLimit
@@ -177,8 +273,11 @@ func New(cfg Config) (*Engine, error) {
 	if cfg.CleanupInterval <= 0 {
 		cfg.CleanupInterval = defaultCleanupInterval
 	}
-	if cfg.ServeReadinessWait <= 0 {
-		cfg.ServeReadinessWait = defaultServeReadinessWait
+	if cfg.StallTimeout <= 0 {
+		cfg.StallTimeout = defaultStallTimeout
+	}
+	if cfg.PeerlessStartupWait <= 0 {
+		cfg.PeerlessStartupWait = defaultPeerlessStartupWait
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -190,80 +289,61 @@ func New(cfg Config) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	unlock := func() {
-		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
-		_ = lockFile.Close()
-	}
-
-	torrentDataDir := filepath.Join(cfg.DataDir, "torrents")
-	managedDir := filepath.Join(cfg.DataDir, "managed-torrents")
-	managedStatePath := filepath.Join(cfg.DataDir, "managed-torrents.json")
-	if cfg.CleanOnStart {
-		for _, path := range []string{torrentDataDir, managedDir, managedStatePath} {
-			if err := os.RemoveAll(path); err != nil {
-				unlock()
-				return nil, fmt.Errorf("clear stale torrent cache: %w", err)
-			}
-		}
-	}
-	if err := os.MkdirAll(torrentDataDir, 0o755); err != nil {
-		unlock()
-		return nil, fmt.Errorf("create torrent data directory: %w", err)
-	}
-	if err := repairSparseCompletedMedia(torrentDataDir, cfg.Logger); err != nil {
-		unlock()
-		return nil, err
-	}
-	clientConfig := torrent.NewDefaultClientConfig()
-	clientConfig.DataDir = torrentDataDir
-	clientConfig.ListenPort = cfg.ListenPort
-	clientConfig.Seed = true
-	clientConfig.NoUpload = false
-	clientConfig.Slogger = slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	client, err := torrent.NewClient(clientConfig)
-	if err != nil {
-		unlock()
-		return nil, fmt.Errorf("create torrent client: %w", err)
-	}
-	httpTransport := http.DefaultTransport.(*http.Transport).Clone()
-	httpTransport.TLSHandshakeTimeout = 30 * time.Second
+	fetchTransport := http.DefaultTransport.(*http.Transport).Clone()
+	fetchTransport.TLSHandshakeTimeout = 10 * time.Second
+	fetchTransport.ResponseHeaderTimeout = 20 * time.Second
 	engine := &Engine{
-		client:           client,
-		httpClient:       &http.Client{Timeout: cfg.MetadataTimeout, Transport: httpTransport},
-		dataDir:          torrentDataDir,
-		managedDir:       managedDir,
-		managedStatePath: managedStatePath,
+		plugin: newPluginClient(cfg.PluginURL, cfg.PluginTokenFile),
+		fetchClient: &http.Client{
+			Transport: fetchTransport,
+			// Indexers such as Prowlarr answer a download link with a redirect
+			// to a magnet URI for magnet-only releases.
+			CheckRedirect: func(request *http.Request, via []*http.Request) error {
+				if request.URL.Scheme == "magnet" {
+					return http.ErrUseLastResponse
+				}
+				if len(via) >= 10 {
+					return errors.New("stopped after 10 redirects")
+				}
+				return nil
+			},
+		},
+		dataDir:          cfg.DataDir,
+		managedDir:       filepath.Join(cfg.DataDir, "managed-torrents"),
+		managedStatePath: filepath.Join(cfg.DataDir, "managed-torrents.json"),
+		downloadsDir:     filepath.Clean(cfg.DownloadsDir),
+		listenPortFixed:  cfg.ListenPort,
+		listenPortFile:   cfg.ListenPortFile,
 		maxTorrentBytes:  cfg.MaxTorrentBytes,
-		readaheadBytes:   cfg.ReadaheadBytes,
 		metadataTimeout:  cfg.MetadataTimeout,
 		seedRatioTarget:  cfg.SeedRatioTarget,
+		seedMaxAge:       cfg.SeedMaxAge,
 		cacheLimitBytes:  cfg.CacheLimitBytes,
 		maxSeedSessions:  cfg.MaxSeedSessions,
 		idleGrace:        cfg.IdleGrace,
-		seedMaxAge:       cfg.SeedMaxAge,
 		cleanupInterval:  cfg.CleanupInterval,
-		serveWait:        cfg.ServeReadinessWait,
-		cleanOnClose:     cfg.CleanOnClose,
+		stallTimeout:     cfg.StallTimeout,
+		peerlessWait:     cfg.PeerlessStartupWait,
 		logger:           cfg.Logger,
 		lockFile:         lockFile,
 		sessions:         make(map[string]*Session),
-		managed:          make(map[*torrent.Torrent]*managedTorrent),
+		torrents:         make(map[string]*torrentState),
+		missingWarned:    make(map[string]bool),
 	}
-	engine.restoreWG.Add(1)
-	go func() {
-		defer engine.restoreWG.Done()
-		if err := engine.restoreManagedTorrents(); err != nil {
-			engine.logger.Error("could not restore managed torrents", "error", err)
-		}
-	}()
+	engine.SetIndexers(cfg.Indexers)
+	if err := engine.loadManagedTorrents(); err != nil {
+		releaseDataDirLock(lockFile)
+		return nil, err
+	}
+	if info, err := os.Stat(filepath.Join(cfg.DataDir, "torrents")); err == nil && info.IsDir() {
+		engine.logger.Warn("legacy built-in torrent data is no longer used; Deluge re-downloads retained torrents into the downloads directory",
+			"path", filepath.Join(cfg.DataDir, "torrents"))
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	engine.cleanupCancel = cancel
-	engine.cleanupWG.Add(1)
+	engine.cancel = cancel
+	engine.wg.Add(2)
 	go engine.runJanitor(ctx)
-	if cfg.CleanOnStart {
-		engine.logger.Info("cleared stale torrent cache from previous server run")
-	}
+	go engine.runListenPort(ctx)
 	return engine, nil
 }
 
@@ -280,89 +360,35 @@ func acquireDataDirLock(dataDir string) (*os.File, error) {
 	return file, nil
 }
 
-// Part-file storage treats a final media path as complete after a restart. Demote
-// sparse final files so missing pieces are downloaded instead of served as zeroes,
-// and drop part files that shadow complete media: chunk writes for pieces shared
-// with adjacent files can recreate a part file after its media was promoted, and
-// reads prefer the part file, which would serve holes over verified data.
-func repairSparseCompletedMedia(dataDir string, logger *slog.Logger) error {
-	return filepath.Walk(dataDir, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			// Entries can vanish mid-walk because this pass removes files itself.
-			if errors.Is(walkErr, os.ErrNotExist) {
-				return nil
-			}
-			return walkErr
-		}
-		if !info.Mode().IsRegular() || strings.HasSuffix(path, ".part") ||
-			!videoExtensions[strings.ToLower(filepath.Ext(path))] || info.Size() == 0 {
-			return nil
-		}
-		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok {
-			return nil
-		}
-		if stat.Blocks*512*2 >= info.Size() {
-			// Not sparse: the final file holds verified complete data. A sibling
-			// part file can only be a stale shadow from later chunk writes.
-			partPath := path + ".part"
-			if err := os.Remove(partPath); err == nil {
-				logger.Warn("removed part file shadowing complete media", "part", partPath)
-			} else if !errors.Is(err, os.ErrNotExist) {
-				logger.Warn("remove part file shadowing complete media", "part", partPath, "error", err)
-			}
-			return nil
-		}
-
-		partPath := path + ".part"
-		if _, err := os.Stat(partPath); err == nil {
-			if err := os.Remove(path); err != nil {
-				return fmt.Errorf("remove sparse completed torrent file %s: %w", path, err)
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("inspect partial torrent file %s: %w", partPath, err)
-		} else if err := os.Rename(path, partPath); err != nil {
-			return fmt.Errorf("demote sparse completed torrent file %s: %w", path, err)
-		}
-		logger.Warn("demoted sparse completed torrent file for recovery", "file", path,
-			"size_bytes", info.Size(), "allocated_bytes", stat.Blocks*512)
-		return nil
-	})
+func releaseDataDirLock(file *os.File) {
+	_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	_ = file.Close()
 }
 
+// Close stops background work and saves state. Torrents stay in Deluge, which
+// keeps seeding them while Filmstream is down.
 func (e *Engine) Close() error {
 	e.closeOnce.Do(func() {
-		e.cleanupCancel()
-		e.cleanupWG.Wait()
-		e.restoreWG.Wait()
-		e.lifecycleMu.Lock()
+		e.cancel()
+		e.wg.Wait()
 		e.mu.Lock()
-		now := time.Now().UTC()
-		for torrent := range e.managed {
-			e.accountManagedTorrentLocked(torrent, now)
-		}
-		if err := e.persistManagedTorrentsLocked(); err != nil {
-			e.logger.Warn("could not save managed torrent state during shutdown", "error", err)
-		}
+		e.persistLocked()
 		e.mu.Unlock()
-		e.client.Close()
-		if e.cleanOnClose {
-			for _, path := range []string{e.dataDir, e.managedDir, e.managedStatePath} {
-				if err := os.RemoveAll(path); err != nil {
-					e.logger.Warn("could not clear torrent cache during shutdown", "error", err)
-				}
-			}
-		}
-		e.lifecycleMu.Unlock()
-		_ = syscall.Flock(int(e.lockFile.Fd()), syscall.LOCK_UN)
-		_ = e.lockFile.Close()
+		releaseDataDirLock(e.lockFile)
 	})
 	return nil
 }
 
-// ListenPort returns the TCP and UDP port used for incoming peers.
+// ListenPort returns the peer port Deluge was told to use, or the one it
+// reported, or 0 before Deluge answered.
 func (e *Engine) ListenPort() int {
-	return e.client.LocalPort()
+	e.mu.Lock()
+	port := e.listenPort
+	e.mu.Unlock()
+	if port == 0 {
+		port = e.desiredListenPort()
+	}
+	return port
 }
 
 func (e *Engine) SetCleanupHandler(handler func(string, string)) {
@@ -371,163 +397,311 @@ func (e *Engine) SetCleanupHandler(handler func(string, string)) {
 	e.mu.Unlock()
 }
 
+// Create adds a torrent to Deluge, waits for its metadata and mounts one video
+// file. It holds no engine-wide lock while downloading the .torrent file or
+// waiting for magnet metadata, so a slow candidate cannot delay other
+// playbacks, and it returns as soon as ctx ends.
 func (e *Engine) Create(ctx context.Context, source Source) (*Session, error) {
 	started := time.Now()
 	configured := 0
-	if source.MagnetURI != "" {
-		configured++
-	}
-	if source.TorrentURL != "" {
-		configured++
-	}
-	if source.TorrentPath != "" {
-		configured++
+	for _, value := range []string{source.MagnetURI, source.TorrentURL, source.TorrentPath} {
+		if value != "" {
+			configured++
+		}
 	}
 	if configured != 1 {
 		return nil, errors.New("exactly one torrent source must be provided")
 	}
 
-	sourceKind := "torrent_url"
-	if source.MagnetURI != "" {
-		sourceKind = "magnet"
-	} else if source.TorrentPath != "" {
-		sourceKind = "torrent_path"
-	}
-	addStarted := time.Now()
-	// Download metadata before locking the torrent lifecycle. A slow indexer
-	// must not hold up a cached replay, another mount, or required seed cleanup.
-	var meta *metainfo.MetaInfo
-	var err error
-	if source.TorrentURL != "" {
-		meta, err = e.downloadMetainfo(ctx, source.TorrentURL)
-	} else if source.TorrentPath != "" {
-		meta, err = metainfo.LoadFromFile(source.TorrentPath)
+	request := pluginAddRequest{SaveRoot: e.downloadsDir, WantedFiles: "all"}
+	var metainfo []byte
+	sourceKind := "magnet"
+	switch {
+	case source.MagnetURI != "":
+		request.Magnet = source.MagnetURI
+	case source.TorrentURL != "":
+		sourceKind = "torrent_url"
+		contents, magnet, err := e.fetchTorrent(ctx, source.TorrentURL)
 		if err != nil {
-			err = fmt.Errorf("load torrent file: %w", err)
+			return nil, err
 		}
+		if magnet != "" {
+			request.Magnet = magnet
+		} else {
+			metainfo = contents
+		}
+	default:
+		sourceKind = "torrent_path"
+		contents, err := readTorrentFile(source.TorrentPath)
+		if err != nil {
+			return nil, err
+		}
+		metainfo = contents
 	}
-	if err != nil {
-		return nil, err
+	if metainfo != nil {
+		request.Torrent = encodeTorrent(metainfo)
 	}
+	fetchDuration := time.Since(started)
 
-	e.lifecycleMu.Lock()
-	defer e.lifecycleMu.Unlock()
-	var t *torrent.Torrent
-	if meta != nil {
-		t, err = e.client.AddTorrent(meta)
-	} else {
-		t, err = e.client.AddMagnet(source.MagnetURI)
-	}
-	addSourceDuration := time.Since(addStarted)
+	addStarted := time.Now()
+	t, err := e.addTorrent(ctx, request)
 	if err != nil {
 		return nil, fmt.Errorf("add %s: %w", sourceKind, err)
 	}
-	metadataContext, cancel := context.WithTimeout(ctx, e.metadataTimeout)
-	defer cancel()
+	addDuration := time.Since(addStarted)
+	registered := false
+	defer func() {
+		if !registered {
+			e.abandon(t)
+		}
+	}()
+
 	metadataStarted := time.Now()
-	select {
-	case <-t.GotInfo():
-	case <-metadataContext.Done():
-		t.Drop()
-		return nil, fmt.Errorf("wait for torrent metadata: %w", metadataContext.Err())
-	}
-	metadataWaitDuration := time.Since(metadataStarted)
-
-	if length := t.Length(); length <= 0 {
-		t.Drop()
-		return nil, errors.New("torrent contains no data")
-	} else if e.maxTorrentBytes > 0 && length > e.maxTorrentBytes {
-		t.Drop()
-		return nil, fmt.Errorf("torrent is %.1f GiB; configured maximum is %.1f GiB", gib(length), gib(e.maxTorrentBytes))
-	}
-
-	fileSelectionStarted := time.Now()
-	file, err := selectVideoFile(t.Files(), source.FileHint)
+	detail, err := e.awaitMetadata(ctx, t)
 	if err != nil {
-		t.Drop()
 		return nil, err
 	}
-	fileSelectionDuration := time.Since(fileSelectionStarted)
-	registrationStarted := time.Now()
+	metadataDuration := time.Since(metadataStarted)
+	if detail.TotalSize <= 0 {
+		return nil, errors.New("torrent contains no data")
+	}
+	if e.maxTorrentBytes > 0 && detail.TotalSize > e.maxTorrentBytes {
+		return nil, fmt.Errorf("torrent is %.1f GiB; configured maximum is %.1f GiB",
+			gib(detail.TotalSize), gib(e.maxTorrentBytes))
+	}
+	file, err := selectVideoFile(detail.Files, source.FileHint)
+	if err != nil {
+		return nil, err
+	}
+	private, rule := e.seedPolicy(source.Indexer, detail.Private)
 	id, err := randomID()
 	if err != nil {
-		t.Drop()
 		return nil, err
 	}
 	now := time.Now().UTC()
 	session := &Session{
-		ID: id, Name: t.Name(), FileName: file.DisplayPath(), FileSize: file.Length(), CreatedAt: now,
-		torrent: t, file: file, lastActivity: now,
+		ID: id, Name: detail.Name, FileName: displayPath(detail.Name, detail.Files, file), FileSize: file.Size,
+		CreatedAt: now, torrent: t, file: file,
+		localPath:    filepath.Join(detail.SavePath, filepath.FromSlash(file.Path)),
+		lastActivity: now,
 	}
-	e.mu.Lock()
-	if err := e.ensureManagedTorrentLocked(t, source.FileHint, now); err != nil {
-		e.mu.Unlock()
-		t.Drop()
-		return nil, err
-	}
-	e.sessions[id] = session
-	e.mu.Unlock()
-	registrationDuration := time.Since(registrationStarted)
+	wanted := e.register(t, session, detail, source.Indexer, private, rule)
+	registered = true
 
-	// Metadata selection does not request payload data. The first source HTTP
-	// read establishes demand for only its requested range, so rejected ranked
-	// candidates never become private-tracker HnR obligations.
-	e.logger.Info("torrent mount stages",
-		"id", session.ID, "name", session.Name, "source_kind", sourceKind,
-		"add_source_duration", addSourceDuration,
-		"metadata_wait_duration", metadataWaitDuration,
-		"file_selection_duration", fileSelectionDuration,
-		"session_registration_duration", registrationDuration,
-		"announce_async", true, "payload_demand", false,
-		"total_duration", time.Since(started))
+	if metainfo == nil {
+		metaContext, cancel := context.WithTimeout(context.Background(), pluginCallTimeout)
+		metainfo, err = e.plugin.metainfo(metaContext, t.hash)
+		cancel()
+		if err != nil {
+			e.logger.Warn("could not save torrent metainfo", "info_hash", t.hash, "error", err)
+		}
+	}
+	e.saveMetainfo(t.hash, metainfo)
+	// Windows first: an unplayed private torrent wants no files, and with
+	// nothing wanted libtorrent would count it finished and drop its seeds.
+	e.setMountWindows(ctx, session)
+	if err := e.plugin.setFiles(ctx, t.hash, wanted); err != nil {
+		_ = e.Drop(id)
+		return nil, fmt.Errorf("select torrent files: %w", err)
+	}
+
+	e.logger.Info("torrent mounted",
+		"id", session.ID, "name", session.Name, "file", session.FileName, "info_hash", t.hash,
+		"source_kind", sourceKind, "indexer", source.Indexer, "private", private,
+		"fetch_duration", fetchDuration, "add_duration", addDuration,
+		"metadata_wait_duration", metadataDuration, "total_duration", time.Since(started))
 	return session, nil
 }
 
+// addTorrent adds the torrent to Deluge (idempotently) and registers a
+// pending Create so concurrent cleanup cannot remove it.
+func (e *Engine) addTorrent(ctx context.Context, request pluginAddRequest) (*torrentState, error) {
+	e.lifecycleMu.Lock()
+	defer e.lifecycleMu.Unlock()
+	response, err := e.plugin.add(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	hash := strings.ToLower(response.InfoHash)
+	if !validInfoHash(hash) {
+		return nil, fmt.Errorf("deluge plugin returned invalid info hash %q", response.InfoHash)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	t := e.torrents[hash]
+	if t == nil {
+		t = &torrentState{hash: hash}
+		e.torrents[hash] = t
+	}
+	t.pending++
+	t.added = t.added || response.Added
+	return t, nil
+}
+
+// abandon releases a Create that failed before registering a playback and
+// removes a torrent nothing else uses.
+func (e *Engine) abandon(t *torrentState) {
+	e.mu.Lock()
+	t.pending--
+	e.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), pluginCallTimeout)
+	defer cancel()
+	e.removeTorrent(ctx, t, "abandoned", func(t *torrentState) bool {
+		return t.record == nil && t.added
+	})
+}
+
+func (e *Engine) awaitMetadata(ctx context.Context, t *torrentState) (pluginTorrent, error) {
+	ctx, cancel := context.WithTimeout(ctx, e.metadataTimeout)
+	defer cancel()
+	delay := 50 * time.Millisecond
+	for {
+		detail, err := e.plugin.torrent(ctx, t.hash)
+		if err == nil && detail.HasMetadata && detail.PieceLength > 0 && detail.NumPieces > 0 && len(detail.Files) > 0 {
+			t.storeDetail(detail)
+			return detail, nil
+		}
+		if errors.Is(err, errTorrentNotFound) {
+			return pluginTorrent{}, fmt.Errorf("wait for torrent metadata: %w", err)
+		}
+		if err != nil && ctx.Err() == nil {
+			e.logger.Debug("torrent metadata poll failed", "info_hash", t.hash, "error", err)
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return pluginTorrent{}, fmt.Errorf("wait for torrent metadata: %w", ctx.Err())
+		case <-timer.C:
+		}
+		delay = min(delay*2, metadataPollMax)
+	}
+}
+
+// register attaches a new playback to its torrent and returns the file
+// selection Deluge should download.
+func (e *Engine) register(t *torrentState, session *Session, detail pluginTorrent, indexer string, private bool, rule *config.SeedRule) any {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if t.numPieces == 0 {
+		t.name = detail.Name
+		t.pieceLength = detail.PieceLength
+		t.numPieces = detail.NumPieces
+		t.files = detail.Files
+		t.savePath = detail.SavePath
+	}
+	t.pending--
+	if t.sessions == nil {
+		t.sessions = make(map[string]*Session)
+	}
+	t.sessions[session.ID] = session
+	e.sessions[session.ID] = session
+	record := t.record
+	if record == nil {
+		record = &managedTorrent{InfoHash: t.hash, CreatedAt: session.CreatedAt}
+		t.record = record
+	}
+	record.Name = detail.Name
+	if record.Indexer == "" {
+		record.Indexer = indexer
+	}
+	if private {
+		record.Private = true
+		if record.Seed == nil {
+			record.Seed = rule
+		}
+	}
+	record.addFile(session.file.Index)
+	record.LastActivity = session.CreatedAt
+	e.persistLocked()
+	if record.WantAll {
+		t.wantAllPushed = true
+	}
+	return record.wanted()
+}
+
+func (e *Engine) setMountWindows(ctx context.Context, session *Session) {
+	windows := map[string]pluginWindow{
+		"mount-head-" + session.ID: {
+			File: session.file.Index, Offset: 0, Length: min(mountHeadBytes, session.FileSize),
+			DeadlineBytes: mountHeadBytes, TTLMillis: mountWindowTTL.Milliseconds(),
+		},
+	}
+	if session.FileSize > 2*mountHeadBytes {
+		windows["mount-tail-"+session.ID] = pluginWindow{
+			File: session.file.Index, Offset: session.FileSize - mountTailBytes, Length: mountTailBytes,
+			DeadlineBytes: mountTailBytes, TTLMillis: mountWindowTTL.Milliseconds(),
+		}
+	}
+	for stream, window := range windows {
+		if err := e.plugin.setWindow(ctx, session.torrent.hash, stream, window); err != nil {
+			e.logger.Warn("could not prioritize playback start", "id", session.ID, "error", err)
+			return
+		}
+	}
+}
+
+func (e *Engine) removeMountWindows(session *Session) {
+	ctx, cancel := context.WithTimeout(context.Background(), pluginCallTimeout)
+	defer cancel()
+	for _, stream := range []string{"mount-head-" + session.ID, "mount-tail-" + session.ID} {
+		if err := e.plugin.removeWindow(ctx, session.torrent.hash, stream); err != nil && !errors.Is(err, errTorrentNotFound) {
+			e.logger.Debug("could not remove playback start window", "id", session.ID, "error", err)
+		}
+	}
+}
+
 func (e *Engine) Get(id string) (*Session, bool) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	session, ok := e.sessions[id]
 	return session, ok
 }
 
-// LocalFilePath returns the selected media path only when the torrent client
-// has promoted a fully downloaded file into its final location. Callers can
-// then inspect the file directly without bypassing torrent reads for partial
-// data, whose sparse holes must continue to be filled through NewReader.
+// LocalFilePath returns the playback file's path once Deluge has verified
+// every piece of it, so callers may read it directly.
 func (e *Engine) LocalFilePath(id string) (string, bool) {
-	e.mu.RLock()
-	session, ok := e.sessions[id]
-	e.mu.RUnlock()
-	if !ok || session.file.BytesCompleted() < session.file.Length() {
+	session, ok := e.Get(id)
+	if !ok {
 		return "", false
 	}
-	path := filepath.Join(e.dataDir, filepath.FromSlash(session.file.Path()))
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() != session.file.Length() {
+	ctx, cancel := context.WithTimeout(context.Background(), pluginCallTimeout)
+	defer cancel()
+	detail, err := e.fetchDetail(ctx, session.torrent)
+	if err != nil || !fileComplete(detail, session.file) {
 		return "", false
 	}
-	return path, true
+	info, err := os.Stat(session.localPath)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != session.FileSize {
+		return "", false
+	}
+	return session.localPath, true
+}
+
+func fileComplete(detail pluginTorrent, file pluginFile) bool {
+	return file.Index < len(detail.FileProgress) && detail.FileProgress[file.Index] >= file.Size
 }
 
 func (e *Engine) TorrentMetainfo(id string) ([]byte, error) {
-	e.mu.RLock()
-	session, ok := e.sessions[id]
-	e.mu.RUnlock()
+	session, ok := e.Get(id)
 	if !ok {
 		return nil, errors.New("playback not found")
 	}
-	meta := session.torrent.Metainfo()
-	var contents bytes.Buffer
-	if err := meta.Write(&contents); err != nil {
-		return nil, fmt.Errorf("encode torrent metainfo: %w", err)
+	if contents, err := os.ReadFile(e.managedMetainfoPath(session.torrent.hash)); err == nil && len(contents) > 0 {
+		return contents, nil
 	}
-	return contents.Bytes(), nil
+	ctx, cancel := context.WithTimeout(context.Background(), pluginCallTimeout)
+	defer cancel()
+	contents, err := e.plugin.metainfo(ctx, session.torrent.hash)
+	if err != nil {
+		return nil, fmt.Errorf("read torrent metainfo: %w", err)
+	}
+	return contents, nil
 }
 
+// Drop discards a playback that will not be used. Its torrent is removed with
+// its data unless another playback uses it or it carries a seeding obligation.
 func (e *Engine) Drop(id string) error {
-	e.lifecycleMu.Lock()
-	defer e.lifecycleMu.Unlock()
-
 	e.mu.Lock()
 	session, ok := e.sessions[id]
 	if !ok {
@@ -538,47 +712,31 @@ func (e *Engine) Drop(id string) error {
 		e.mu.Unlock()
 		return errors.New("playback is active")
 	}
-	shared := false
-	for candidateID, candidate := range e.sessions {
-		if candidateID != id && candidate.torrent == session.torrent {
-			shared = true
-			break
-		}
-	}
-	retainForSeeding := false
-	if state := e.managed[session.torrent]; !shared && state != nil && state.Started {
-		retainedID, err := randomID()
-		if err != nil {
-			e.mu.Unlock()
-			return err
-		}
-		e.serveMu.Lock()
-		retained := *session
-		e.serveMu.Unlock()
-		retained.ID = retainedID
-		retained.activeStreams = 0
-		retained.started = true
-		e.sessions[retainedID] = &retained
-		retainForSeeding = true
-	}
+	t := session.torrent
 	delete(e.sessions, id)
-	if !shared && !retainForSeeding {
-		e.removeManagedTorrentLocked(session.torrent)
-		if err := e.persistManagedTorrentsLocked(); err != nil {
-			e.logger.Warn("could not save managed torrent state", "error", err)
-		}
+	delete(t.sessions, id)
+	unused := len(t.sessions) == 0 && t.pending == 0
+	var record managedTorrent
+	if t.record != nil {
+		record = *t.record
 	}
 	handler := e.onCleanup
 	e.mu.Unlock()
 
-	if !shared && !retainForSeeding {
-		paths := e.torrentDataPaths(session.torrent)
-		session.torrent.Drop()
-		if err := e.removeTorrentData(paths); err != nil {
-			e.logger.Warn("could not fully remove rejected torrent cache", "error", err)
+	e.removeMountWindows(session)
+	if unused {
+		ctx, cancel := context.WithTimeout(context.Background(), pluginCallTimeout)
+		switch {
+		case record.Started || record.Obligated:
+			e.logger.Info("retained rejected torrent to satisfy seeding requirement", "name", session.Name, "info_hash", t.hash)
+		case record.Private && e.privateDownloadObligates(ctx, t):
+			// Enough was downloaded to count as a snatch on the tracker.
+		default:
+			e.removeTorrent(ctx, t, "rejected", func(t *torrentState) bool {
+				return len(t.sessions) == 0 && (t.record == nil || !t.record.Started && !t.record.Obligated)
+			})
 		}
-	} else if retainForSeeding {
-		e.logger.Info("retained rejected torrent to satisfy seeding requirement", "name", session.Name)
+		cancel()
 	}
 	if handler != nil {
 		handler(id, "rejected")
@@ -586,139 +744,232 @@ func (e *Engine) Drop(id string) error {
 	return nil
 }
 
+// privateDownloadObligates marks a never-played private torrent obligated
+// once it downloaded enough to count as a snatch. It also reports true when
+// Deluge cannot be asked, so nothing is removed on a guess.
+func (e *Engine) privateDownloadObligates(ctx context.Context, t *torrentState) bool {
+	detail, err := e.fetchDetail(ctx, t)
+	if err != nil {
+		e.logger.Warn("kept private torrent because its download volume is unknown", "info_hash", t.hash, "error", err)
+		return true
+	}
+	if !obligationReached(detail) {
+		return false
+	}
+	e.obligate(ctx, t, "downloaded_bytes", detail.AllTimeDownload)
+	return true
+}
+
+// removeTorrent removes a torrent and its data from Deluge when still
+// eligible, and forgets it. It returns the playback IDs that were removed.
+func (e *Engine) removeTorrent(ctx context.Context, t *torrentState, reason string, eligible func(*torrentState) bool) ([]string, bool) {
+	e.lifecycleMu.Lock()
+	defer e.lifecycleMu.Unlock()
+	e.mu.Lock()
+	if e.torrents[t.hash] != t || t.pending > 0 || !eligible(t) {
+		e.mu.Unlock()
+		return nil, false
+	}
+	for _, session := range t.sessions {
+		if session.activeStreams > 0 {
+			e.mu.Unlock()
+			return nil, false
+		}
+	}
+	e.mu.Unlock()
+
+	// Only a torrent Deluge no longer has may be forgotten; otherwise it would
+	// keep downloading unmanaged.
+	if err := e.plugin.remove(ctx, t.hash, true); err != nil && !errors.Is(err, errTorrentNotFound) {
+		e.logger.Warn("could not remove torrent from Deluge", "reason", reason, "info_hash", t.hash, "error", err)
+		return nil, false
+	}
+	e.mu.Lock()
+	ids := make([]string, 0, len(t.sessions))
+	for id := range t.sessions {
+		delete(e.sessions, id)
+		ids = append(ids, id)
+	}
+	t.sessions = nil
+	delete(e.torrents, t.hash)
+	delete(e.missingWarned, t.hash)
+	if t.record != nil {
+		e.persistLocked()
+	}
+	e.mu.Unlock()
+	e.removeMetainfo(t.hash)
+	e.logger.Info("removed torrent", "reason", reason, "info_hash", t.hash, "name", t.name)
+	return ids, true
+}
+
+// obligate commits a private torrent to be completed and seeded.
+func (e *Engine) obligate(ctx context.Context, t *torrentState, args ...any) {
+	e.mu.Lock()
+	if t.record == nil {
+		e.mu.Unlock()
+		return
+	}
+	changed := !t.record.Obligated || !t.record.WantAll
+	t.record.Obligated = true
+	t.record.WantAll = true
+	if changed {
+		e.persistLocked()
+	}
+	e.mu.Unlock()
+	if changed {
+		e.logger.Info("private torrent must now be completed and seeded", append([]any{"info_hash", t.hash, "name", t.name}, args...)...)
+	}
+	e.pushWantAll(ctx, t)
+}
+
+func (e *Engine) pushWantAll(ctx context.Context, t *torrentState) {
+	if err := e.ensureWantAll(ctx, t); err != nil {
+		e.logger.Warn("could not request every file of a torrent", "info_hash", t.hash, "error", err)
+	}
+}
+
 func (e *Engine) Status(id string) (Status, bool) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
 	session, ok := e.sessions[id]
 	if !ok {
+		e.mu.Unlock()
 		return Status{}, false
 	}
+	t := session.torrent
 	state := "ready"
 	if session.activeStreams > 0 {
 		state = "streaming"
-	} else if session.started {
+	} else if session.served {
 		state = "seeding"
 	}
-	activeStreams := session.activeStreams
-	lastActivity := session.lastActivity
-	started := session.started
-	t := session.torrent
-	file := session.file
 	status := Status{
 		ID: session.ID, Name: session.Name, FileName: session.FileName, FileSize: session.FileSize,
-		State: state, ActiveStreams: activeStreams, LastActivity: lastActivity,
+		State: state, ActiveStreams: session.activeStreams, LastActivity: session.lastActivity,
+		InfoHash: t.hash,
 	}
-	downloaded, uploaded, seededFor := e.managedTransferTotalsLocked(t, time.Now().UTC())
-	if started && activeStreams == 0 {
-		remaining := max(0, e.seedMaxAge-seededFor)
-		deadline := time.Now().UTC().Add(remaining)
-		status.SeedDeadline = &deadline
-	}
-	stats := t.Stats()
-	ratio := transferRatio(downloaded, uploaded)
-	status.BytesComplete = file.BytesCompleted()
-	status.TorrentBytes = t.Length()
-	status.TorrentComplete = t.BytesCompleted()
-	status.DownloadedBytes = downloaded
-	status.UploadedBytes = uploaded
-	status.Ratio = ratio
-	status.RatioTarget = e.seedRatioTarget
-	status.RatioTargetMet = ratioTargetMet(downloaded, ratio, e.seedRatioTarget)
-	status.TotalPeers = stats.TotalPeers
-	status.PendingPeers = stats.PendingPeers
-	status.ActivePeers = stats.ActivePeers
-	status.ConnectedSeeders = stats.ConnectedSeeders
-	status.HalfOpenPeers = stats.HalfOpenPeers
-	status.InfoHash = t.InfoHash().HexString()
-	status.CachedPercent = localCoveragePercent(session)
-	e.serveMu.Lock()
-	status.SourceUnavailable = session.serveUnavailable != nil
-	status.OutboundDialObserved = session.serveDialObserved
+	now := time.Now()
+	status.SourceUnavailable = session.unavailable != nil && now.Before(session.unavailableUntil)
 	if !session.serveDeadline.IsZero() {
 		deadline := session.serveDeadline
 		status.ServeDeadline = &deadline
 	}
-	e.serveMu.Unlock()
+	var record managedTorrent
+	if t.record != nil {
+		record = *t.record
+	}
+	served := session.served
+	e.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), pluginCallTimeout)
+	defer cancel()
+	detail, err := e.detail(ctx, t)
+	if err != nil {
+		e.logger.Debug("torrent status unavailable", "id", id, "error", err)
+	}
+	seed := e.seedState(record, detail)
+	if session.file.Index < len(detail.FileProgress) {
+		status.BytesComplete = detail.FileProgress[session.file.Index]
+	}
+	status.TorrentBytes = detail.TotalSize
+	status.TorrentComplete = detail.TotalDone
+	status.DownloadedBytes = detail.AllTimeDownload
+	status.UploadedBytes = detail.AllTimeUpload
+	status.Ratio = seed.ratio
+	status.RatioTarget = seed.ratioTarget
+	status.RatioTargetMet = seed.ratioMet
+	status.TotalPeers = detail.ListPeers
+	status.PendingPeers = detail.ConnectCandidates
+	status.ActivePeers = detail.NumPeers
+	status.ConnectedSeeders = detail.NumSeeds
+	status.OutboundDialObserved = detail.ListPeers > 0
+	if session.FileSize > 0 {
+		status.CachedPercent = int(100 * status.BytesComplete / session.FileSize)
+	}
+	status.DownloadRate = detail.DownloadRate
+	status.UploadRate = detail.UploadRate
+	status.Progress = detail.Progress
+	status.Private = record.Private || detail.Private
+	status.Snatched = status.Private && (record.Started || record.Obligated)
+	status.SeedingSeconds = detail.SeedingSeconds
+	status.SeedRequirementMet = seed.met
+	status.TrackerMessage = detail.TrackerMessage
+	if served && status.ActiveStreams == 0 {
+		if remaining, known := seed.remaining(); known {
+			deadline := now.UTC().Add(remaining)
+			status.SeedDeadline = &deadline
+		}
+	}
 	return status, true
 }
 
-// SourceUnavailable returns the bounded readiness failure for a playback. HLS
-// uses this to stop probes and packagers as soon as the source HTTP request has
-// established that a peerless partial torrent cannot serve startup.
+// SourceUnavailable returns the current unavailable verdict for a playback,
+// if any. HLS uses it to stop probes and packagers early.
 func (e *Engine) SourceUnavailable(id string) error {
-	e.mu.RLock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	session, ok := e.sessions[id]
-	e.mu.RUnlock()
-	if !ok {
+	if !ok || session.unavailable == nil || !time.Now().Before(session.unavailableUntil) {
 		return nil
 	}
-	e.serveMu.Lock()
-	defer e.serveMu.Unlock()
-	return session.serveUnavailable
+	return session.unavailable
 }
 
-// MarkSourceUnavailable records a source that connected for startup but later
-// stopped advancing its HLS playlist. The failure remains session-wide so
-// recovery cannot keep replaying cached ranges from the same stalled release.
+// MarkSourceUnavailable records a playback whose consumer saw the source stop
+// advancing. Blocked reads fail until the verdict expires or data arrives.
 func (e *Engine) MarkSourceUnavailable(id string, cause error) error {
-	e.mu.RLock()
-	session, ok := e.sessions[id]
-	e.mu.RUnlock()
+	session, ok := e.Get(id)
 	if !ok {
 		return nil
 	}
 	if cause == nil {
 		cause = errors.New("source stopped advancing")
 	}
+	return e.markUnavailable(session, cause)
+}
 
-	e.serveMu.Lock()
-	if session.serveUnavailable != nil {
-		err := session.serveUnavailable
-		e.serveMu.Unlock()
-		return err
-	}
+func (e *Engine) markUnavailable(session *Session, cause error) error {
 	err := fmt.Errorf("%w: %w", ErrSourceUnavailable, cause)
-	session.serveUnavailable = err
-	deadline := session.serveDeadline
-	e.serveMu.Unlock()
-
-	stats := session.torrent.Stats()
-	e.logger.Warn("playback source stopped advancing",
-		"name", session.Name, "file", session.FileName,
-		"info_hash", session.torrent.InfoHash().HexString(),
-		"connected_peers", stats.ActivePeers, "connected_seeders", stats.ConnectedSeeders,
-		"total_peers", stats.TotalPeers, "pending_peers", stats.PendingPeers,
-		"half_open_peers", stats.HalfOpenPeers, "cached_percent", localCoveragePercent(session),
-		"serve_deadline", deadline, "error", cause)
+	e.mu.Lock()
+	if session.unavailable != nil && time.Now().Before(session.unavailableUntil) {
+		err = session.unavailable
+	} else {
+		session.unavailable = err
+		session.unavailableUntil = time.Now().Add(sourceUnavailableHold)
+	}
+	e.mu.Unlock()
+	t := session.torrent
+	t.detailMu.Lock()
+	detail := t.detail
+	t.detailMu.Unlock()
+	e.logger.Warn("playback source unavailable",
+		"id", session.ID, "name", session.Name, "file", session.FileName, "info_hash", t.hash,
+		"connected_peers", detail.NumPeers, "connected_seeders", detail.NumSeeds,
+		"known_peers", detail.ListPeers, "download_rate", detail.DownloadRate,
+		"tracker_status", detail.TrackerStatus, "hold", sourceUnavailableHold, "error", cause)
 	return err
 }
 
 func (e *Engine) ServeHTTP(w http.ResponseWriter, r *http.Request, id string) error {
-	session, ok := e.beginStream(id, r.Method != http.MethodHead)
+	session, ok := e.beginStream(id)
 	if !ok {
 		return errors.New("playback not found")
 	}
 	defer e.endStream(id)
 
-	// HEAD never reads data, and a parked HLS packager resumes over its existing
-	// source connection, so only body-producing requests need serve readiness.
+	reader := e.newReader(r.Context(), session)
+	defer reader.Close()
+	// HEAD never reads data. Other requests first wait for their first byte so
+	// an unavailable source is reported as an error instead of a stalled body.
 	if r.Method != http.MethodHead {
-		if err := e.ensureServeReadiness(r.Context(), session, requestReadStart(r, session.file.Length())); err != nil {
+		if err := reader.prepare(requestReadStart(r, session.FileSize)); err != nil {
 			return err
 		}
 	}
-
-	reader := session.file.NewReader()
-	defer reader.Close()
-	reader.SetContext(r.Context())
-	reader.SetResponsive()
-	reader.SetReadahead(e.readaheadBytes)
-
-	if mediaType := mime.TypeByExtension(strings.ToLower(filepath.Ext(session.FileName))); mediaType != "" {
+	if mediaType := mime.TypeByExtension(strings.ToLower(path.Ext(session.FileName))); mediaType != "" {
 		w.Header().Set("Content-Type", mediaType)
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	http.ServeContent(w, r, filepath.Base(session.FileName), session.CreatedAt, reader)
+	http.ServeContent(w, r, path.Base(session.FileName), session.CreatedAt, reader)
 	return nil
 }
 
@@ -750,276 +1001,8 @@ func requestReadStart(r *http.Request, size int64) int64 {
 	return start
 }
 
-// ensureServeReadiness makes sure a source read can actually make progress.
-// Pieces of a locally present file can still be marked incomplete (for example
-// boundary pieces shared with adjacent part files), so the read first re-hashes
-// local data, then waits a bounded window for the swarm. Without this, a
-// playback mounted on a dead swarm stalls silently inside the first read until
-// the client's request times out with no log or error anywhere.
-func (e *Engine) ensureServeReadiness(ctx context.Context, session *Session, readStart int64) (err error) {
-	defer func() {
-		if err == nil {
-			// A source that can serve reads has recovered. Do not carry its old
-			// startup deadline into a later seek or resume after peers disconnect.
-			e.serveMu.Lock()
-			if session.serveUnavailable == nil {
-				session.serveDeadline = time.Time{}
-			}
-			e.serveMu.Unlock()
-		}
-	}()
-	deadline, unavailable := e.serveReadinessState(session)
-	if unavailable != nil {
-		return unavailable
-	}
-	if !e.readBlocked(session, readStart) {
-		return nil
-	}
-	readinessContext, cancel := context.WithDeadline(ctx, deadline)
-	defer cancel()
-	e.verifyFileLocalPieces(readinessContext, session)
-	if !e.readBlocked(session, readStart) {
-		return nil
-	}
-
-	// anacrolix only permits outgoing peer connections when needData is true.
-	// Creating a File reader is not enough: its first Read marks the current and
-	// readahead pieces wanted, which moves tracker peers out of the pending pool
-	// and into outbound dials. Keep this demand reader alive until readiness is
-	// established; the HTTP reader below then takes over the same range.
-	demandContext, cancelDemand := context.WithCancel(readinessContext)
-	demandReader := session.file.NewReader()
-	demandReader.SetContext(demandContext)
-	demandReader.SetResponsive()
-	demandReader.SetReadahead(e.readaheadBytes)
-	if _, err := demandReader.Seek(readStart, io.SeekStart); err != nil {
-		cancelDemand()
-		_ = demandReader.Close()
-		return fmt.Errorf("seek playback source demand: %w", err)
-	}
-	initialStats := session.torrent.Stats()
-	e.serveMu.Lock()
-	session.serveInitialPending = max(session.serveInitialPending, initialStats.PendingPeers)
-	e.serveMu.Unlock()
-	demandDone := make(chan error, 1)
-	go func() {
-		_, err := demandReader.Read(make([]byte, 1))
-		demandDone <- err
-	}()
-	defer func() {
-		cancelDemand()
-		<-demandDone
-		_ = demandReader.Close()
-	}()
-
-	e.logger.Info("started playback source demand",
-		"name", session.Name, "file", session.FileName, "read_start", readStart,
-		"readahead_bytes", e.readaheadBytes, "pending_peers", initialStats.PendingPeers,
-		"half_open_peers", initialStats.HalfOpenPeers, "serve_deadline", deadline)
-	nextLog := time.Now().Add(serviceReadinessLogEvery)
-	for {
-		stats := session.torrent.Stats()
-		e.observeServeDial(session, stats)
-		if !e.readBlocked(session, readStart) {
-			return nil
-		}
-		if err := readinessContext.Err(); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return e.markSourceUnavailable(session)
-		}
-		if time.Now().After(nextLog) {
-			e.logger.Info("waiting for playback swarm to serve source",
-				"name", session.Name, "file", session.FileName,
-				"connected_peers", stats.ActivePeers, "connected_seeders", stats.ConnectedSeeders,
-				"pending_peers", stats.PendingPeers, "half_open_peers", stats.HalfOpenPeers,
-				"cached_percent", localCoveragePercent(session), "serve_deadline", deadline)
-			nextLog = time.Now().Add(serviceReadinessLogEvery)
-		}
-		select {
-		case <-readinessContext.Done():
-		case <-time.After(serviceReadinessPoll):
-		}
-	}
-}
-
-func (e *Engine) observeServeDial(session *Session, stats torrent.TorrentStats) {
-	e.serveMu.Lock()
-	if stats.HalfOpenPeers > 0 ||
-		session.serveInitialPending > 0 && stats.PendingPeers < session.serveInitialPending {
-		session.serveDialObserved = true
-	}
-	e.serveMu.Unlock()
-}
-
-// serveReadinessState shares one deadline across consecutive blocked reads.
-// FFprobe and FFmpeg make several range requests during startup; only a source
-// that becomes ready may renew the budget, never a failed or canceled read.
-func (e *Engine) serveReadinessState(session *Session) (time.Time, error) {
-	e.serveMu.Lock()
-	defer e.serveMu.Unlock()
-	if session.serveDeadline.IsZero() {
-		session.serveDeadline = time.Now().Add(e.serveWait)
-		session.serveInitialPending = 0
-		session.serveDialObserved = false
-	}
-	return session.serveDeadline, session.serveUnavailable
-}
-
-func (e *Engine) markSourceUnavailable(session *Session) error {
-	e.serveMu.Lock()
-	if session.serveUnavailable != nil {
-		err := session.serveUnavailable
-		e.serveMu.Unlock()
-		return err
-	}
-	stats := session.torrent.Stats()
-	coverage := localCoveragePercent(session)
-	err := fmt.Errorf("%w: no peers connected before the shared %s startup deadline and only %d%% of %s is available locally",
-		ErrSourceUnavailable, e.serveWait, coverage, session.FileName)
-	session.serveUnavailable = err
-	deadline := session.serveDeadline
-	dialObserved := session.serveDialObserved
-	e.serveMu.Unlock()
-
-	discoveryOutcome := "peers_discovered_but_not_connected"
-	if stats.TotalPeers == 0 && stats.PendingPeers == 0 && stats.HalfOpenPeers == 0 {
-		if dialObserved {
-			discoveryOutcome = "peers_dialed_but_not_connected"
-		} else {
-			discoveryOutcome = "no_peers_returned_or_retained"
-		}
-	}
-	e.logger.Warn("playback swarm cannot serve source",
-		"name", session.Name, "file", session.FileName,
-		"info_hash", session.torrent.InfoHash().HexString(),
-		"connected_peers", stats.ActivePeers, "connected_seeders", stats.ConnectedSeeders,
-		"total_peers", stats.TotalPeers, "pending_peers", stats.PendingPeers,
-		"half_open_peers", stats.HalfOpenPeers, "cached_percent", coverage,
-		"serve_deadline", deadline, "outbound_dial_observed", dialObserved,
-		"peer_discovery_outcome", discoveryOutcome,
-		"tracker_outcome", "inferred_from_peer_counters")
-	return err
-}
-
-// readBlocked reports whether a read starting at readStart would have to wait
-// for the network: nothing is connected or dialing, and the readahead window is
-// not fully covered by complete local pieces.
-func (e *Engine) readBlocked(session *Session, readStart int64) bool {
-	t := session.torrent
-	stats := t.Stats()
-	if stats.ActivePeers > 0 {
-		return false
-	}
-	file := session.file
-	windowEnd := min(file.Length()-1, readStart+e.readaheadBytes)
-	return !fileRangeComplete(t, file, readStart, windowEnd)
-}
-
-// verifyFileLocalPieces re-hashes the playback file's incomplete pieces so
-// locally present data becomes servable without peers. Data can be on disk
-// while pieces are marked incomplete, and the in-memory completion state does
-// not survive a restart, so this is the only way a disconnected replay can
-// serve. Verification is bounded; pieces beyond the budget stay incomplete.
-func (e *Engine) verifyFileLocalPieces(ctx context.Context, session *Session) {
-	t := session.torrent
-	file := session.file
-	if !fileDataPresent(e.dataDir, file) {
-		return
-	}
-	pieceLength := t.Info().PieceLength
-	begin := int(file.Offset() / pieceLength)
-	end := int((file.Offset() + file.Length() + pieceLength - 1) / pieceLength)
-	if maxPieces := int(t.NumPieces()); end > maxPieces {
-		end = maxPieces
-	}
-	missingPieces := 0
-	for piece := begin; piece < end; piece++ {
-		if t.PieceBytesMissing(piece) > 0 {
-			missingPieces++
-		}
-	}
-	if missingPieces == 0 {
-		return
-	}
-	verifyContext, cancel := context.WithTimeout(ctx, localVerifyBudget)
-	defer cancel()
-	verifiedPieces := 0
-	var verifiedBytes int64
-	for piece := begin; piece < end; piece++ {
-		if verifyContext.Err() != nil {
-			break
-		}
-		if t.PieceBytesMissing(piece) <= 0 {
-			continue
-		}
-		pieceLength := t.Piece(piece).Info().Length()
-		if err := t.Piece(piece).VerifyDataContext(verifyContext); err != nil {
-			e.logger.Warn("verify local torrent data", "name", t.Name(), "piece", piece, "error", err)
-			break
-		}
-		if t.PieceBytesMissing(piece) <= 0 {
-			verifiedPieces++
-			verifiedBytes += pieceLength
-		}
-	}
-	remainingPieces := 0
-	for piece := begin; piece < end; piece++ {
-		if t.PieceBytesMissing(piece) > 0 {
-			remainingPieces++
-		}
-	}
-	if verifiedPieces == 0 && remainingPieces == missingPieces {
-		return
-	}
-	logArgs := []any{"name", t.Name(), "file", file.DisplayPath(),
-		"incomplete_pieces", missingPieces, "verified_pieces", verifiedPieces,
-		"verified_bytes", verifiedBytes, "remaining_incomplete_pieces", remainingPieces}
-	if remainingPieces > 0 {
-		e.logger.Warn("checked local torrent data for playback", logArgs...)
-	} else {
-		e.logger.Info("recovered playback data from local pieces", logArgs...)
-	}
-}
-
-// fileDataPresent reports whether any local bytes exist for the file, so that
-// re-hashing its incomplete pieces has a chance to recover them.
-func fileDataPresent(dataDir string, file *torrent.File) bool {
-	for _, suffix := range []string{"", ".part"} {
-		path := filepath.Join(dataDir, filepath.FromSlash(file.Path())) + suffix
-		if info, err := os.Stat(path); err == nil && info.Size() > 0 {
-			return true
-		}
-	}
-	return false
-}
-
-// fileRangeComplete reports whether every piece overlapping the file-relative
-// byte range [start, end] is complete, so reads there are served from local data.
-func fileRangeComplete(t *torrent.Torrent, file *torrent.File, start, end int64) bool {
-	pieceLength := t.Info().PieceLength
-	firstPiece := int((file.Offset() + start) / pieceLength)
-	lastPiece := int((file.Offset() + end) / pieceLength)
-	if maxPiece := int(t.NumPieces()) - 1; lastPiece > maxPiece {
-		lastPiece = maxPiece
-	}
-	for piece := firstPiece; piece <= lastPiece; piece++ {
-		if t.PieceBytesMissing(piece) > 0 {
-			return false
-		}
-	}
-	return true
-}
-
-func localCoveragePercent(session *Session) int {
-	if session.FileSize <= 0 {
-		return 0
-	}
-	return int(100 * session.file.BytesCompleted() / session.FileSize)
-}
-
-func (e *Engine) beginStream(id string, markStarted bool) (*Session, bool) {
+// beginStream counts an HTTP reader.
+func (e *Engine) beginStream(id string) (*Session, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	session, ok := e.sessions[id]
@@ -1028,16 +1011,9 @@ func (e *Engine) beginStream(id string, markStarted bool) (*Session, bool) {
 	}
 	now := time.Now().UTC()
 	session.activeStreams++
-	if markStarted {
-		session.started = true
-		e.markManagedTorrentStartedLocked(session.torrent, now)
-	}
 	session.lastActivity = now
-	e.updateManagedTorrentActivityLocked(session.torrent, now)
-	if markStarted {
-		if err := e.persistManagedTorrentsLocked(); err != nil {
-			e.logger.Warn("could not save managed torrent state", "error", err)
-		}
+	if record := session.torrent.record; record != nil {
+		record.LastActivity = now
 	}
 	return session, true
 }
@@ -1051,343 +1027,212 @@ func (e *Engine) endStream(id string) {
 		}
 		now := time.Now().UTC()
 		session.lastActivity = now
-		e.updateManagedTorrentActivityLocked(session.torrent, now)
+		if record := session.torrent.record; record != nil {
+			record.LastActivity = now
+		}
 	}
 }
 
-func (e *Engine) runJanitor(ctx context.Context) {
-	defer e.cleanupWG.Done()
-	ticker := time.NewTicker(e.cleanupInterval)
+// detail returns the torrent's Deluge status, at most detailMaxAge old.
+func (e *Engine) detail(ctx context.Context, t *torrentState) (pluginTorrent, error) {
+	t.detailMu.Lock()
+	defer t.detailMu.Unlock()
+	if !t.detailAt.IsZero() && time.Since(t.detailAt) < detailMaxAge {
+		return t.detail, nil
+	}
+	detail, err := e.plugin.torrent(ctx, t.hash)
+	if err != nil {
+		return t.detail, err
+	}
+	t.storeDetailLocked(detail)
+	return detail, nil
+}
+
+// fetchDetail returns fresh Deluge status.
+func (e *Engine) fetchDetail(ctx context.Context, t *torrentState) (pluginTorrent, error) {
+	detail, err := e.plugin.torrent(ctx, t.hash)
+	if err != nil {
+		return pluginTorrent{}, err
+	}
+	t.storeDetail(detail)
+	return detail, nil
+}
+
+func (t *torrentState) storeDetail(detail pluginTorrent) {
+	t.detailMu.Lock()
+	t.storeDetailLocked(detail)
+	t.detailMu.Unlock()
+}
+
+// storeDetailLocked caches status and tracks when the torrent last gained
+// verified data, which read stall detection relies on.
+func (t *torrentState) storeDetailLocked(detail pluginTorrent) {
+	now := time.Now()
+	t.detail = detail
+	t.detailAt = now
+	if t.lastProgressAt.IsZero() || detail.TotalDone > t.lastDone {
+		t.lastDone = detail.TotalDone
+		t.lastProgressAt = now
+	}
+}
+
+func (e *Engine) lastProgress(t *torrentState) time.Time {
+	t.detailMu.Lock()
+	defer t.detailMu.Unlock()
+	return t.lastProgressAt
+}
+
+// fetchTorrent downloads a .torrent file, or returns the magnet URI an indexer
+// redirected to.
+func (e *Engine) fetchTorrent(ctx context.Context, torrentURL string) ([]byte, string, error) {
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		attemptContext, cancel := context.WithTimeout(ctx, torrentFetchTimeout)
+		contents, magnet, retry, err := e.fetchTorrentOnce(attemptContext, torrentURL)
+		cancel()
+		if err == nil {
+			return contents, magnet, nil
+		}
+		if ctx.Err() != nil {
+			return nil, "", fmt.Errorf("download torrent file: %w", ctx.Err())
+		}
+		lastErr = err
+		if !retry || attempt == 3 {
+			break
+		}
+		timer := time.NewTimer(time.Duration(attempt) * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, "", fmt.Errorf("download torrent file: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
+	return nil, "", fmt.Errorf("download torrent file: %w", lastErr)
+}
+
+func (e *Engine) fetchTorrentOnce(ctx context.Context, torrentURL string) (contents []byte, magnet string, retry bool, err error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, torrentURL, nil)
+	if err != nil {
+		return nil, "", false, err
+	}
+	request.Header.Set("User-Agent", "filmstream/0.1")
+	response, err := e.fetchClient.Do(request)
+	if err != nil {
+		return nil, "", true, err
+	}
+	defer response.Body.Close()
+	if location := response.Header.Get("Location"); response.StatusCode >= 300 && response.StatusCode < 400 &&
+		strings.HasPrefix(strings.ToLower(location), "magnet:") {
+		return nil, location, false, nil
+	}
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return nil, "", response.StatusCode >= 500 || response.StatusCode == http.StatusTooManyRequests,
+			fmt.Errorf("download torrent file returned %s", response.Status)
+	}
+	contents, err = io.ReadAll(io.LimitReader(response.Body, maxMetainfoBytes+1))
+	if err != nil {
+		return nil, "", true, err
+	}
+	return parseTorrentPayload(contents)
+}
+
+func parseTorrentPayload(contents []byte) ([]byte, string, bool, error) {
+	if len(contents) > maxMetainfoBytes {
+		return nil, "", false, fmt.Errorf("torrent file exceeds %d bytes", maxMetainfoBytes)
+	}
+	if trimmed := strings.TrimSpace(string(contents[:min(len(contents), 8192)])); strings.HasPrefix(strings.ToLower(trimmed), "magnet:") {
+		return nil, trimmed, false, nil
+	}
+	if len(contents) == 0 || contents[0] != 'd' {
+		return nil, "", false, errors.New("response is not a torrent file")
+	}
+	return contents, "", false, nil
+}
+
+func readTorrentFile(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("load torrent file: %w", err)
+	}
+	defer file.Close()
+	contents, err := io.ReadAll(io.LimitReader(file, maxMetainfoBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("load torrent file: %w", err)
+	}
+	contents, magnet, _, err := parseTorrentPayload(contents)
+	if err != nil {
+		return nil, fmt.Errorf("load torrent file: %w", err)
+	}
+	if magnet != "" {
+		return nil, errors.New("load torrent file: file contains a magnet URI, not a torrent")
+	}
+	return contents, nil
+}
+
+// runListenPort pushes the configured peer port to Deluge and follows the
+// port file, whose value can change when the VPN reconnects.
+func (e *Engine) runListenPort(ctx context.Context) {
+	defer e.wg.Done()
+	pushed := 0
+	healthChecked := false
+	var lastErr string
+	ticker := time.NewTicker(listenPortPoll)
 	defer ticker.Stop()
 	for {
+		if !healthChecked {
+			if health, err := e.plugin.health(ctx); err == nil {
+				healthChecked = true
+				e.logDelugeHealth(health)
+				e.mu.Lock()
+				if e.listenPort == 0 {
+					e.listenPort = health.ListenPort
+				}
+				e.mu.Unlock()
+			}
+		}
+		if port := e.desiredListenPort(); port > 0 && port != pushed {
+			if err := e.plugin.setListenPort(ctx, port); err != nil {
+				if ctx.Err() == nil && err.Error() != lastErr {
+					e.logger.Warn("could not set Deluge listen port", "port", port, "error", err)
+					lastErr = err.Error()
+				}
+			} else {
+				e.logger.Info("set Deluge listen port", "port", port, "previous", pushed)
+				pushed = port
+				lastErr = ""
+				e.mu.Lock()
+				e.listenPort = port
+				e.mu.Unlock()
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-ticker.C:
-			e.cleanup(now.UTC())
+		case <-ticker.C:
 		}
 	}
 }
 
-type torrentGroup struct {
-	torrent      *torrent.Torrent
-	sessions     []*Session
-	lastActivity time.Time
-	active       int
-	started      bool
-	complete     int64
-	downloaded   int64
-	uploaded     int64
-	ratio        float64
-	ratioMet     bool
-	seededFor    time.Duration
-}
-
-func (e *Engine) cleanup(now time.Time) {
-	e.lifecycleMu.Lock()
-	defer e.lifecycleMu.Unlock()
-
-	e.mu.Lock()
-	groupsByTorrent := make(map[*torrent.Torrent]*torrentGroup)
-	for _, session := range e.sessions {
-		group := groupsByTorrent[session.torrent]
-		if group == nil {
-			state := e.accountManagedTorrentLocked(session.torrent, now)
-			downloaded, uploaded, seededFor := e.managedTransferTotalsLocked(session.torrent, now)
-			ratio := transferRatio(downloaded, uploaded)
-			group = &torrentGroup{
-				torrent: session.torrent, complete: session.torrent.BytesCompleted(),
-				downloaded: downloaded, uploaded: uploaded, ratio: ratio,
-				ratioMet: ratioTargetMet(downloaded, ratio, e.seedRatioTarget), seededFor: seededFor,
-			}
-			if state != nil {
-				group.started = state.Started
-			}
-			groupsByTorrent[session.torrent] = group
-		}
-		group.sessions = append(group.sessions, session)
-		group.active += session.activeStreams
-		group.started = group.started || session.started
-		if session.lastActivity.After(group.lastActivity) {
-			group.lastActivity = session.lastActivity
-		}
-	}
-
-	groups := make([]*torrentGroup, 0, len(groupsByTorrent))
-	var totalComplete int64
-	for _, group := range groupsByTorrent {
-		groups = append(groups, group)
-		totalComplete += group.complete
-	}
-	selected := make(map[*torrentGroup]string)
-	for _, group := range groups {
-		if group.active > 0 {
-			continue
-		}
-		idle := now.Sub(group.lastActivity)
-		switch {
-		case !group.started && idle >= e.idleGrace:
-			selected[group] = "unused"
-		case group.started && idle >= e.idleGrace && group.ratioMet:
-			selected[group] = "ratio-target"
-		case group.started && idle >= e.idleGrace && group.seededFor >= e.seedMaxAge:
-			selected[group] = "seed-time-target"
-		}
-	}
-	for group := range selected {
-		totalComplete -= group.complete
-	}
-	remainingGroups := len(groups) - len(selected)
-	if remainingGroups > e.maxSeedSessions {
-		candidates := cleanupCandidates(groups, selected, now, e.idleGrace, e.seedMaxAge)
-		for _, group := range candidates {
-			if remainingGroups <= e.maxSeedSessions {
-				break
-			}
-			selected[group] = "session-limit"
-			totalComplete -= group.complete
-			remainingGroups--
-		}
-	}
-	if totalComplete > e.cacheLimitBytes {
-		for _, group := range cleanupCandidates(groups, selected, now, e.idleGrace, e.seedMaxAge) {
-			if totalComplete <= e.cacheLimitBytes {
-				break
-			}
-			selected[group] = "cache-limit"
-			totalComplete -= group.complete
-		}
-	}
-
-	type cleanupItem struct {
-		group  *torrentGroup
-		reason string
-		ids    []string
-	}
-	items := make([]cleanupItem, 0, len(selected))
-	for group, reason := range selected {
-		item := cleanupItem{group: group, reason: reason}
-		for _, session := range group.sessions {
-			delete(e.sessions, session.ID)
-			item.ids = append(item.ids, session.ID)
-		}
-		e.removeManagedTorrentLocked(group.torrent)
-		items = append(items, item)
-	}
-	if err := e.persistManagedTorrentsLocked(); err != nil {
-		e.logger.Warn("could not save managed torrent state", "error", err)
-	}
-	handler := e.onCleanup
-	e.mu.Unlock()
-
-	for _, item := range items {
-		paths := e.torrentDataPaths(item.group.torrent)
-		item.group.torrent.Drop()
-		if err := e.removeTorrentData(paths); err != nil {
-			e.logger.Warn("could not fully remove torrent cache", "reason", item.reason, "error", err)
-		}
-		e.logger.Info("retired torrent session",
-			"reason", item.reason,
-			"stored_bytes", item.group.complete,
-			"downloaded_bytes", item.group.downloaded,
-			"uploaded_bytes", item.group.uploaded,
-			"ratio", item.group.ratio,
-		)
-		if handler != nil {
-			for _, id := range item.ids {
-				handler(id, item.reason)
+func (e *Engine) desiredListenPort() int {
+	if e.listenPortFile != "" {
+		if contents, err := os.ReadFile(e.listenPortFile); err == nil {
+			if port, err := strconv.Atoi(strings.TrimSpace(string(contents))); err == nil && port > 0 && port <= 65535 {
+				return port
 			}
 		}
 	}
+	return e.listenPortFixed
 }
 
-func cleanupCandidates(
-	groups []*torrentGroup,
-	selected map[*torrentGroup]string,
-	now time.Time,
-	idleGrace time.Duration,
-	seedMaxAge time.Duration,
-) []*torrentGroup {
-	var candidates []*torrentGroup
-	for _, group := range groups {
-		if _, alreadySelected := selected[group]; alreadySelected || group.active > 0 {
-			continue
-		}
-		if group.started && !group.ratioMet && group.seededFor < seedMaxAge {
-			continue
-		}
-		if now.Sub(group.lastActivity) < idleGrace {
-			continue
-		}
-		candidates = append(candidates, group)
+func (e *Engine) logDelugeHealth(health pluginHealth) {
+	e.logger.Info("connected to Deluge", "deluge", health.Deluge, "libtorrent", health.Libtorrent,
+		"listen_port", health.ListenPort)
+	if health.DHT || health.LSD || health.UTPEX || health.UPnP || health.NATPMP || health.PEXLoaded {
+		e.logger.Warn("Deluge peer discovery that private trackers forbid is enabled",
+			"dht", health.DHT, "lsd", health.LSD, "pex", health.UTPEX, "pex_loaded", health.PEXLoaded,
+			"upnp", health.UPnP, "natpmp", health.NATPMP)
 	}
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].lastActivity.Before(candidates[j].lastActivity)
-	})
-	return candidates
-}
-
-func (e *Engine) torrentDataPaths(t *torrent.Torrent) []string {
-	paths := make([]string, 0, len(t.Files()))
-	for _, file := range t.Files() {
-		paths = append(paths, file.Path())
-	}
-	return paths
-}
-
-func (e *Engine) removeTorrentData(paths []string) error {
-	var firstErr error
-	for _, torrentPath := range paths {
-		relative := filepath.Clean(filepath.FromSlash(torrentPath))
-		if relative == "." || filepath.IsAbs(relative) || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("unsafe torrent path %q", torrentPath)
-			}
-			continue
-		}
-		path := filepath.Join(e.dataDir, relative)
-		for _, candidate := range []string{path, path + ".part"} {
-			if err := os.Remove(candidate); err != nil && !errors.Is(err, os.ErrNotExist) && firstErr == nil {
-				firstErr = err
-			}
-		}
-		removeEmptyParents(filepath.Dir(path), e.dataDir)
-	}
-	return firstErr
-}
-
-func removeEmptyParents(path, stop string) {
-	for path != stop && path != "." && path != string(filepath.Separator) {
-		if err := os.Remove(path); err != nil {
-			return
-		}
-		path = filepath.Dir(path)
-	}
-}
-
-func transferRatio(downloaded, uploaded int64) float64 {
-	if downloaded <= 0 {
-		return 0
-	}
-	return float64(uploaded) / float64(downloaded)
-}
-
-func ratioTargetMet(downloaded int64, ratio, target float64) bool {
-	return target <= 0 || downloaded > 0 && ratio >= target
-}
-
-func (e *Engine) downloadMetainfo(ctx context.Context, torrentURL string) (*metainfo.MetaInfo, error) {
-	var lastErr error
-	for attempt := 1; attempt <= 3; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, torrentURL, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("User-Agent", "filmstream/0.1")
-		response, err := e.httpClient.Do(req)
-		if err == nil {
-			if response.StatusCode >= 200 && response.StatusCode < 300 {
-				meta, parseErr := metainfo.Load(io.LimitReader(response.Body, maxMetainfoBytes))
-				response.Body.Close()
-				if parseErr != nil {
-					return nil, fmt.Errorf("parse torrent file: %w", parseErr)
-				}
-				return meta, nil
-			}
-			lastErr = fmt.Errorf("download torrent file returned %s", response.Status)
-			response.Body.Close()
-			if response.StatusCode < 500 {
-				break
-			}
-		} else {
-			var urlError *url.Error
-			if errors.As(err, &urlError) {
-				lastErr = urlError.Err
-			} else {
-				lastErr = err
-			}
-		}
-		if attempt < 3 {
-			select {
-			case <-ctx.Done():
-				return nil, fmt.Errorf("download torrent file: %w", ctx.Err())
-			case <-time.After(time.Duration(attempt) * time.Second):
-			}
-		}
-	}
-	return nil, fmt.Errorf("download torrent file: %w", lastErr)
-}
-
-func selectVideoFile(files []*torrent.File, fileHint string) (*torrent.File, error) {
-	var videos []*torrent.File
-	for _, file := range files {
-		if videoExtensions[strings.ToLower(filepath.Ext(file.Path()))] {
-			videos = append(videos, file)
-		}
-	}
-	if len(videos) == 0 {
-		return nil, errors.New("torrent contains no supported video files")
-	}
-	if strings.TrimSpace(fileHint) != "" && len(videos) > 1 {
-		matching := matchingVideoFiles(videos, fileHint)
-		if len(matching) == 0 {
-			return nil, fmt.Errorf("torrent contains no video matching %s", fileHint)
-		}
-		videos = matching
-	}
-	sort.SliceStable(videos, func(i, j int) bool {
-		return videos[i].Length() > videos[j].Length()
-	})
-	return videos[0], nil
-}
-
-func matchingVideoFiles(files []*torrent.File, hint string) []*torrent.File {
-	hint = normalizeFileHint(hint)
-	if hint == "" {
-		return nil
-	}
-	var matching []*torrent.File
-	for _, file := range files {
-		name := normalizeFileHint(file.Path())
-		if strings.Contains(name, hint) || matchesAlternateEpisodeCode(name, hint) {
-			matching = append(matching, file)
-		}
-	}
-	return matching
-}
-
-func normalizeFileHint(value string) string {
-	var builder strings.Builder
-	for _, character := range strings.ToLower(value) {
-		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' {
-			builder.WriteRune(character)
-		}
-	}
-	return builder.String()
-}
-
-func matchesAlternateEpisodeCode(name, hint string) bool {
-	if len(hint) < 6 || hint[0] != 's' {
-		return false
-	}
-	episodeIndex := strings.IndexByte(hint, 'e')
-	if episodeIndex < 2 || episodeIndex == len(hint)-1 {
-		return false
-	}
-	seasonRaw := hint[1:episodeIndex]
-	episodeRaw := hint[episodeIndex+1:]
-	season := strings.TrimLeft(seasonRaw, "0")
-	episode := strings.TrimLeft(episodeRaw, "0")
-	if season == "" {
-		season = "0"
-	}
-	if episode == "" {
-		episode = "0"
-	}
-	return strings.Contains(name, season+"x"+episode) ||
-		strings.Contains(name, season+"x"+episodeRaw) ||
-		strings.Contains(name, seasonRaw+"x"+episode) ||
-		strings.Contains(name, seasonRaw+"x"+episodeRaw)
 }
 
 func randomID() (string, error) {

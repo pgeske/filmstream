@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/pgeske/filmstream/internal/catalog"
@@ -238,17 +241,24 @@ func TestTorznabTVSearchIncludesSeasonPacksAndEpisodeFallback(t *testing.T) {
 	}
 }
 
-func TestTorznabSkipsEpisodeSearchWhenSeasonPackIsAvailable(t *testing.T) {
+func TestTorznabEpisodeSearchAlwaysQueriesEpisodeAndUsesSupportedIDs(t *testing.T) {
+	var mu sync.Mutex
 	episodeSearches := 0
+	var tvQuery url.Values
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Query().Get("t") {
 		case "caps":
-			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><tv-search available="yes" supportedParams="q,season,ep"/></searching></caps>`)
+			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><tv-search available="yes" supportedParams="q,season,ep,imdbid,tmdbid"/></searching></caps>`)
 		case "tvsearch":
+			mu.Lock()
+			tvQuery = r.URL.Query()
+			mu.Unlock()
 			fmt.Fprint(w, `<?xml version="1.0"?><rss><channel><item><title>Example.Show.S01.Complete.1080p</title><guid>pack</guid><enclosure url="/pack" length="1000" type="application/x-bittorrent"/></item></channel></rss>`)
 		case "search":
 			if r.URL.Query().Get("q") == "Example Show S01E02" {
+				mu.Lock()
 				episodeSearches++
+				mu.Unlock()
 			}
 			fmt.Fprint(w, `<?xml version="1.0"?><rss><channel></channel></rss>`)
 		default:
@@ -263,13 +273,89 @@ func TestTorznabSkipsEpisodeSearchWhenSeasonPackIsAvailable(t *testing.T) {
 	}
 	candidates, err := configured.Search(t.Context(), catalog.SearchRequest{
 		Query: "Example Show", MediaType: "show", SeasonNumber: 1, EpisodeNumber: 2,
-		PreferSeasonPack: true,
+		PreferSeasonPack: true, IMDBID: "tt0944947", TMDBID: 1399,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(candidates) != 1 || candidates[0].ID != "pack" || episodeSearches != 0 {
-		t.Fatalf("candidates = %+v, episode searches = %d", candidates, episodeSearches)
+	if len(candidates) != 1 || candidates[0].ID != "pack" || episodeSearches != 1 {
+		t.Fatalf("candidates = %+v, episode searches = %d; a season pack must not skip the episode query", candidates, episodeSearches)
+	}
+	if tvQuery.Get("imdbid") != "tt0944947" || tvQuery.Get("tmdbid") != "1399" ||
+		tvQuery.Get("season") != "1" || tvQuery.Has("q") {
+		t.Fatalf("TV search query = %v, want ID search without a title", tvQuery)
+	}
+}
+
+func TestTorznabMovieIDSearchKeepsExactMatchesWithoutTitleFallback(t *testing.T) {
+	var movieQuery url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("t") {
+		case "caps":
+			fmt.Fprint(w, `<?xml version="1.0"?><caps><searching><search available="yes" supportedParams="q"/><movie-search available="yes" supportedParams="q,year,imdbid"/></searching></caps>`)
+		case "movie":
+			movieQuery = r.URL.Query()
+			// Release names use the original title, not the localized query.
+			fmt.Fprint(w, `<?xml version="1.0"?><rss><channel><item><title>Sen.to.Chihiro.2001.1080p.BluRay.x264</title><guid>exact</guid><enclosure url="/exact" length="1000" type="application/x-bittorrent"/></item></channel></rss>`)
+		case "search":
+			t.Error("an exact ID search unexpectedly used a title fallback")
+		default:
+			http.Error(w, "unsupported", http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	configured, err := NewTorznab("test", server.URL, "", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := configured.Search(t.Context(), catalog.SearchRequest{
+		Query: "Spirited Away", Year: 2001, MediaType: "movie", IMDBID: "tt0245429", TMDBID: 129,
+	})
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("candidates = %+v, error = %v", candidates, err)
+	}
+	if movieQuery.Get("imdbid") != "tt0245429" || movieQuery.Has("tmdbid") || movieQuery.Has("q") {
+		t.Fatalf("movie query = %v, want only the supported IMDb ID", movieQuery)
+	}
+}
+
+func TestTorznabCachesFailedCapabilitiesBriefly(t *testing.T) {
+	var capsRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("t") == "caps" {
+			capsRequests.Add(1)
+		}
+		http.Error(w, "indexer down", http.StatusBadGateway)
+	}))
+	defer server.Close()
+	configured, err := NewTorznab("test", server.URL, "", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if _, err := configured.Search(t.Context(), catalog.SearchRequest{Query: "Movie"}); err == nil {
+			t.Fatal("expected the capabilities failure")
+		}
+	}
+	if got := capsRequests.Load(); got != 1 {
+		t.Fatalf("capabilities requests = %d, want the failure cached", got)
+	}
+}
+
+func TestTorznabCandidateNormalizesInfoHashAttribute(t *testing.T) {
+	configured, err := NewTorznab("test", "https://indexer.example/api", "", http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := torznabItem{Title: "Movie.2024.1080p.WEB.H264", GUID: "https://tracker.example/details/1"}
+	item.Enclosure.URL = "/download/1"
+	item.Attributes = append(item.Attributes, struct {
+		Name  string `xml:"name,attr"`
+		Value string `xml:"value,attr"`
+	}{Name: "infohash", Value: "0123456789ABCDEF0123456789ABCDEF01234567"})
+	candidate, ok := configured.candidate(item)
+	if !ok || candidate.InfoHash != "0123456789abcdef0123456789abcdef01234567" {
+		t.Fatalf("candidate = %+v", candidate)
 	}
 }
 

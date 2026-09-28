@@ -2,9 +2,12 @@ package indexer
 
 import (
 	"context"
+	"encoding/base32"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -27,14 +30,33 @@ type Indexer interface {
 }
 
 type Registry struct {
-	mu       sync.RWMutex
-	indexers map[string]Indexer
-	ordered  []Indexer
+	mu          sync.RWMutex
+	indexers    map[string]Indexer
+	ordered     []Indexer
+	private     map[string]bool
+	headPrewarm map[string]bool
+}
+
+// SearchPolicy bounds a search across every configured indexer.
+type SearchPolicy struct {
+	// Protocol keeps only candidates of this protocol; empty keeps every protocol.
+	Protocol string
+	// Acceptable reports whether the candidates gathered so far could be played.
+	// Once it first holds, slower indexers get Settle longer to answer so a slow
+	// private tracker can still beat a fast public one without holding the click
+	// hostage. Nil (or a zero Settle) waits for every indexer.
+	Acceptable func([]catalog.Candidate) bool
+	Settle     time.Duration
+	// Deadline caps the whole search. Indexers that have not answered by then
+	// are abandoned and reported as timed out. Zero means no cap beyond ctx.
+	Deadline time.Duration
 }
 
 func NewRegistry(configs []config.Indexer) (*Registry, error) {
 	client := &http.Client{Timeout: 20 * time.Second}
-	registry := &Registry{indexers: make(map[string]Indexer)}
+	registry := &Registry{
+		indexers: make(map[string]Indexer), private: make(map[string]bool), headPrewarm: make(map[string]bool),
+	}
 	for _, cfg := range configs {
 		var implementation Indexer
 		var err error
@@ -56,6 +78,8 @@ func NewRegistry(configs []config.Indexer) (*Registry, error) {
 		}
 		registry.indexers[cfg.Name] = implementation
 		registry.ordered = append(registry.ordered, implementation)
+		registry.private[cfg.Name] = cfg.Private
+		registry.headPrewarm[cfg.Name] = cfg.Private && cfg.HeadPrewarm
 	}
 	return registry, nil
 }
@@ -68,84 +92,44 @@ func (r *Registry) Replace(configs []config.Indexer) error {
 	r.mu.Lock()
 	r.indexers = replacement.indexers
 	r.ordered = replacement.ordered
+	r.private = replacement.private
+	r.headPrewarm = replacement.headPrewarm
 	r.mu.Unlock()
 	return nil
 }
 
-func (r *Registry) Search(ctx context.Context, request catalog.SearchRequest) ([]catalog.Candidate, error) {
+// Private reports whether the named indexer is configured as a private tracker.
+func (r *Registry) Private(name string) bool {
 	r.mu.RLock()
-	ordered := append([]Indexer(nil), r.ordered...)
-	r.mu.RUnlock()
-	if len(ordered) == 0 {
-		return nil, errors.New("no indexers are configured")
-	}
-
-	type result struct {
-		candidates []catalog.Candidate
-		err        error
-	}
-	results := make(chan result, len(ordered))
-	var group sync.WaitGroup
-	for _, configured := range ordered {
-		group.Add(1)
-		go func(indexer Indexer) {
-			defer group.Done()
-			candidates, err := indexer.Search(ctx, request)
-			for i := range candidates {
-				candidates[i].Indexer = indexer.Name()
-			}
-			results <- result{candidates: candidates, err: err}
-		}(configured)
-	}
-	group.Wait()
-	close(results)
-
-	var candidates []catalog.Candidate
-	var failures []string
-	for result := range results {
-		candidates = append(candidates, result.candidates...)
-		if result.err != nil {
-			failures = append(failures, result.err.Error())
-		}
-	}
-	if len(candidates) == 0 && len(failures) > 0 {
-		return nil, fmt.Errorf("all indexers failed: %s", strings.Join(failures, "; "))
-	}
-	return candidates, nil
+	defer r.mu.RUnlock()
+	return r.private[name]
 }
 
-func (r *Registry) SearchProtocol(
-	ctx context.Context,
-	request catalog.SearchRequest,
-	protocol string,
-) ([]catalog.Candidate, error) {
-	candidates, err := r.Search(ctx, request)
-	if err != nil {
-		return nil, err
-	}
-	matches := make([]catalog.Candidate, 0, len(candidates))
-	for _, candidate := range candidates {
-		if candidate.Protocol == protocol {
-			matches = append(matches, candidate)
-		}
-	}
-	return matches, nil
+// HeadPrewarm reports whether the named private indexer allows prewarming
+// the head and tail of a release before the user presses Play.
+func (r *Registry) HeadPrewarm(name string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.headPrewarm[name]
 }
 
-// SearchProtocolUntil starts every configured search concurrently and returns as
-// soon as the accumulated candidates satisfy the caller. Irrelevant fast results
-// therefore cannot hide a matching result from another indexer, while a strong
-// primary result does not wait for every slower source. If searches fail before
-// enough matches arrive, return partial candidates with the error so the caller
-// can distinguish an empty ranking from an incomplete search.
-func (r *Registry) SearchProtocolUntil(
+// Search queries every configured indexer concurrently and returns when all of
+// them answered, when policy.Settle elapsed after the gathered candidates first
+// became acceptable, or at policy.Deadline, whichever comes first. Candidates
+// carry their indexer name, private-tracker flag, and (for magnets) info hash.
+// If some indexers failed or timed out, the partial candidates are returned
+// with an error so callers can tell an incomplete search from an empty one.
+func (r *Registry) Search(
 	ctx context.Context,
 	request catalog.SearchRequest,
-	protocol string,
-	sufficient func([]catalog.Candidate) bool,
+	policy SearchPolicy,
 ) ([]catalog.Candidate, error) {
 	r.mu.RLock()
 	ordered := append([]Indexer(nil), r.ordered...)
+	private := make(map[string]bool, len(r.private))
+	for name, value := range r.private {
+		private[name] = value
+	}
 	r.mu.RUnlock()
 	if len(ordered) == 0 {
 		return nil, errors.New("no indexers are configured")
@@ -154,6 +138,7 @@ func (r *Registry) SearchProtocolUntil(
 	searchContext, cancel := context.WithCancel(ctx)
 	defer cancel()
 	type result struct {
+		name       string
 		candidates []catalog.Candidate
 		err        error
 	}
@@ -161,31 +146,62 @@ func (r *Registry) SearchProtocolUntil(
 	for _, configured := range ordered {
 		go func(configured Indexer) {
 			candidates, err := configured.Search(searchContext, request)
+			name := configured.Name()
 			matches := make([]catalog.Candidate, 0, len(candidates))
 			for _, candidate := range candidates {
-				candidate.Indexer = configured.Name()
-				if candidate.Protocol == protocol {
-					matches = append(matches, candidate)
+				if policy.Protocol != "" && candidate.Protocol != policy.Protocol {
+					continue
 				}
+				candidate.Indexer = name
+				candidate.Private = private[name]
+				if candidate.InfoHash == "" {
+					candidate.InfoHash = magnetInfoHash(candidate.MagnetURI)
+				}
+				matches = append(matches, candidate)
 			}
-			results <- result{candidates: matches, err: err}
+			results <- result{name: name, candidates: matches, err: err}
 		}(configured)
 	}
 
+	var deadline <-chan time.Time
+	if policy.Deadline > 0 {
+		timer := time.NewTimer(policy.Deadline)
+		defer timer.Stop()
+		deadline = timer.C
+	}
+	var settle <-chan time.Time
+	answered := make(map[string]bool, len(ordered))
 	var candidates []catalog.Candidate
 	var failures []string
 	successes := 0
-	for range ordered {
-		result := <-results
-		if result.err != nil {
-			failures = append(failures, result.err.Error())
-			continue
-		}
-		successes++
-		candidates = append(candidates, result.candidates...)
-		if sufficient != nil && sufficient(candidates) {
-			cancel()
-			return candidates, nil
+collect:
+	for len(answered) < len(ordered) {
+		select {
+		case result := <-results:
+			answered[result.name] = true
+			if result.err != nil {
+				failures = append(failures, result.err.Error())
+				continue
+			}
+			successes++
+			candidates = append(candidates, result.candidates...)
+			if settle == nil && policy.Acceptable != nil && policy.Settle > 0 && policy.Acceptable(candidates) {
+				timer := time.NewTimer(policy.Settle)
+				defer timer.Stop()
+				settle = timer.C
+			}
+		case <-settle:
+			// Enough to play; stop waiting for slower indexers.
+			break collect
+		case <-deadline:
+			for _, configured := range ordered {
+				if !answered[configured.Name()] {
+					failures = append(failures, fmt.Sprintf("%s timed out after %s", configured.Name(), policy.Deadline))
+				}
+			}
+			break collect
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 	if len(failures) > 0 {
@@ -197,59 +213,40 @@ func (r *Registry) SearchProtocolUntil(
 	return candidates, nil
 }
 
-func (r *Registry) SearchFirstProtocol(
-	ctx context.Context,
-	request catalog.SearchRequest,
-	protocol string,
-) ([]catalog.Candidate, error) {
-	r.mu.RLock()
-	ordered := append([]Indexer(nil), r.ordered...)
-	r.mu.RUnlock()
-	if len(ordered) == 0 {
-		return nil, errors.New("no indexers are configured")
+// magnetInfoHash extracts the normalized v1 info hash from a magnet link.
+func magnetInfoHash(magnetURI string) string {
+	if !strings.HasPrefix(magnetURI, "magnet:?") {
+		return ""
 	}
-
-	searchContext, cancel := context.WithCancel(ctx)
-	defer cancel()
-	type result struct {
-		candidates []catalog.Candidate
-		err        error
+	values, err := url.ParseQuery(strings.TrimPrefix(magnetURI, "magnet:?"))
+	if err != nil {
+		return ""
 	}
-	results := make(chan result, len(ordered))
-	for _, configured := range ordered {
-		go func(indexer Indexer) {
-			candidates, err := indexer.Search(searchContext, request)
-			for i := range candidates {
-				candidates[i].Indexer = indexer.Name()
-			}
-			results <- result{candidates: candidates, err: err}
-		}(configured)
-	}
-
-	var failures []string
-	successes := 0
-	for range ordered {
-		result := <-results
-		if result.err != nil {
-			failures = append(failures, result.err.Error())
-			continue
-		}
-		successes++
-		matches := make([]catalog.Candidate, 0, len(result.candidates))
-		for _, candidate := range result.candidates {
-			if candidate.Protocol == protocol {
-				matches = append(matches, candidate)
+	for _, topic := range values["xt"] {
+		if hash, ok := strings.CutPrefix(strings.ToLower(topic), "urn:btih:"); ok {
+			if normalized := normalizeInfoHash(hash); normalized != "" {
+				return normalized
 			}
 		}
-		if len(matches) > 0 {
-			cancel()
-			return matches, nil
+	}
+	return ""
+}
+
+// normalizeInfoHash returns a v1 info hash as 40 lowercase hex digits, accepting
+// the hex or base32 encodings found in magnet links and indexer attributes.
+func normalizeInfoHash(value string) string {
+	value = strings.TrimSpace(value)
+	switch len(value) {
+	case 40:
+		if decoded, err := hex.DecodeString(value); err == nil {
+			return hex.EncodeToString(decoded)
+		}
+	case 32:
+		if decoded, err := base32.StdEncoding.DecodeString(strings.ToUpper(value)); err == nil {
+			return hex.EncodeToString(decoded)
 		}
 	}
-	if successes == 0 && len(failures) > 0 {
-		return nil, fmt.Errorf("all indexers failed: %s", strings.Join(failures, "; "))
-	}
-	return nil, nil
+	return ""
 }
 
 func (r *Registry) Resolve(ctx context.Context, candidate catalog.Candidate) (Source, error) {

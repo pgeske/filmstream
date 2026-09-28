@@ -11,7 +11,7 @@ struct ShowEpisodesView: View {
     @State private var isLoading = false
     @State private var preparingEpisodeID: String?
     @State private var preparation = PlaybackPreparation()
-    private var preparationStage: PlaybackPreparationStage? { preparation.stage }
+    private var showsPreparationPanel: Bool { preparation.isPreparing || preparation.errorMessage != nil }
     @State private var errorMessage: String?
     @FocusState private var focusedSeasonNumber: Int?
     @FocusState private var focusedEpisodeID: String?
@@ -35,6 +35,12 @@ struct ShowEpisodesView: View {
             .padding(.horizontal, 72)
             .padding(.top, 48)
             .padding(.bottom, 54)
+            .disabled(showsPreparationPanel)
+
+            if showsPreparationPanel {
+                PlaybackPreparationPanel(title: preparationTitle, preparation: preparation)
+                    .transition(.opacity)
+            }
         }
         .navigationTitle("Episodes & More")
         .task(id: selectedSeasonNumber) {
@@ -42,6 +48,11 @@ struct ShowEpisodesView: View {
         }
         .onDisappear { preparation.cancel() }
         .onChange(of: selectedSeasonNumber) { _, _ in preparation.cancel() }
+        .onChange(of: showsPreparationPanel) { _, shown in
+            if !shown, let preparingEpisodeID {
+                focusedEpisodeID = preparingEpisodeID
+            }
+        }
         .onAppear {
             focusedSeasonNumber = selectedSeasonNumber
         }
@@ -156,18 +167,10 @@ struct ShowEpisodesView: View {
                 if isLoading {
                     ProgressView()
                         .tint(Color.teaAccent)
-                } else if let preparationStage {
-                    HStack(spacing: 12) {
-                        ProgressView()
-                            .tint(Color.teaAccent)
-                        Text(preparationStageLabel(preparationStage))
-                            .font(.headline.weight(.semibold))
-                            .foregroundStyle(Color.teaAccentLight)
-                    }
                 }
             }
 
-            if let errorMessage = preparation.errorMessage ?? errorMessage {
+            if let errorMessage {
                 Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                     .font(.headline)
                     .foregroundStyle(Color.teaAmber)
@@ -196,13 +199,7 @@ struct ShowEpisodesView: View {
                     .frame(width: 310, height: 174)
                     .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                     .overlay(alignment: .center) {
-                        if preparation.isPreparing && preparingEpisodeID == episode.id {
-                            ZStack {
-                                Color.black.opacity(0.48)
-                                ProgressView()
-                                    .tint(.white)
-                            }
-                        } else if isFocused {
+                        if isFocused {
                             Image(systemName: "play.fill")
                                 .font(.system(size: 27, weight: .bold))
                                 .foregroundStyle(Color.teaCream)
@@ -297,13 +294,11 @@ struct ShowEpisodesView: View {
         }
     }
 
-    private func preparationStageLabel(_ stage: PlaybackPreparationStage) -> String {
-        switch stage {
-        case .findingRelease:
-            "Finding Season Release…"
-        case .bufferingVideo:
-            "Buffering Episode…"
+    private var preparationTitle: String {
+        guard let episode = loadedSeason?.episodes.first(where: { $0.id == preparingEpisodeID }) else {
+            return details.show.title
         }
+        return "\(details.show.title) · \(episode.label)"
     }
 
     private func preparePlayback(for episode: Episode) {
@@ -328,11 +323,7 @@ struct ShowEpisodesView: View {
     private func advancePlayback(to episode: Episode) async throws {
         let movie = episode.playbackMovie(in: details.show)
         async let next = try? await model.api.nextEpisode(after: episode, in: details)
-        let prepared = try await model.preparePlayback(
-            for: movie,
-            startSeconds: 0,
-            onStage: { _ in }
-        )
+        let prepared = try await model.api.preparePlayback(for: movie, startSeconds: 0)
         let nextEpisode = await next
         guard !Task.isCancelled else {
             Task { try? await model.api.stopNativePlayback(prepared.playback.id) }

@@ -1,42 +1,53 @@
 package torrentstream
 
 import (
-	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
+	"strings"
 	"time"
 
-	"github.com/anacrolix/torrent"
-	"github.com/anacrolix/torrent/metainfo"
+	"github.com/pgeske/filmstream/internal/config"
 )
 
-const managedTorrentStateVersion = 1
+const managedTorrentStateVersion = 2
 
+// managedTorrent is Filmstream's durable record of a torrent it added to
+// Deluge. Deluge persists the torrent itself; this keeps what Filmstream needs
+// to honour its seeding obligation across restarts.
 type managedTorrent struct {
-	InfoHash        string    `json:"info_hash"`
-	FileHint        string    `json:"file_hint,omitempty"`
-	Started         bool      `json:"started"`
-	SeededSeconds   float64   `json:"seeded_seconds,omitempty"`
-	DownloadedBytes int64     `json:"downloaded_bytes,omitempty"`
-	UploadedBytes   int64     `json:"uploaded_bytes,omitempty"`
-	LastActivity    time.Time `json:"last_activity"`
-
-	runtimeDownloaded int64
-	runtimeUploaded   int64
-	lastCountedAt     time.Time
+	InfoHash string `json:"info_hash"`
+	Name     string `json:"name,omitempty"`
+	// Indexer is the configured indexer the release came from.
+	Indexer string           `json:"indexer,omitempty"`
+	Private bool             `json:"private,omitempty"`
+	Seed    *config.SeedRule `json:"seed_rule,omitempty"`
+	// Files are the playback file indices selected so far.
+	Files []int `json:"files,omitempty"`
+	// Started is set by the first payload read of any playback.
+	Started bool `json:"started"`
+	// Obligated marks a private torrent that must be completed and seeded
+	// until its rule is met, even if it was never played.
+	Obligated bool `json:"obligated,omitempty"`
+	// WantAll records that every file was requested from Deluge.
+	WantAll      bool      `json:"want_all,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
+	LastActivity time.Time `json:"last_activity"`
 }
 
 type managedTorrentPayload struct {
 	Version  int               `json:"version"`
-	Torrents []*managedTorrent `json:"torrents"`
+	Torrents []json.RawMessage `json:"torrents"`
 }
 
-func (e *Engine) restoreManagedTorrents() error {
+// loadManagedTorrents reads the persisted records. Unreadable entries are
+// logged and kept verbatim so the next save cannot silently drop an obligation.
+func (e *Engine) loadManagedTorrents() error {
 	contents, err := os.ReadFile(e.managedStatePath)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -46,223 +57,128 @@ func (e *Engine) restoreManagedTorrents() error {
 	}
 	var payload managedTorrentPayload
 	if err := json.Unmarshal(contents, &payload); err != nil {
-		return fmt.Errorf("parse managed torrent state: %w", err)
-	}
-	if payload.Version != managedTorrentStateVersion {
-		return fmt.Errorf("unsupported managed torrent state version %d", payload.Version)
-	}
-
-	for _, state := range payload.Torrents {
-		if state == nil {
-			return errors.New("managed torrent state contains a null entry")
+		// Never overwrite a state file we cannot read: set it aside.
+		backup := fmt.Sprintf("%s.corrupt-%d", e.managedStatePath, time.Now().Unix())
+		if renameErr := os.Rename(e.managedStatePath, backup); renameErr != nil {
+			return fmt.Errorf("parse managed torrent state: %w (and could not set it aside: %v)", err, renameErr)
 		}
-		if !validInfoHash(state.InfoHash) {
-			return fmt.Errorf("managed torrent state contains invalid info hash %q", state.InfoHash)
-		}
-		e.lifecycleMu.Lock()
-		err := e.restoreManagedTorrent(state, time.Now().UTC())
-		e.lifecycleMu.Unlock()
-		if err != nil {
-			return err
-		}
+		e.logger.Error("managed torrent state is corrupt; moved aside for manual recovery",
+			"path", backup, "error", err)
+		return nil
 	}
-	return nil
-}
-
-func (e *Engine) restoreManagedTorrent(state *managedTorrent, now time.Time) error {
-	meta, err := metainfo.LoadFromFile(e.managedMetainfoPath(state.InfoHash))
-	if err != nil {
-		return fmt.Errorf("load managed torrent %s: %w", state.InfoHash, err)
-	}
-	t, err := e.client.AddTorrent(meta)
-	if err != nil {
-		return fmt.Errorf("restore managed torrent %s: %w", state.InfoHash, err)
-	}
-	if t.InfoHash().HexString() != state.InfoHash {
-		t.Drop()
-		return fmt.Errorf("managed torrent %s has mismatched metainfo", state.InfoHash)
-	}
-	file, err := selectVideoFile(t.Files(), state.FileHint)
-	if err != nil && state.FileHint != "" {
-		file, err = selectVideoFile(t.Files(), "")
-	}
-	if err != nil {
-		t.Drop()
-		return fmt.Errorf("restore managed torrent %s: %w", state.InfoHash, err)
-	}
-	id, err := randomID()
-	if err != nil {
-		t.Drop()
-		return err
-	}
-	if state.LastActivity.IsZero() {
-		state.LastActivity = now
-	}
-	stats := t.Stats()
-	state.runtimeDownloaded = stats.BytesReadData.Int64()
-	state.runtimeUploaded = stats.BytesWrittenData.Int64()
-	if state.Started {
-		state.lastCountedAt = now
-	}
-
-	e.mu.Lock()
-	e.managed[t] = state
-	for _, session := range e.sessions {
-		if session.torrent == t {
-			session.started = session.started || state.Started
-			e.mu.Unlock()
-			e.logger.Info("restored managed torrent state", "name", t.Name(),
-				"seeded_hours", state.SeededSeconds/3600)
-			return nil
-		}
-	}
-	e.sessions[id] = &Session{
-		ID: id, Name: t.Name(), FileName: file.DisplayPath(), FileSize: file.Length(), CreatedAt: now,
-		torrent: t, file: file, started: state.Started, lastActivity: state.LastActivity,
-	}
-	e.mu.Unlock()
-	e.logger.Info("restored managed torrent for seeding", "name", t.Name(),
-		"seeded_hours", state.SeededSeconds/3600)
-	return nil
-}
-
-func (e *Engine) ensureManagedTorrentLocked(t *torrent.Torrent, fileHint string, now time.Time) error {
-	if state := e.managed[t]; state != nil {
-		if state.FileHint == "" && fileHint != "" {
-			state.FileHint = fileHint
-			if err := e.persistManagedTorrentsLocked(); err != nil {
-				e.logger.Warn("could not update managed torrent file hint", "error", err)
+	now := time.Now().UTC()
+	for index, raw := range payload.Torrents {
+		var record managedTorrent
+		if err := json.Unmarshal(raw, &record); err != nil || !validInfoHash(record.InfoHash) {
+			if err == nil {
+				err = fmt.Errorf("invalid info hash %q", record.InfoHash)
 			}
+			e.logger.Error("could not restore managed torrent entry; keeping it for manual recovery",
+				"index", index, "error", err)
+			e.unreadableRecords = append(e.unreadableRecords, raw)
+			continue
 		}
-		return nil
-	}
-
-	infoHash := t.InfoHash().HexString()
-	var contents bytes.Buffer
-	meta := t.Metainfo()
-	if err := meta.Write(&contents); err != nil {
-		return fmt.Errorf("encode managed torrent metainfo: %w", err)
-	}
-	if err := os.MkdirAll(e.managedDir, 0o700); err != nil {
-		return fmt.Errorf("create managed torrent directory: %w", err)
-	}
-	if err := writeManagedFile(e.managedMetainfoPath(infoHash), contents.Bytes()); err != nil {
-		return fmt.Errorf("save managed torrent metainfo: %w", err)
-	}
-	stats := t.Stats()
-	e.managed[t] = &managedTorrent{
-		InfoHash: infoHash, FileHint: fileHint, LastActivity: now,
-		runtimeDownloaded: stats.BytesReadData.Int64(),
-		runtimeUploaded:   stats.BytesWrittenData.Int64(),
-	}
-	if err := e.persistManagedTorrentsLocked(); err != nil {
-		delete(e.managed, t)
-		_ = os.Remove(e.managedMetainfoPath(infoHash))
-		return err
+		record.InfoHash = strings.ToLower(record.InfoHash)
+		if payload.Version < 2 && record.Started {
+			// Version 1 predates Deluge; its started torrents are completed
+			// so any tracker obligation they carry is honoured.
+			record.WantAll = true
+		}
+		if record.CreatedAt.IsZero() {
+			record.CreatedAt = now
+		}
+		if record.LastActivity.IsZero() {
+			record.LastActivity = now
+		}
+		recordCopy := record
+		e.torrents[record.InfoHash] = &torrentState{hash: record.InfoHash, record: &recordCopy, restored: true}
 	}
 	return nil
 }
 
-func (e *Engine) accountManagedTorrentLocked(t *torrent.Torrent, now time.Time) *managedTorrent {
-	state := e.managed[t]
-	if state == nil {
-		return nil
-	}
-	stats := t.Stats()
-	downloaded := stats.BytesReadData.Int64()
-	uploaded := stats.BytesWrittenData.Int64()
-	if downloaded >= state.runtimeDownloaded {
-		state.DownloadedBytes += downloaded - state.runtimeDownloaded
-	}
-	if uploaded >= state.runtimeUploaded {
-		state.UploadedBytes += uploaded - state.runtimeUploaded
-	}
-	state.runtimeDownloaded = downloaded
-	state.runtimeUploaded = uploaded
-	if state.Started {
-		if !state.lastCountedAt.IsZero() && now.After(state.lastCountedAt) {
-			state.SeededSeconds += now.Sub(state.lastCountedAt).Seconds()
+// persistLocked writes every managed torrent record. Callers hold e.mu.
+func (e *Engine) persistLocked() {
+	records := make([]*managedTorrent, 0, len(e.torrents))
+	for _, t := range e.torrents {
+		if t.record != nil {
+			records = append(records, t.record)
 		}
-		state.lastCountedAt = now
 	}
-	return state
-}
-
-func (e *Engine) managedTransferTotalsLocked(t *torrent.Torrent, now time.Time) (downloaded, uploaded int64, seededFor time.Duration) {
-	state := e.managed[t]
-	if state == nil {
-		stats := t.Stats()
-		return stats.BytesReadData.Int64(), stats.BytesWrittenData.Int64(), 0
+	sort.Slice(records, func(i, j int) bool { return records[i].InfoHash < records[j].InfoHash })
+	entries := make([]json.RawMessage, 0, len(records)+len(e.unreadableRecords))
+	for _, record := range records {
+		encoded, err := json.Marshal(record)
+		if err != nil {
+			e.logger.Error("could not encode managed torrent state", "info_hash", record.InfoHash, "error", err)
+			continue
+		}
+		entries = append(entries, encoded)
 	}
-	stats := t.Stats()
-	downloaded = state.DownloadedBytes + max(0, stats.BytesReadData.Int64()-state.runtimeDownloaded)
-	uploaded = state.UploadedBytes + max(0, stats.BytesWrittenData.Int64()-state.runtimeUploaded)
-	seconds := state.SeededSeconds
-	if state.Started && !state.lastCountedAt.IsZero() && now.After(state.lastCountedAt) {
-		seconds += now.Sub(state.lastCountedAt).Seconds()
-	}
-	return downloaded, uploaded, time.Duration(seconds * float64(time.Second))
-}
-
-func (e *Engine) markManagedTorrentStartedLocked(t *torrent.Torrent, now time.Time) {
-	state := e.managed[t]
-	if state == nil {
-		return
-	}
-	if !state.Started {
-		state.Started = true
-		state.lastCountedAt = now
-	}
-	state.LastActivity = now
-}
-
-func (e *Engine) updateManagedTorrentActivityLocked(t *torrent.Torrent, now time.Time) {
-	if state := e.managed[t]; state != nil {
-		state.LastActivity = now
-	}
-}
-
-func (e *Engine) removeManagedTorrentLocked(t *torrent.Torrent) {
-	state := e.managed[t]
-	if state == nil {
-		return
-	}
-	delete(e.managed, t)
-	if err := os.Remove(e.managedMetainfoPath(state.InfoHash)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		e.logger.Warn("could not remove managed torrent metainfo", "error", err)
-	}
-}
-
-func (e *Engine) persistManagedTorrentsLocked() error {
-	states := make([]*managedTorrent, 0, len(e.managed))
-	for _, state := range e.managed {
-		copy := *state
-		copy.runtimeDownloaded = 0
-		copy.runtimeUploaded = 0
-		copy.lastCountedAt = time.Time{}
-		states = append(states, &copy)
-	}
-	sort.Slice(states, func(i, j int) bool { return states[i].InfoHash < states[j].InfoHash })
-	if len(states) == 0 {
+	entries = append(entries, e.unreadableRecords...)
+	if len(entries) == 0 {
 		if err := os.Remove(e.managedStatePath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove managed torrent state: %w", err)
+			e.logger.Warn("could not remove managed torrent state", "error", err)
 		}
-		return nil
+		return
 	}
-	payload := managedTorrentPayload{Version: managedTorrentStateVersion, Torrents: states}
-	contents, err := json.MarshalIndent(payload, "", "  ")
+	contents, err := json.MarshalIndent(managedTorrentPayload{Version: managedTorrentStateVersion, Torrents: entries}, "", "  ")
 	if err != nil {
-		return err
+		e.logger.Error("could not encode managed torrent state", "error", err)
+		return
 	}
-	contents = append(contents, '\n')
-	if err := writeManagedFile(e.managedStatePath, contents); err != nil {
-		return fmt.Errorf("save managed torrent state: %w", err)
+	if err := writeManagedFile(e.managedStatePath, append(contents, '\n')); err != nil {
+		e.logger.Warn("could not save managed torrent state", "error", err)
 	}
-	return nil
 }
 
 func (e *Engine) managedMetainfoPath(infoHash string) string {
 	return filepath.Join(e.managedDir, infoHash+".torrent")
+}
+
+// saveMetainfo keeps a copy of the .torrent so an obligation survives even if
+// Deluge loses its own state.
+func (e *Engine) saveMetainfo(infoHash string, contents []byte) {
+	if len(contents) == 0 {
+		return
+	}
+	path := e.managedMetainfoPath(infoHash)
+	if _, err := os.Stat(path); err == nil {
+		return
+	}
+	if err := writeManagedFile(path, contents); err != nil {
+		e.logger.Warn("could not save torrent metainfo", "info_hash", infoHash, "error", err)
+	}
+}
+
+func (e *Engine) removeMetainfo(infoHash string) {
+	if err := os.Remove(e.managedMetainfoPath(infoHash)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		e.logger.Warn("could not remove torrent metainfo", "info_hash", infoHash, "error", err)
+	}
+}
+
+func (r *managedTorrent) addFile(index int) bool {
+	if slices.Contains(r.Files, index) {
+		return false
+	}
+	r.Files = append(r.Files, index)
+	slices.Sort(r.Files)
+	return true
+}
+
+// wanted is the file selection Deluge should download in the background.
+// A private torrent nobody has played yet wants no files: only the stream
+// windows (file head and tail) download, so browsing, prewarming or losing a
+// candidate race never snatches it. Its first played byte switches it to
+// every file (see markServing).
+func (r *managedTorrent) wanted() any {
+	switch {
+	case r.WantAll:
+		return wantedFiles(true, nil)
+	case r.Private && !r.Started && !r.Obligated:
+		return wantedFiles(false, nil)
+	default:
+		return wantedFiles(false, r.Files)
+	}
 }
 
 func validInfoHash(value string) bool {

@@ -16,6 +16,7 @@ import (
 	"github.com/pgeske/filmstream/internal/history"
 	"github.com/pgeske/filmstream/internal/hls"
 	"github.com/pgeske/filmstream/internal/metadata"
+	"github.com/pgeske/filmstream/internal/torrentstream"
 )
 
 const (
@@ -23,7 +24,14 @@ const (
 	prewarmBufferSeconds = 30
 	prewarmMaxAge        = 20 * time.Minute
 	prewarmHintTTL       = 30 * time.Minute
+	// prewarmClaimWait bounds how long a click waits for an in-flight prewarm
+	// to select its release before selecting one itself.
+	prewarmClaimWait = 10 * time.Second
 )
+
+// errPrewarmSkipped marks a prewarm that playback creation declined on
+// purpose, such as a release that would create a new private-tracker obligation.
+var errPrewarmSkipped = errors.New("prewarm skipped")
 
 type playbackPrewarmTarget struct {
 	request           CreatePlaybackRequest
@@ -84,17 +92,25 @@ func (s *Server) prewarmPlayback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	request.Preferences = mergePreferences(s.defaults, request.Preferences)
-	if request.MediaType == string(metadata.MediaTypeShow) ||
-		s.playbackSourceMode == config.PlaybackSourceTorrentOnly {
-		// Browsing torrent-backed media warms only the indexer search. A torrent is
-		// mounted after explicit Play; active playback separately buffers its next episode.
+	if request.MediaType == string(metadata.MediaTypeShow) {
+		// A show page names no episode yet: warm only the indexer search. Active
+		// playback separately buffers its next episode.
 		s.queueReleaseSearch(request)
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "finding_releases"})
 		return
 	}
-	s.queuePlaybackPrewarm(playbackPrewarmTarget{
-		request: request, source: "hint", priority: true,
-	})
+	target := playbackPrewarmTarget{request: request, source: "hint", priority: true}
+	if s.playbackSourceMode == config.PlaybackSourceTorrentOnly {
+		// A torrent movie page warms the search (which an explicit Play joins)
+		// and mounts the best release from it. A new private release is mounted
+		// only where head prewarm is allowed, and then downloads just its file
+		// head and tail until Play (see prewarmableTorrentCandidates).
+		s.queueReleaseSearch(request)
+		s.queuePlaybackPrewarm(target)
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "finding_releases"})
+		return
+	}
+	s.queuePlaybackPrewarm(target)
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "prewarming"})
 }
 
@@ -112,10 +128,25 @@ func (s *Server) claimPrewarmedPlayback(ctx context.Context, request CreatePlayb
 	ready := state.playbackReady
 	s.prewarmMu.Unlock()
 
+	wait := time.NewTimer(prewarmClaimWait)
+	defer wait.Stop()
 	select {
 	case <-ctx.Done():
 		return CreatePlaybackResponse{}, false
 	case <-ready:
+	case <-wait.C:
+		// The prewarm is still selecting a release. Cancel it so its candidate
+		// sessions are dropped instead of competing with the click's own
+		// selection, which reuses its search and quarantine results.
+		s.prewarmMu.Lock()
+		if s.prewarmStates[key] == state && !state.claimed {
+			delete(s.prewarmStates, key)
+			state.cancel()
+		}
+		s.prewarmMu.Unlock()
+		s.logger.Info("prewarm still selecting a release; playback request takes over",
+			"media_id", request.MediaID, "waited", prewarmClaimWait)
+		return CreatePlaybackResponse{}, false
 	}
 
 	s.prewarmMu.Lock()
@@ -250,6 +281,14 @@ func (s *Server) runPlaybackPrewarm(ctx context.Context, key string, state *play
 		}
 		return
 	}
+	if status := s.prewarmTorrentStatus(response.ID); status.Private && !status.Snatched {
+		// Packaging would read payload and snatch the release; the engine is
+		// already fetching its file head and tail, which is all Play needs.
+		// Unclaimed, the playback is stopped and the untouched torrent dropped.
+		s.logger.Info("prewarmed private release head only", "id", response.ID, "name", status.Name)
+		time.AfterFunc(prewarmHintTTL, func() { s.expireUnusedPrewarm(key, state) })
+		return
+	}
 	bitmapSubtitleIndex := s.bitmapSubtitleIndexForPrewarm(
 		ctx, response.ID, state.target.subtitleSelection,
 	)
@@ -324,6 +363,16 @@ func (s *Server) runPlaybackPrewarm(ctx context.Context, key string, state *play
 	}
 }
 
+// prewarmTorrentStatus is the torrent status of a prewarmed playback, zero
+// for Usenet playbacks and servers without a torrent engine.
+func (s *Server) prewarmTorrentStatus(id string) torrentstream.Status {
+	if s.engine == nil {
+		return torrentstream.Status{}
+	}
+	status, _ := s.engine.Status(id)
+	return status
+}
+
 func (s *Server) expireUnusedPrewarm(key string, state *playbackPrewarmState) {
 	s.prewarmMu.Lock()
 	if s.prewarmStates[key] != state || state.claimed {
@@ -368,7 +417,10 @@ func (s *Server) finishPlaybackPrewarm(
 		state.cancel()
 	}
 	s.prewarmMu.Unlock()
-	if err != nil && !errors.Is(err, context.Canceled) {
+	switch {
+	case errors.Is(err, errPrewarmSkipped):
+		s.logger.Info("prewarm playback skipped", "media_id", state.target.request.MediaID, "reason", err)
+	case err != nil && !errors.Is(err, context.Canceled):
 		s.logger.Warn("prewarm playback", "media_id", state.target.request.MediaID, "error", err)
 	}
 	return err == nil
@@ -560,6 +612,9 @@ func (s *Server) prewarmJSON(
 			Error string `json:"error"`
 		}
 		_ = json.Unmarshal(contents, &payload)
+		if internal && response.StatusCode == http.StatusConflict {
+			return fmt.Errorf("%w: %s", errPrewarmSkipped, payload.Error)
+		}
 		if payload.Error != "" {
 			return errors.New(payload.Error)
 		}

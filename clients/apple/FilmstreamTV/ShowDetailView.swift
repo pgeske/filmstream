@@ -13,6 +13,7 @@ struct ShowDetailView: View {
     @State private var preparation = PlaybackPreparation()
     private var isPreparing: Bool { preparation.isPreparing }
     private var preparationStage: PlaybackPreparationStage? { preparation.stage }
+    private var showsPreparationPanel: Bool { isPreparing || preparation.errorMessage != nil }
     @State private var isRemoving = false
     @State private var errorMessage: String?
     @FocusState private var focusedAction: ShowDetailAction?
@@ -82,7 +83,7 @@ struct ShowDetailView: View {
                         .frame(maxWidth: 800, alignment: .leading)
                 }
 
-                if let errorMessage = preparation.errorMessage ?? errorMessage {
+                if let errorMessage {
                     Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(Color.teaAmber)
                         .font(.headline)
@@ -90,10 +91,16 @@ struct ShowDetailView: View {
                 }
 
                 actionButtons
+                    .disabled(showsPreparationPanel)
             }
             .padding(.leading, 82)
             .padding(.trailing, 60)
             .padding(.vertical, 54)
+
+            if showsPreparationPanel {
+                PlaybackPreparationPanel(title: preparationTitle, preparation: preparation)
+                    .transition(.opacity)
+            }
         }
         .background(Color.teaBackground)
         .task(id: show.id) {
@@ -101,6 +108,11 @@ struct ShowDetailView: View {
             await loadShow()
         }
         .onDisappear { preparation.cancel() }
+        .onChange(of: showsPreparationPanel) { _, shown in
+            if !shown {
+                focusedAction = .play
+            }
+        }
         .navigationDestination(isPresented: $showsEpisodes) {
             if let details {
                 ShowEpisodesView(details: details)
@@ -225,6 +237,12 @@ struct ShowDetailView: View {
         .padding(.top, 4)
     }
 
+    private var preparationTitle: String {
+        let title = (details?.show ?? show).title
+        guard let episode = playbackSelection?.episode else { return title }
+        return "\(title) · \(episode.label)"
+    }
+
     private var primaryButtonTitle: String {
         switch preparationStage {
         case .findingRelease:
@@ -315,11 +333,7 @@ struct ShowDetailView: View {
         guard let details else { return }
         let movie = episode.playbackMovie(in: details.show)
         async let next = try? await model.api.nextEpisode(after: episode, in: details)
-        let prepared = try await model.preparePlayback(
-            for: movie,
-            startSeconds: 0,
-            onStage: { _ in }
-        )
+        let prepared = try await model.api.preparePlayback(for: movie, startSeconds: 0)
         let nextEpisode = await next
         guard !Task.isCancelled else {
             Task { try? await model.api.stopNativePlayback(prepared.playback.id) }

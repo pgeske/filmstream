@@ -179,6 +179,128 @@ private struct TeaDetailActionButtonBody: View {
     }
 }
 
+/// Covers a detail screen while a title is prepared: live server status, Cancel, and
+/// after a failure the reason with Try Again.
+struct PlaybackPreparationPanel: View {
+    let title: String
+    let preparation: PlaybackPreparation
+
+    @FocusState private var focusedButton: PanelButton?
+
+    private enum PanelButton: Hashable {
+        case retry
+        case cancel
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.8)
+                .ignoresSafeArea()
+
+            VStack(spacing: 30) {
+                Text(title)
+                    .font(.title2.weight(.bold))
+                    .foregroundStyle(Color.teaCream)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+
+                if let errorMessage = preparation.errorMessage {
+                    failure(errorMessage)
+                } else {
+                    status
+                }
+
+                HStack(spacing: 32) {
+                    if preparation.canRetry {
+                        Button {
+                            preparation.retry()
+                        } label: {
+                            Label("Try Again", systemImage: "arrow.clockwise")
+                                .font(.headline.weight(.bold))
+                        }
+                        .buttonStyle(TeaActionButtonStyle(prominent: true))
+                        .focusEffectDisabled()
+                        .focused($focusedButton, equals: .retry)
+                    }
+
+                    Button {
+                        preparation.cancel()
+                    } label: {
+                        Label(preparation.errorMessage == nil ? "Cancel" : "Close", systemImage: "xmark")
+                            .font(.headline.weight(.bold))
+                    }
+                    .buttonStyle(TeaActionButtonStyle())
+                    .focusEffectDisabled()
+                    .focused($focusedButton, equals: .cancel)
+                }
+                .padding(.top, 10)
+            }
+            .padding(64)
+            .frame(maxWidth: 1_300)
+            .background(
+                Color.teaPanel.opacity(0.97),
+                in: RoundedRectangle(cornerRadius: 34, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 34, style: .continuous)
+                    .stroke(Color.teaAccent.opacity(0.25), lineWidth: 1.5)
+            }
+        }
+        .onExitCommand {
+            preparation.cancel()
+        }
+        .onAppear {
+            focusedButton = preparation.canRetry ? .retry : .cancel
+        }
+        .onChange(of: preparation.canRetry) { _, canRetry in
+            focusedButton = canRetry ? .retry : .cancel
+        }
+    }
+
+    @ViewBuilder
+    private var status: some View {
+        let progress = preparation.progress
+        Text(progress?.headline ?? "Preparing…")
+            .font(.title3.weight(.semibold))
+            .foregroundStyle(Color.teaCream)
+            .multilineTextAlignment(.center)
+
+        if let fraction = progress?.fraction {
+            ProgressView(value: fraction)
+                .tint(Color.teaAccent)
+                .frame(width: 760)
+        } else {
+            ProgressView()
+                .tint(Color.teaAccent)
+        }
+
+        if let detail = progress?.detail {
+            Text(detail)
+                .font(.headline)
+                .foregroundStyle(Color.teaCream)
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+        }
+    }
+
+    @ViewBuilder
+    private func failure(_ message: String) -> some View {
+        Image(systemName: "exclamationmark.triangle.fill")
+            .font(.system(size: 64))
+            .foregroundStyle(Color.teaAmber)
+
+        Text("Couldn't Start Playback")
+            .font(.title3.weight(.bold))
+            .foregroundStyle(Color.teaCream)
+
+        Text(message)
+            .font(.body)
+            .foregroundStyle(Color.teaCream)
+            .multilineTextAlignment(.center)
+            .lineLimit(5)
+    }
+}
+
 struct MovieRatingBadges: View {
     let ratings: MovieRatings?
 

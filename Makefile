@@ -26,6 +26,7 @@ fmt:
 
 test:
 	go test ./...
+	python3 deluge/teastream/test_common.py
 
 apple-project:
 	cd $(APPLE_DIR) && xcodegen generate

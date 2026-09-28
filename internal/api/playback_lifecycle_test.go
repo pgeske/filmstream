@@ -116,8 +116,8 @@ func (*failedProducerManager) Status(string) (hls.Status, bool) {
 	return hls.Status{State: "failed", PackagedSegments: 8, PackagedSeconds: 32, Error: "HLS producer stopped"}, true
 }
 
-func (*failedProducerManager) AssetPath(string, string) (string, error) {
-	return "", hls.ErrProducerStopped
+func (*failedProducerManager) Asset(string, string) (hls.Asset, error) {
+	return hls.Asset{}, hls.ErrProducerStopped
 }
 
 func TestPlaybackStatusDistinguishesProducerFailureFromActiveSourceReader(t *testing.T) {

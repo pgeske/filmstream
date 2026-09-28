@@ -297,44 +297,105 @@ public struct FilmstreamAPI: Sendable {
         )
     }
 
+    /// Creates a playback and buffers its opening. `onStage` reports progress so the
+    /// caller can poll `playbackStatus` once the playback exists.
+    public func preparePlayback(
+        for movie: Movie,
+        startSeconds: Double,
+        onStage: @escaping @MainActor @Sendable (PlaybackPreparationStage) -> Void = { _ in }
+    ) async throws -> PreparedPlayback {
+        await onStage(.findingRelease)
+        let playback = try await createPlayback(for: movie, startSeconds: startSeconds)
+        do {
+            try Task.checkCancellation()
+            await onStage(.bufferingVideo(playbackID: playback.id))
+            let prepared = try await startNativePlayback(playback, for: movie, startSeconds: startSeconds)
+            if prepared.playback.id != playback.id {
+                Task { try? await stopNativePlayback(playback.id) }
+            }
+            return prepared
+        } catch {
+            // This request owns the session it created or claimed, not the
+            // in-place session of a newer seek or recovery.
+            Task { try? await stopNativePlayback(playback.id) }
+            throw error
+        }
+    }
+
+    /// First preparation of a playback. The subtitle track list is only known from
+    /// the first response, so a saved bitmap subtitle choice costs a second request;
+    /// if that re-encode cannot start, playback continues without burned-in subtitles.
+    private func startNativePlayback(
+        _ playback: Playback,
+        for movie: Movie,
+        startSeconds: Double
+    ) async throws -> PreparedPlayback {
+        let prepared = try await prepareNativePlaybackWithRetry(
+            playback,
+            for: movie,
+            startSeconds: startSeconds,
+            audioStreamIndex: nil,
+            bitmapSubtitleIndex: nil
+        )
+        guard let saved = HLSSubtitleTrack.savedPreference(in: prepared.hls.subtitles ?? []),
+              saved.isBitmap,
+              prepared.hls.burnedSubtitleIndex != saved.index else {
+            return prepared
+        }
+        do {
+            return try await prepareNativePlayback(
+                prepared.playback,
+                startSeconds: startSeconds,
+                audioStreamIndex: prepared.hls.audioStreamIndex,
+                bitmapSubtitleIndex: saved.index
+            )
+        } catch {
+            try Task.checkCancellation()
+            return try await prepareNativePlayback(
+                prepared.playback,
+                startSeconds: startSeconds,
+                audioStreamIndex: prepared.hls.audioStreamIndex,
+                bitmapSubtitleIndex: nil
+            )
+        }
+    }
+
+    /// Starts or re-prepares HLS packaging. Callers always state the audio stream and
+    /// burned-in subtitle they need; `nil` lets the server choose its defaults, which
+    /// would silently replace a viewer's explicit choice on a seek or recovery.
     public func prepareNativePlayback(
         _ playback: Playback,
         startSeconds: Double,
-        bitmapSubtitleIndex: Int? = nil,
-        audioStreamIndex: Int? = nil,
-        useSavedSubtitlePreference: Bool = true
+        audioStreamIndex: Int?,
+        bitmapSubtitleIndex: Int?
     ) async throws -> PreparedPlayback {
-        var selectedBitmapIndex = bitmapSubtitleIndex
-        if useSavedSubtitlePreference {
-            let tracks = try await subtitleTracks(playbackID: playback.id)
-            let savedSubtitle = HLSSubtitleTrack.savedPreference(in: tracks)
-            selectedBitmapIndex = savedSubtitle?.isBitmap == true ? savedSubtitle?.index : nil
-        }
         let hls: HLSPlayback = try await send(
             path: "v1/playbacks/\(playback.id)/hls",
             method: "POST",
             body: HLSRequest(
                 startSeconds: max(0, startSeconds),
-                bitmapSubtitleIndex: selectedBitmapIndex,
+                bitmapSubtitleIndex: bitmapSubtitleIndex,
                 audioStreamIndex: audioStreamIndex
             )
         )
         return PreparedPlayback(playback: playback, hls: hls)
     }
 
+    /// Like `prepareNativePlayback`, but replaces a playback the server lost (404) or
+    /// whose source failed (502) with a newly created one, at most once.
     public func prepareNativePlaybackWithRetry(
         _ playback: Playback,
         for movie: Movie,
         startSeconds: Double,
-        bitmapSubtitleIndex: Int? = nil,
-        useSavedSubtitlePreference: Bool = true
+        audioStreamIndex: Int?,
+        bitmapSubtitleIndex: Int?
     ) async throws -> PreparedPlayback {
         do {
             return try await prepareNativePlayback(
                 playback,
                 startSeconds: startSeconds,
-                bitmapSubtitleIndex: bitmapSubtitleIndex,
-                useSavedSubtitlePreference: useSavedSubtitlePreference
+                audioStreamIndex: audioStreamIndex,
+                bitmapSubtitleIndex: bitmapSubtitleIndex
             )
         } catch let error as FilmstreamError {
             try Task.checkCancellation()
@@ -343,24 +404,32 @@ public struct FilmstreamAPI: Sendable {
                 throw error
             }
             let replacement = try await createPlayback(for: movie, startSeconds: startSeconds)
+            // Stream indexes only identify the same tracks within the same file.
+            let sameFile = replacement.fileName == playback.fileName
+                && replacement.fileSize == playback.fileSize
             do {
                 return try await prepareNativePlayback(
                     replacement,
                     startSeconds: startSeconds,
-                    bitmapSubtitleIndex: bitmapSubtitleIndex,
-                    useSavedSubtitlePreference: useSavedSubtitlePreference
+                    audioStreamIndex: sameFile ? audioStreamIndex : nil,
+                    bitmapSubtitleIndex: sameFile ? bitmapSubtitleIndex : nil
                 )
             } catch {
-                // Only the replacement belongs to this attempt. Never delete the
+                // Only a new replacement belongs to this attempt. Never delete the
                 // original ID here: a newer seek may already be using it.
-                Task { try? await stopNativePlayback(replacement.id) }
+                if replacement.id != playback.id {
+                    Task { try? await stopNativePlayback(replacement.id) }
+                }
                 throw error
             }
         }
     }
 
-    public func subtitleTracks(playbackID: String) async throws -> [HLSSubtitleTrack] {
-        try await send(path: "v1/playbacks/\(playbackID)/hls/subtitles")
+    /// Server-side progress of a playback: torrent transfer and HLS packaging.
+    public func playbackStatus(_ playbackID: String) async throws -> PlaybackStatus {
+        var request = URLRequest(url: baseURL.appendingPathComponent("v1/playbacks/\(playbackID)"))
+        request.timeoutInterval = 10
+        return try await send(request)
     }
 
     public func stopNativePlayback(_ playbackID: String) async throws {
@@ -377,7 +446,7 @@ public struct FilmstreamAPI: Sendable {
             )
         )
         request.httpMethod = "POST"
-        request.timeoutInterval = 15
+        request.timeoutInterval = Self.playbackRequestTimeout
         let _: HealthResponse = try await send(request)
     }
 
@@ -475,6 +544,10 @@ public struct FilmstreamAPI: Sendable {
         return urlError.code == .timedOut || urlError.code == .networkConnectionLost
     }
 
+    // Creating a playback and buffering its opening can wait on indexers, torrent
+    // metadata, and a cold swarm; the viewer can cancel explicitly instead.
+    private static let playbackRequestTimeout: TimeInterval = 300
+
     private func send<Request: Encodable, Response: Decodable>(
         path: String,
         method: String,
@@ -482,7 +555,7 @@ public struct FilmstreamAPI: Sendable {
     ) async throws -> Response {
         var request = URLRequest(url: baseURL.appendingPathComponent(path))
         request.httpMethod = method
-        request.timeoutInterval = 240
+        request.timeoutInterval = Self.playbackRequestTimeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try encoder.encode(body)
         return try await send(request)
