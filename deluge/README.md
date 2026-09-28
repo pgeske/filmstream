@@ -40,11 +40,14 @@ only loads eggs tagged with its own Python version, for example
    - `TEASTREAM_BACKGROUND_DOWNLOAD_KIB`: per-torrent download cap in KiB/s
      for torrents no stream is reading (finishing a snatch, seeding); a
      torrent with a live stream window is uncapped (default unlimited).
+   - `TEASTREAM_BACKGROUND_DOWNLOAD_WHILE_STREAMING_KIB`: the same cap while
+     any stream is playing, so background torrents yield to playback
+     (default unlimited).
 
    The same keys (`token_file`, `save_root`, `bind`, `port`,
-   `max_download_kib`, `max_upload_kib`, `background_download_kib`) can
-   instead be set in `teastream.conf` in Deluge's config directory; the
-   environment wins.
+   `max_download_kib`, `max_upload_kib`, `background_download_kib`,
+   `background_download_while_streaming_kib`) can instead be set in
+   `teastream.conf` in Deluge's config directory; the environment wins.
 4. Enable the plugin once: stop deluged, set `"enabled_plugins": ["TeaStream"]`
    in `core.conf`, and start it again (or tick TeaStream under Preferences →
    Plugins in the Web UI). Deluge remembers enabled plugins across restarts.

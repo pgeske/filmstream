@@ -18,9 +18,10 @@ Configuration (``teastream.conf`` in Deluge's config dir; environment wins):
 ``bind`` / TEASTREAM_BIND (default 127.0.0.1), ``port`` / TEASTREAM_PORT
 (default 8113), ``token_file`` / TEASTREAM_TOKEN_FILE, ``save_root`` /
 TEASTREAM_SAVE_ROOT (default /downloads), and KiB/s bandwidth caps
-``max_download_kib`` / ``max_upload_kib`` / ``background_download_kib``
-(TEASTREAM_MAX_DOWNLOAD_KIB etc.; default unlimited; the background cap applies
-to each torrent no stream window is reading).
+``max_download_kib`` / ``max_upload_kib`` / ``background_download_kib`` /
+``background_download_while_streaming_kib`` (TEASTREAM_MAX_DOWNLOAD_KIB etc.;
+default unlimited; the background caps apply to each torrent no stream window is
+reading, the tighter one while any stream is playing).
 
 Authentication: every endpoint except ``GET /v1/health`` needs
 ``Authorization: Bearer <token>``, the stripped contents of the token file. With
@@ -232,6 +233,9 @@ class Core(CorePluginBase):
         self.core.set_config(dict(PRIVACY_SETTINGS))
         self.core.apply_session_settings(dict(STREAMING_SESSION_SETTINGS))
         self.background_download_kib = self._kib_setting('background_download_kib')
+        self.background_download_while_streaming_kib = self._kib_setting(
+            'background_download_while_streaming_kib'
+        )
         self.core.set_config({
             'max_download_speed': float(self._kib_setting('max_download_kib')),
             'max_upload_speed': float(self._kib_setting('max_upload_kib')),
@@ -297,10 +301,14 @@ class Core(CorePluginBase):
 
     def _apply_background_limits(self):
         """Keeps full bandwidth for torrents a player is reading and holds the
-        rest (snatch completion, seeding) to background_download_kib."""
+        rest (snatch completion, seeding) to background_download_kib, tighter
+        while anything is playing."""
+        streaming = {info_hash for info_hash, s in self.streams.items() if s.windows}
+        background = (
+            self.background_download_while_streaming_kib if streaming else self.background_download_kib
+        )
         for info_hash, torrent in list(self.torrents.torrents.items()):
-            streams = self.streams.get(info_hash)
-            limit = -1.0 if streams and streams.windows else self.background_download_kib
+            limit = -1.0 if info_hash in streaming else background
             if torrent.options['max_download_speed'] != limit:
                 torrent.set_max_download_speed(limit)
 
