@@ -1,0 +1,327 @@
+# Production Filmstream pod (k3s, namespace alyosha): gluetun (ProtonVPN with
+# port forwarding), filmstream, and the Deluge sidecar with the TeaStream
+# plugin, all sharing gluetun's network namespace.
+#
+# Referenced, not stored here:
+#   Secrets filmstream-config (config.json + key files), filmstream-vpn,
+#           filmstream-teastream-token (plugin bearer token)
+#   PVCs    filmstream-state, filmstream-torrent-data
+#   Host    /home/alyosha/containers/filmstream/{bin,tools,deluge-config},
+#           /mnt/alyosha-12TB/media/downloads/teastream (shared /downloads)
+# Build the backend into bin/filmstream and the plugin egg into
+# deluge-config/plugins (deluge/build-egg.sh), then roll the deployment.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations: {}
+  labels:
+    app.kubernetes.io/name: filmstream
+  name: filmstream
+  namespace: alyosha
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: filmstream
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      creationTimestamp: null
+      labels:
+        app.kubernetes.io/name: filmstream
+    spec:
+      automountServiceAccountToken: false
+      containers:
+      - env:
+        - name: VPN_SERVICE_PROVIDER
+          value: protonvpn
+        - name: VPN_TYPE
+          value: openvpn
+        - name: VPN_PORT_FORWARDING
+          value: 'on'
+        - name: VPN_PORT_FORWARDING_STATUS_FILE
+          value: /tmp/gluetun/forwarded_port
+        - name: VPN_PORT_FORWARDING_UP_COMMAND
+          value: /bin/sh -c 'printf "%s\n" "{{PORT}}" > /tmp/gluetun/filmstream-port.tmp && mv /tmp/gluetun/filmstream-port.tmp
+            /tmp/gluetun/filmstream-port'
+        - name: VPN_PORT_FORWARDING_DOWN_COMMAND
+          value: /bin/sh -c 'rm -f /tmp/gluetun/filmstream-port /tmp/gluetun/filmstream-port.tmp'
+        - name: SERVER_COUNTRIES
+          value: United States
+        - name: SERVER_CITIES
+          value: New York
+        - name: FIREWALL_INPUT_PORTS
+          value: '8943'
+        - name: FIREWALL_OUTBOUND_SUBNETS
+          value: 10.42.0.0/16,10.43.0.0/16,100.64.0.0/10,192.168.68.0/24
+        - name: DNS_KEEP_NAMESERVER
+          value: 'off'
+        - name: HEALTH_SERVER_ADDRESS
+          value: 127.0.0.1:9999
+        envFrom:
+        - secretRef:
+            name: filmstream-vpn
+        image: qmcgaw/gluetun:v3@sha256:fa19cc76b2af13d57a8d3dc3066f2ada061b1c761b8aecf989b3877c0486e027
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          exec:
+            command:
+            - /gluetun-entrypoint
+            - healthcheck
+          failureThreshold: 3
+          periodSeconds: 15
+          successThreshold: 1
+          timeoutSeconds: 1
+        name: gluetun
+        readinessProbe:
+          exec:
+            command:
+            - /gluetun-entrypoint
+            - healthcheck
+          failureThreshold: 3
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 1
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 25m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            add:
+            - NET_ADMIN
+        startupProbe:
+          exec:
+            command:
+            - /gluetun-entrypoint
+            - healthcheck
+          failureThreshold: 90
+          periodSeconds: 2
+          successThreshold: 1
+          timeoutSeconds: 1
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /dev/net/tun
+          name: tun
+        - mountPath: /tmp/gluetun
+          name: gluetun-state
+      - args:
+        - "until curl --fail --silent --output /dev/null http://127.0.0.1:9999/; do sleep 1; done\nuntil curl --silent --output\
+          \ /dev/null http://127.0.0.1:8113/v1/health; do sleep 1; done\nexec /opt/filmstream/filmstream serve \\\n  --config\
+          \ /config/config.json \\\n  --torrent-port-file /tmp/gluetun/filmstream-port \\\n  --ffmpeg-path /usr/local/bin/ffmpeg\
+          \ \\\n  --ffprobe-path /usr/local/bin/ffprobe \\\n  --bitmap-subtitle-encoder h264_nvenc\n"
+        command:
+        - /bin/sh
+        - -ec
+        env:
+        - name: HOME
+          value: /tmp
+        - name: OMDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              key: omdb-api-key
+              name: filmstream-config
+              optional: true
+        image: lscr.io/linuxserver/ffmpeg@sha256:eb164204fc1b3ff22c116cbcaed24a34b8dce9b27c1e7e4628d5afe22acbf7a1
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          exec:
+            command:
+            - curl
+            - --fail
+            - --silent
+            - --output
+            - /dev/null
+            - http://127.0.0.1:8943/v1/health
+          failureThreshold: 4
+          periodSeconds: 15
+          successThreshold: 1
+          timeoutSeconds: 3
+        name: filmstream
+        ports:
+        - containerPort: 8943
+          name: http
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /v1/health
+            port: http
+            scheme: HTTP
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 1
+        resources:
+          limits:
+            cpu: '2'
+            ephemeral-storage: 50Gi
+            memory: 2Gi
+          requests:
+            cpu: 100m
+            ephemeral-storage: 2Gi
+            memory: 256Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+          runAsGroup: 1000
+          runAsNonRoot: true
+          runAsUser: 1000
+        startupProbe:
+          failureThreshold: 120
+          httpGet:
+            path: /v1/health
+            port: http
+            scheme: HTTP
+          periodSeconds: 2
+          successThreshold: 1
+          timeoutSeconds: 1
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /opt/filmstream
+          name: binary
+          readOnly: true
+        - mountPath: /config
+          name: config
+          readOnly: true
+        - mountPath: /data
+          name: data
+        - mountPath: /state
+          name: state
+        - mountPath: /tmp
+          name: tmp
+        - mountPath: /tmp/gluetun
+          name: gluetun-state
+          readOnly: true
+        - mountPath: /opt/tools
+          name: media-tools
+          readOnly: true
+        - mountPath: /hls
+          name: hls
+        - mountPath: /obsidian/notes
+          name: obsidian-notes
+          readOnly: true
+        - mountPath: /downloads
+          name: downloads
+        - mountPath: /secrets
+          name: teastream-token
+          readOnly: true
+      - env:
+        - name: PUID
+          value: '1000'
+        - name: PGID
+          value: '1000'
+        - name: TZ
+          value: America/New_York
+        - name: DELUGE_LOGLEVEL
+          value: warning
+        - name: TEASTREAM_TOKEN_FILE
+          value: /secrets/teastream-token
+        - name: TEASTREAM_SAVE_ROOT
+          value: /downloads
+        image: lscr.io/linuxserver/deluge@sha256:9505c64720afa9e5f0ac1576e660dd6d1e9d4a6733b791f4821e8f496f19f41f
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - curl -s -o /dev/null http://127.0.0.1:8113/v1/health
+          failureThreshold: 4
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          successThreshold: 1
+          timeoutSeconds: 5
+        name: deluge
+        resources:
+          limits:
+            cpu: '2'
+            memory: 1536Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        volumeMounts:
+        - mountPath: /config
+          name: deluge-config
+        - mountPath: /downloads
+          name: downloads
+        - mountPath: /secrets
+          name: teastream-token
+          readOnly: true
+        - mountPath: /tmp/gluetun
+          name: gluetun-state
+          readOnly: true
+      dnsConfig:
+        nameservers:
+        - 127.0.0.1
+        options:
+        - name: ndots
+          value: '1'
+      dnsPolicy: None
+      restartPolicy: Always
+      runtimeClassName: nvidia
+      schedulerName: default-scheduler
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      terminationGracePeriodSeconds: 60
+      volumes:
+      - hostPath:
+          path: /dev/net/tun
+          type: CharDevice
+        name: tun
+      - hostPath:
+          path: /home/alyosha/containers/filmstream/bin
+          type: Directory
+        name: binary
+      - name: config
+        secret:
+          defaultMode: 288
+          secretName: filmstream-config
+      - name: data
+        persistentVolumeClaim:
+          claimName: filmstream-torrent-data
+      - name: state
+        persistentVolumeClaim:
+          claimName: filmstream-state
+      - emptyDir: {}
+        name: tmp
+      - emptyDir: {}
+        name: gluetun-state
+      - hostPath:
+          path: /home/alyosha/containers/filmstream/tools
+          type: Directory
+        name: media-tools
+      - emptyDir:
+          sizeLimit: 24Gi
+        name: hls
+      - hostPath:
+          path: /home/alyosha/notes
+          type: Directory
+        name: obsidian-notes
+      - hostPath:
+          path: /mnt/alyosha-12TB/media/downloads/teastream
+          type: Directory
+        name: downloads
+      - hostPath:
+          path: /home/alyosha/containers/filmstream/deluge-config
+          type: Directory
+        name: deluge-config
+      - name: teastream-token
+        secret:
+          defaultMode: 288
+          secretName: filmstream-teastream-token
+
