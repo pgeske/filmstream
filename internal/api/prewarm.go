@@ -92,17 +92,25 @@ func (s *Server) prewarmPlayback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	request.Preferences = mergePreferences(s.defaults, request.Preferences)
-	if request.MediaType == string(metadata.MediaTypeShow) ||
-		s.playbackSourceMode == config.PlaybackSourceTorrentOnly {
-		// Browsing torrent-backed media warms only the indexer search. A torrent is
-		// mounted after explicit Play; active playback separately buffers its next episode.
+	if request.MediaType == string(metadata.MediaTypeShow) {
+		// A show page names no episode yet: warm only the indexer search. Active
+		// playback separately buffers its next episode.
 		s.queueReleaseSearch(request)
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "finding_releases"})
 		return
 	}
-	s.queuePlaybackPrewarm(playbackPrewarmTarget{
-		request: request, source: "hint", priority: true,
-	})
+	target := playbackPrewarmTarget{request: request, source: "hint", priority: true}
+	if s.playbackSourceMode == config.PlaybackSourceTorrentOnly {
+		// A torrent movie page warms the search (which an explicit Play joins)
+		// and mounts the best release from it. A new private release is mounted
+		// only where head prewarm is allowed, and then downloads just its file
+		// head and tail until Play (see prewarmableTorrentCandidates).
+		s.queueReleaseSearch(request)
+		s.queuePlaybackPrewarm(target)
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "finding_releases"})
+		return
+	}
+	s.queuePlaybackPrewarm(target)
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "prewarming"})
 }
 

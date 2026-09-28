@@ -131,7 +131,7 @@ func TestReleaseSearchDoesNotHideIndexerFailuresBehindIrrelevantResults(t *testi
 	}
 }
 
-func TestTorrentMoviePrewarmCachesPopularMovieRankingsWithoutMounting(t *testing.T) {
+func TestTorrentMoviePrewarmCachesPopularMovieRankings(t *testing.T) {
 	var searches atomic.Int32
 	indexerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Query().Get("t") {
@@ -184,8 +184,8 @@ func TestTorrentMoviePrewarmCachesPopularMovieRankingsWithoutMounting(t *testing
 			t.Fatalf("prewarm %s: found = %v, ranked = %+v", request.MediaID, found, ranked)
 		}
 	}
-	if searches.Load() != 2 || len(server.prewarmStates) != 0 {
-		t.Fatalf("searches = %d, playback prewarms = %d", searches.Load(), len(server.prewarmStates))
+	if searches.Load() != 2 {
+		t.Fatalf("searches = %d", searches.Load())
 	}
 }
 
