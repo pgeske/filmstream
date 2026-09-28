@@ -160,6 +160,8 @@ type torrentState struct {
 	pending       int
 	sessions      map[string]*Session
 	wantAllPushed bool
+	// wantMu serializes readers switching a snatched torrent to every file.
+	wantMu sync.Mutex
 
 	// Metadata, written once under Engine.mu before any session exists.
 	name        string
@@ -821,13 +823,9 @@ func (e *Engine) obligate(ctx context.Context, t *torrentState, args ...any) {
 }
 
 func (e *Engine) pushWantAll(ctx context.Context, t *torrentState) {
-	if err := e.plugin.setFiles(ctx, t.hash, wantedFiles(true, nil)); err != nil {
+	if err := e.ensureWantAll(ctx, t); err != nil {
 		e.logger.Warn("could not request every file of a torrent", "info_hash", t.hash, "error", err)
-		return
 	}
-	e.mu.Lock()
-	t.wantAllPushed = true
-	e.mu.Unlock()
 }
 
 func (e *Engine) Status(id string) (Status, bool) {

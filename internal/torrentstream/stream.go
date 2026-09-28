@@ -202,8 +202,12 @@ func (r *pieceReader) await(pos int64) error {
 			r.readyStart = max(0, int64(piece)*pieceLength-r.file.Offset)
 			r.readyEnd = min(r.file.Size, int64(last+1)*pieceLength-r.file.Offset)
 			if r.e.markServing(r.session) {
-				// A played private torrent is snatched: complete and seed all of it.
-				r.e.pushWantAll(r.ctx, r.t)
+				// A played private torrent is snatched: complete and seed all of
+				// it. Its pieces were held in libtorrent's part file until now, so
+				// no reader may touch the file before Deluge has moved them.
+				if err := r.e.ensureWantAll(r.ctx, r.t); err != nil {
+					return err
+				}
 			}
 			return nil
 		}
@@ -244,8 +248,9 @@ func (e *Engine) waitTimeout(session *Session) time.Duration {
 
 // markServing records that the playback delivered data: its startup deadline
 // and any unavailable verdict no longer apply. The first data served from a
-// torrent marks it started, which makes it a seeding obligation; markServing
-// reports whether that just happened to a private torrent.
+// torrent marks it started, which makes it a seeding obligation (every file
+// of a private torrent). markServing reports whether the torrent wants every
+// file but Deluge has not confirmed that yet.
 func (e *Engine) markServing(session *Session) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -254,15 +259,39 @@ func (e *Engine) markServing(session *Session) bool {
 	session.unavailable = nil
 	session.unavailableUntil = time.Time{}
 	record := session.torrent.record
-	if record == nil || record.Started {
+	if record == nil {
 		return false
 	}
-	record.Started = true
-	if record.Private {
-		record.WantAll = true
+	if !record.Started {
+		record.Started = true
+		if record.Private {
+			record.WantAll = true
+		}
+		e.persistLocked()
 	}
-	e.persistLocked()
-	return record.Private
+	return record.WantAll && !session.torrent.wantAllPushed
+}
+
+// ensureWantAll makes Deluge want every file of t and returns once it has
+// (the plugin answers after libtorrent moved part-file pieces into place).
+// Concurrent readers wait for the first one's request instead of reading
+// early.
+func (e *Engine) ensureWantAll(ctx context.Context, t *torrentState) error {
+	t.wantMu.Lock()
+	defer t.wantMu.Unlock()
+	e.mu.Lock()
+	pushed := t.wantAllPushed
+	e.mu.Unlock()
+	if pushed {
+		return nil
+	}
+	if err := e.plugin.setFiles(ctx, t.hash, wantedFiles(true, nil)); err != nil {
+		return fmt.Errorf("request every file of the torrent: %w", err)
+	}
+	e.mu.Lock()
+	t.wantAllPushed = true
+	e.mu.Unlock()
+	return nil
 }
 
 // checkStall decides whether a blocked read should give up. A playback that

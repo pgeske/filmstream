@@ -73,7 +73,10 @@ POST /v1/torrents/{hash}/wait
 
 PUT /v1/torrents/{hash}/files
     {"wanted": "all" | [indices]} sets file priorities through Deluge (normal
-    for wanted, skip for the rest) so they persist. -> {"priorities": [...]}
+    for wanted, skip for the rest) so they persist. When a skipped file
+    becomes wanted, the answer waits (up to 10 s) for libtorrent to move its
+    pieces out of the part file, so they are readable from disk once it
+    returns. -> {"priorities": [...]}
 
 PUT /v1/torrents/{hash}/windows/{stream}
     {"file", "offset", "length", "deadline_bytes" (optional, default 32 MiB),
@@ -124,6 +127,7 @@ from .common import (
     DEFAULT_WINDOW_TTL_MS,
     MAX_WAIT_MS,
     MAX_WINDOW_TTL_MS,
+    PRIORITY_SKIP,
     build_metainfo,
     base_piece_priorities,
     file_priorities,
@@ -151,6 +155,8 @@ STREAMING_SESSION_SETTINGS = {
     'resolver_cache_timeout': 60,
 }
 WAIT_POLL_SECONDS = 0.05
+# Upper bound on waiting for libtorrent to confirm new file priorities.
+FILE_PRIORITY_TIMEOUT_SECONDS = 10
 
 
 class ApiError(Exception):
@@ -191,6 +197,17 @@ class Waiter:
         self.done = False
 
 
+class FilePriorityWaiter:
+    """A set-files request answered once libtorrent applied the priorities."""
+
+    __slots__ = ('request', 'payload', 'done')
+
+    def __init__(self, request, payload):
+        self.request = request
+        self.payload = payload
+        self.done = False
+
+
 class Core(CorePluginBase):
     def enable(self):
         self.config = ConfigManager('teastream.conf', DEFAULT_PREFS)
@@ -199,6 +216,7 @@ class Core(CorePluginBase):
         self.streams = {}
         self.pending_selection = {}
         self.waiters = []
+        self.file_priority_waiters = {}
         self.waiter_loop = task.LoopingCall(self._poll_waiters)
         self._token_cache = (None, None)
 
@@ -213,9 +231,9 @@ class Core(CorePluginBase):
                 'restart deluged to unload it (private torrents never use PEX).'
             )
 
-        component.get('AlertManager').register_handler(
-            'metadata_received', self._on_metadata_received
-        )
+        alerts = component.get('AlertManager')
+        alerts.register_handler('metadata_received', self._on_metadata_received)
+        alerts.register_handler('file_prio', self._on_file_priorities_applied)
         bind = os.environ.get('TEASTREAM_BIND') or self.config['bind']
         port = int(os.environ.get('TEASTREAM_PORT') or self.config['port'])
         site = _QuietSite(_Api(self))
@@ -223,12 +241,15 @@ class Core(CorePluginBase):
         log.info('TeaStream API listening on %s:%d', bind, port)
 
     def disable(self):
-        component.get('AlertManager').deregister_handler(self._on_metadata_received)
+        alerts = component.get('AlertManager')
+        alerts.deregister_handler(self._on_metadata_received)
+        alerts.deregister_handler(self._on_file_priorities_applied)
         if self.waiter_loop.running:
             self.waiter_loop.stop()
-        for waiter in list(self.waiters):
+        for waiter in list(self.waiters) + [w for ws in self.file_priority_waiters.values() for w in ws]:
             self._finish(waiter, 503, {'error': 'TeaStream plugin disabled'})
         self.waiters = []
+        self.file_priority_waiters = {}
         for info_hash, streams in list(self.streams.items()):
             streams.windows.clear()
             self._apply(info_hash)
@@ -298,7 +319,7 @@ class Core(CorePluginBase):
             elif rest == ['wait'] and method == 'POST':
                 return self.wait(info_hash, _body(request), request)
             elif rest == ['files'] and method == 'PUT':
-                return self.set_files(info_hash, _body(request))
+                return self.set_files(info_hash, _body(request), request)
             elif rest == ['metainfo'] and method == 'GET':
                 return self.metainfo(info_hash)
             elif len(rest) == 2 and rest[0] == 'windows':
@@ -423,7 +444,7 @@ class Core(CorePluginBase):
             self.waiter_loop.start(WAIT_POLL_SECONDS, now=False)
         return server.NOT_DONE_YET
 
-    def set_files(self, info_hash, body):
+    def set_files(self, info_hash, body, request):
         torrent = self._torrent(info_hash)
         info = self._info(torrent)
         wanted = body.get('wanted')
@@ -431,12 +452,42 @@ class Core(CorePluginBase):
             raise ApiError(400, 'wanted must be "all" or a list of file indices')
         if isinstance(wanted, list) and any(i < 0 or i >= info.num_files() for i in wanted):
             raise ApiError(400, 'file index out of range')
+        previous = list(torrent.handle.get_file_priorities())
         priorities = file_priorities(info.num_files(), wanted)
         torrent.set_file_priorities(priorities)
         self.torrents.save_state()
         if info_hash in self.streams:
             self._apply(info_hash)
-        return {'priorities': priorities}
+        payload = {'priorities': priorities}
+        if not any(old == PRIORITY_SKIP and new > PRIORITY_SKIP for old, new in zip(previous, priorities)):
+            return payload
+        # Pieces of a skipped file live in libtorrent's part file; the disk
+        # thread moves them into the real file when the file becomes wanted.
+        # Answer once file_prio_alert confirms that, so a caller that read
+        # those pieces' "have" bits can read them from the file right away.
+        waiter = FilePriorityWaiter(request, payload)
+        self.file_priority_waiters.setdefault(info_hash, []).append(waiter)
+        request.notifyFinish().addBoth(self._forget_waiter, waiter)
+        reactor.callLater(FILE_PRIORITY_TIMEOUT_SECONDS, self._file_priorities_timed_out, info_hash, waiter)
+        return server.NOT_DONE_YET
+
+    def _on_file_priorities_applied(self, alert):
+        try:
+            info_hash = str(alert.handle.info_hash())
+        except RuntimeError:
+            return
+        for waiter in self.file_priority_waiters.pop(info_hash, []):
+            self._finish(waiter, 200, waiter.payload)
+
+    def _file_priorities_timed_out(self, info_hash, waiter):
+        waiting = self.file_priority_waiters.get(info_hash, [])
+        if waiter in waiting:
+            waiting.remove(waiter)
+            if not waiting:
+                del self.file_priority_waiters[info_hash]
+        if not waiter.done:
+            log.warning('TeaStream: no file_prio_alert for %s within %ds', info_hash, FILE_PRIORITY_TIMEOUT_SECONDS)
+            self._finish(waiter, 200, waiter.payload)
 
     def set_window(self, info_hash, stream, body):
         torrent = self._torrent(info_hash)
