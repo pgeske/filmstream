@@ -48,11 +48,28 @@ config, as private trackers require. PEX stays loaded until deluged restarts
 (`pex_extension_loaded` in the health response); restart deluged once after
 the first enable.
 
-It also tunes two libtorrent session settings for streaming:
+It also tunes three libtorrent session settings for streaming:
 `initial_picker_threshold` 0, so piece priorities (and with them the stream
-windows) apply from a torrent's first piece instead of after four random ones,
-and `urlseed_max_request_bytes` 2 MiB, so a web seed is never more than 2 MiB
-away from serving a seek. Deluge should therefore be dedicated to Filmstream.
+windows) apply from a torrent's first piece instead of after four random ones;
+`urlseed_max_request_bytes` 2 MiB, so a web seed is never more than 2 MiB
+away from serving a seek; and `resolver_cache_timeout` 60 s, because
+libtorrent caches failed tracker lookups for that long and deluged usually
+starts before the VPN's resolver answers. Deluge should therefore be dedicated
+to Filmstream.
+
+While a stream window's deadline zone misses a piece, the plugin focuses the
+torrent: the first missing 8 MiB (at least two pieces) of each zone get
+deadlines and top priority, the rest of the zone high priority, the rest of
+the window the lowest, and the rest of the torrent pauses (priority 0), except
+that at least 64 MiB of missing data stays wanted so the torrent never looks
+finished (libtorrent would drop its seeds). Otherwise libtorrent keeps every
+peer's request queue full of rarest-first background blocks, finishes
+background pieces first, skips deadlines for busy peers, and picks
+top-priority pieces in random order. The background resumes once the zones
+are complete or the windows expire, so private torrents still complete and
+seed.
+
+`python3 deluge/teastream/test_common.py` tests the piece math.
 
 ## Filmstream side
 

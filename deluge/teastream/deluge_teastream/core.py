@@ -11,7 +11,7 @@ TorrentManager, Torrent.handle); Deluge itself is not modified.
 Enabling the plugin also turns off DHT, PEX (ut_pex), LSD, UPnP and NAT-PMP in
 Deluge's core config, as private trackers require. libtorrent additionally
 honours the BEP27 private flag per torrent. Deluge's peer id and user agent are
-left untouched. It also tunes two libtorrent session settings for streaming
+left untouched. It also tunes three libtorrent session settings for streaming
 (see STREAMING_SESSION_SETTINGS).
 
 Configuration (``teastream.conf`` in Deluge's config dir; environment wins):
@@ -78,12 +78,16 @@ PUT /v1/torrents/{hash}/files
 PUT /v1/torrents/{hash}/windows/{stream}
     {"file", "offset", "length", "deadline_bytes" (optional, default 32 MiB),
     "ttl_ms" (optional, default 30000, max 600000)}. Replaces the stream's
-    window: its missing pieces get top priority and the first deadline_bytes
-    get staggered piece deadlines (earliest first). Pieces that left the window
-    lose their deadline. Windows of all streams of a torrent are merged, so
-    several readers (probe, packager, subtitles) can stream concurrently; the
-    rest of the wanted files keep normal priority and finish in the
-    background. A window expires after ttl_ms unless it is refreshed.
+    window: its missing pieces get top priority, and its first deadline_bytes
+    (the deadline zone) are fetched in reading order, the first missing ones
+    with staggered piece deadlines. Pieces that left the window lose their
+    deadline. Windows of all streams of a torrent are merged, so several
+    readers (probe, packager, subtitles) can stream concurrently; the rest of
+    the wanted files keep normal priority and finish in the background. While
+    a deadline zone misses a piece, the torrent focuses on its streams
+    instead: the background pauses and only the pieces due next keep top
+    priority (see common.stream_priorities). A window expires after ttl_ms
+    unless it is refreshed.
     -> {"first_piece", "last_piece", "deadline_last_piece"}
 
 DELETE /v1/torrents/{hash}/windows/{stream}
@@ -125,6 +129,7 @@ from .common import (
     file_priorities,
     pack_bitfield,
     schedule,
+    stream_priorities,
     window_pieces,
 )
 
@@ -136,8 +141,15 @@ PRIVACY_SETTINGS = {'dht': False, 'lsd': False, 'upnp': False, 'natpmp': False, 
 # priorities and so every stream window, until a torrent has
 # initial_picker_threshold pieces; and a web seed fetches whole
 # urlseed_max_request_bytes runs (16 MiB by default), which a time-critical
-# piece must wait behind.
-STREAMING_SESSION_SETTINGS = {'initial_picker_threshold': 0, 'urlseed_max_request_bytes': 2 << 20}
+# piece must wait behind. libtorrent also caches failed tracker DNS lookups
+# for resolver_cache_timeout (20 minutes by default): deluged usually starts
+# before the VPN's resolver answers, and every announce to those trackers,
+# including a new playback's, would fail from that cache until it expired.
+STREAMING_SESSION_SETTINGS = {
+    'initial_picker_threshold': 0,
+    'urlseed_max_request_bytes': 2 << 20,
+    'resolver_cache_timeout': 60,
+}
 WAIT_POLL_SECONDS = 0.05
 
 
@@ -592,7 +604,8 @@ class Core(CorePluginBase):
             return
         have = _have(torrent)
         windows = [(w.first, w.last, w.deadline_last) for w in streams.windows.values()]
-        deadlines, boosted = schedule(windows, have, info.piece_length())
+        plan = schedule(windows, have, info.piece_length())
+        deadlines, zones, boosted = plan
         for piece in streams.deadlines - deadlines.keys():
             handle.reset_piece_deadline(piece)
         for piece, due in deadlines.items():
@@ -609,11 +622,11 @@ class Core(CorePluginBase):
             info.num_pieces(),
             info.piece_length(),
         )
-        for piece in boosted:
-            base[piece] = 7
+        downloaded = _downloaded(handle) if zones else {}
+        priorities = stream_priorities(base, windows, have, plan, downloaded, info.piece_length())
         if boosted or streams.boosted:
-            if list(handle.get_piece_priorities()) != base:
-                handle.prioritize_pieces(base)
+            if list(handle.get_piece_priorities()) != priorities:
+                handle.prioritize_pieces(priorities)
         streams.boosted = bool(boosted)
         if not streams.windows:
             del self.streams[info_hash]
@@ -742,6 +755,18 @@ def _bounded_int(value, default, low, high, name):
 
 def _have(torrent):
     return torrent.handle.status(lt.torrent_handle.query_pieces).pieces
+
+
+# libtorrent block states: none, requested, writing, finished.
+_BLOCK_RECEIVED = (2, 3)
+
+
+def _downloaded(handle):
+    """Bytes already received of each partially downloaded piece."""
+    return {
+        partial['piece_index']: sum(block['block_size'] for block in partial['blocks'] if block['state'] in _BLOCK_RECEIVED)
+        for partial in handle.get_download_queue()
+    }
 
 
 def _pieces_response(have, first, last, complete):
