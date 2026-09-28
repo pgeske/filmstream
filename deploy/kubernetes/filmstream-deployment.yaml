@@ -230,6 +230,12 @@ spec:
           value: /secrets/teastream-token
         - name: TEASTREAM_SAVE_ROOT
           value: /downloads
+        # 80% of the 500 Mbit/s line in total; torrents nobody is watching get
+        # 100 Mbit/s so the household keeps headroom.
+        - name: TEASTREAM_MAX_DOWNLOAD_KIB
+          value: '48828'
+        - name: TEASTREAM_BACKGROUND_DOWNLOAD_KIB
+          value: '12207'
         image: lscr.io/linuxserver/deluge@sha256:9505c64720afa9e5f0ac1576e660dd6d1e9d4a6733b791f4821e8f496f19f41f
         imagePullPolicy: IfNotPresent
         livenessProbe:

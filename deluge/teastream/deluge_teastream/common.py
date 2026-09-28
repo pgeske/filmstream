@@ -18,7 +18,16 @@ DEFAULT_PREFS = {
     'token_file': '',
     # Root under which each torrent gets its own <root>/<info_hash> directory.
     'save_root': '/downloads',
+    # Bandwidth caps in KiB/s (-1 = unlimited); TEASTREAM_MAX_DOWNLOAD_KIB,
+    # TEASTREAM_MAX_UPLOAD_KIB and TEASTREAM_BACKGROUND_DOWNLOAD_KIB override
+    # them. The totals bound the whole daemon; a torrent nobody is streaming
+    # (finishing a snatch, seeding) is also held to background_download_kib so
+    # playback keeps the headroom.
+    'max_download_kib': -1,
+    'max_upload_kib': -1,
+    'background_download_kib': -1,
 }
+
 
 # libtorrent download priorities.
 PRIORITY_SKIP = 0

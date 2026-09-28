@@ -225,6 +225,11 @@ class Core(CorePluginBase):
         self.pex_extension_loaded = bool(self.core.config['utpex'])
         self.core.set_config(dict(PRIVACY_SETTINGS))
         self.core.apply_session_settings(dict(STREAMING_SESSION_SETTINGS))
+        self.background_download_kib = self._kib_setting('background_download_kib')
+        self.core.set_config({
+            'max_download_speed': float(self._kib_setting('max_download_kib')),
+            'max_upload_speed': float(self._kib_setting('max_upload_kib')),
+        })
         if self.pex_extension_loaded:
             log.warning(
                 'TeaStream disabled PEX, but ut_pex was loaded when deluged started; '
@@ -265,6 +270,21 @@ class Core(CorePluginBase):
             # Refreshing keeps deadlines relative to now and restores the boost
             # if something (a Deluge file-priority change) reset priorities.
             self._apply(info_hash)
+        self._apply_background_limits()
+
+    def _kib_setting(self, key):
+        """A KiB/s pref (<= 0 means unlimited), overridable by TEASTREAM_<KEY>."""
+        value = float(os.environ.get('TEASTREAM_' + key.upper()) or self.config[key])
+        return value if value > 0 else -1.0
+
+    def _apply_background_limits(self):
+        """Keeps full bandwidth for torrents a player is reading and holds the
+        rest (snatch completion, seeding) to background_download_kib."""
+        for info_hash, torrent in list(self.torrents.torrents.items()):
+            streams = self.streams.get(info_hash)
+            limit = -1.0 if streams and streams.windows else self.background_download_kib
+            if torrent.options['max_download_speed'] != limit:
+                torrent.set_max_download_speed(limit)
 
     # --- request helpers ---
 
